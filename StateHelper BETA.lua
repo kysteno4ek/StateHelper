@@ -205,7 +205,10 @@ do
  imgui.OnFrame = function(cond, ...)
   local n, args = select('#', ...), {...}
   if type(args[n]) == 'function' then args[n] = guard(args[n]) end
-  return onframe(cond, unpack(args, 1, n))
+  return onframe(function(...)
+   if not (inst_suc_font and inst_suc_font[1] and inst_suc_font[2]) then return false end
+   return cond(...)
+  end, unpack(args, 1, n))
  end
 end
 local new = imgui.new
@@ -329,27 +332,20 @@ function download_font()
 		local file = io.open(path, 'rb'); if not file then return false end
 		local data = file:read('*a'); file:close(); return sh_resource.valid(data, 'ttf')
 	end
-	local need_reload = false
-	if not file_ok(dir .. '/State Helper/Шрифты/SF600.ttf') or not file_ok(dir .. '/State Helper/Шрифты/SF800.ttf') then
-		download_id = sh_resource.download(link_meduim_font, dir .. '/State Helper/Шрифты/SF600.ttf', function(id, status, p1, p2)
-			if status == dlstatus.STATUS_ENDDOWNLOADDATA then
-				inst_suc_font[1] = true
-				if inst_suc_font[1] and inst_suc_font[2] then
-					need_reload = true
-					lua_thread.create(function() wait(500) thisScript():reload() end)
+	local fonts = {
+		{link_meduim_font, 'SF600.ttf'},
+		{link_bold_font, 'SF800.ttf'},
+	}
+	for index, font in ipairs(fonts) do
+		local path = dir .. '/State Helper/Шрифты/' .. font[2]
+		inst_suc_font[index] = file_ok(path)
+		if not inst_suc_font[index] then
+			sh_resource.download(font[1], path, function(_, status)
+				if status == dlstatus.STATUS_ENDDOWNLOADDATA then
+					inst_suc_font[index] = true
 				end
-			end
-		end)
-		download_id = sh_resource.download(link_bold_font, dir .. '/State Helper/Шрифты/SF800.ttf', function(id, status, p1, p2)
-			if status == dlstatus.STATUS_ENDDOWNLOADDATA then
-				inst_suc_font[2] = true
-				if inst_suc_font[1] and inst_suc_font[2] then
-					lua_thread.create(function() wait(500) thisScript():reload() end)
-				end
-			end
-		end)
-	else
-		inst_suc_font = {true, true}
+			end)
+		end
 	end
 end
 download_font()
@@ -16903,7 +16899,12 @@ function sh_browser_tick()
 end
 
 function sh_browser_close()
-    if sh_browser_manager then pcall(sh_browser_manager.close, 'unload') end
+    if sh_browser_manager then
+        for _, logo in ipairs(sh_browser_manager.state.search_logos or {}) do
+            if logo.texture then pcall(imgui.ReleaseTexture, logo.texture); logo.texture = nil end
+        end
+        pcall(sh_browser_manager.close, 'unload')
+    end
     if sh_browser_cursor_owned then pcall(function() if type(sampGetCursorMode) ~= 'function' or sampGetCursorMode() == 4 then sampSetCursorMode(0) end end); sh_browser_cursor_owned = false end
     if sh_browser_lock_owned then pcall(lockPlayerControl, false); sh_browser_lock_owned = false end
 end
@@ -17100,10 +17101,116 @@ function hall.browser_settings()
     end
 end
 
+function sh_browser_bootstrap.search_logo(logo)
+    if logo.texture then return logo.texture end
+    local folder = dir .. '/State Helper/Browser/Assets'
+    local filename = 'search-' .. logo.engine .. '.png'
+    local path = folder .. '/' .. filename
+    if not logo.checked then
+        local file = io.open(path, 'rb')
+        if file then
+            local data = file:read(2 * 1024 * 1024)
+            file:close()
+            if sh_resource.valid(data, 'png') then
+                local ok, texture = pcall(imgui.CreateTextureFromFile, path)
+                if ok and texture then logo.texture = texture end
+            end
+        end
+        logo.checked = true
+    end
+    if logo.texture then return logo.texture end
+    if not logo.downloading and os.time() >= (logo.retry_at or 0) then
+        if not doesDirectoryExist(folder) then createDirectory(folder) end
+        logo.downloading = true
+        logo.retry_at = os.time() + 30
+        local url = 'https://raw.githubusercontent.com/kysteno4ek/StateHelper/main/images/' .. filename
+        local ok, id = pcall(sh_resource.download, url, path, function(_, status)
+            if status == dlstatus.STATUS_ENDDOWNLOADDATA then
+                logo.checked, logo.downloading = false, false
+            elseif status == dlstatus.STATUS_DOWNLOAD_ERROR or status == dlstatus.STATUSEX_ENDDOWNLOAD then
+                logo.downloading = false
+            end
+        end)
+        if not ok or not id or id == 0 then logo.downloading = false end
+    end
+end
+
+function sh_browser_bootstrap.draw_search_choice(manager)
+    local state = manager.state
+    state.search_logos = state.search_logos or {
+        {engine = 'yandex', label = 'Яндекс', letter = 'Я', color = imgui.ImVec4(1, 0.35, 0.27, 1)},
+        {engine = 'google', label = 'Google', letter = 'G', color = imgui.ImVec4(0.26, 0.52, 0.96, 1)},
+    }
+    imgui.SetCursorPos(imgui.ImVec2(4, 39))
+    imgui.BeginChild('##SHBrowserSearchChoice', imgui.ImVec2(840, 369), false,
+        imgui.WindowFlags.NoScrollbar + imgui.WindowFlags.NoScrollWithMouse)
+
+    local question = 'Каким поиском вы пользуетесь?'
+    imgui.PushFont(bold_font[3])
+    local title = imgui.CalcTextSize(u8(question))
+    imgui.PopFont()
+    gui.Text((840 - title.x) * 0.5, 55, question, bold_font[3])
+
+    for index, logo in ipairs(state.search_logos) do
+        local x, y = 260 + (index - 1) * 164, 138
+        imgui.SetCursorPos(imgui.ImVec2(x, y))
+        local pos = imgui.GetCursorScreenPos()
+        local clicked = imgui.InvisibleButton('##SHSearchChoice' .. logo.engine, imgui.ImVec2(148, 96))
+        local draw = imgui.GetWindowDrawList()
+        local top = imgui.ImVec2(pos.x, pos.y)
+        local bottom = imgui.ImVec2(pos.x + 148, pos.y + 96)
+        draw:AddRectFilled(top, bottom, imgui.GetColorU32Vec4(imgui.ImVec4(1, 1, 1, 1)), 12, 15)
+        if imgui.IsItemHovered() then
+            draw:AddRect(top, bottom, imgui.GetColorU32Vec4(imgui.ImVec4(0.29, 0.40, 1, 1)), 12, 15, 2)
+        end
+
+        local texture = sh_browser_bootstrap.search_logo(logo)
+        if texture then
+            imgui.SetCursorPos(imgui.ImVec2(x + 49, y + 10))
+            imgui.Image(texture, imgui.ImVec2(50, 50))
+        else
+            draw:AddCircleFilled(imgui.ImVec2(pos.x + 74, pos.y + 35), 20, imgui.GetColorU32Vec4(logo.color), 40)
+            imgui.PushFont(bold_font[1])
+            local letter = u8(logo.letter)
+            local size = imgui.CalcTextSize(letter)
+            imgui.SetCursorPos(imgui.ImVec2(x + 74 - size.x * 0.5, y + 35 - size.y * 0.5))
+            imgui.TextColored(imgui.ImVec4(1, 1, 1, 1), letter)
+            imgui.PopFont()
+        end
+
+        imgui.PushFont(font[3])
+        local label = u8(logo.label)
+        local size = imgui.CalcTextSize(label)
+        imgui.SetCursorPos(imgui.ImVec2(x + 74 - size.x * 0.5, y + 68))
+        imgui.TextColored(imgui.ImVec4(0.12, 0.12, 0.14, 1), label)
+        imgui.PopFont()
+
+        if clicked then
+            local path = dir .. '/State Helper/Browser/preferences.json'
+            local data = json.encode({version = 1, search_engine = logo.engine, browser_mode = state.mode})
+            if write_file(path, data) then
+                state.search_engine = logo.engine
+                state.message = ''
+                state.settings_message = 'Настройки сохранены.'
+            else
+                state.message = 'Не удалось сохранить выбор. Попробуйте ещё раз.'
+                state.settings_message = state.message
+            end
+            state.settings_message_at = os.clock()
+        end
+    end
+    if state.message ~= '' then gui.Text(24, 300, state.message, font[3]) end
+    imgui.EndChild()
+end
+
 function hall.help()
     sh_browser_ensure()
     if sh_browser_manager and not sh_browser_manager.state.installing then
-        sh_browser_manager.draw(cl, font, bold_font)
+        if sh_browser_manager.state.search_engine then
+            sh_browser_manager.draw(cl, font, bold_font)
+        else
+            sh_browser_bootstrap.draw_search_choice(sh_browser_manager)
+        end
     else
         sh_browser_bootstrap.draw()
     end
@@ -17967,7 +18074,7 @@ win.main = imgui.OnFrame(
 		gui.Draw({4, 4}, {840, 440}, window_bg_color, 12, 15)
 		winter.begin(848, 448)
 
-		if not setting.winter_intro_done and (not setting.first_start or first_start >= 4) then
+		if not setting.winter_intro_done and (not setting.first_start or first_start >= 6) then
 			if not winter_intro.t0 then winter_intro.t0 = os.clock() end
 			local elapsed = os.clock() - winter_intro.t0
 			local a = math.min(1, elapsed / 0.5)
