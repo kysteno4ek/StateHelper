@@ -3,7 +3,7 @@ local math = math
 script_name('State Helper')
 script_authors('Kane')
 script_description('Script for employees of state organizations on the Arizona Role Playing Game')
-script_version('3.5.1')
+script_version('3.5.2')
 script_properties('work-in-pause')
 
 local ffi = require 'ffi'
@@ -976,6 +976,8 @@ setting = {
 	stroi = { func = false, cmd = 'str', key = {'', {}}, list = {}, pos = { x = math.floor(sx - 130), y = math.floor(sy * 0.28) } },
 	mini_player_pos = { x = sx / 2, y = sy - 60 },
 	first_start = true,
+	browser_cursor_key = 0x48,
+	browser_cursor_modifiers = 0,
 	prinfo = false,
 	cl = 'Black',
 	color_def = {0.00, 0.48, 1.00},
@@ -1367,19 +1369,8 @@ end
 local last_saved_json = nil
 
 local function replace_file(new_path, path)
-	local backup = path .. '.old'
-	os.remove(backup)
-	if os.rename(path, backup) then
-		if os.rename(new_path, path) then
-			os.remove(backup)
-			return true
-		else
-			os.rename(backup, path)
-			return false
-		end
-	else
-		return os.rename(new_path, path)
-	end
+	local ok = ffi.load('kernel32').MoveFileExA(new_path, path, 9) ~= 0
+	return ok, not ok and 'MoveFileExA failed' or nil
 end
 
 local function write_file(path, data)
@@ -1565,7 +1556,12 @@ function save(force)
 	if not ok then sh_audit.io_error('Не удалось подготовить настройки к сохранению.'); return false end
 	if not force and data == last_saved_json then return true end
 	local written, problem = write_file(dir .. '/State Helper/Настройки.json', data)
-	if written then last_saved_json = data; return true end
+	if written then
+		last_saved_json = data
+		local backup_ok, backup_error = write_file(dir .. '/State Helper/Настройки.json.last-good', data)
+		if not backup_ok then sh_audit.io_error('Настройки сохранены, но резервная копия не обновилась.', backup_error) end
+		return true
+	end
 	sh_audit.io_error('Не удалось сохранить настройки. Проверьте свободное место и доступ к папке.', problem)
 	return false
 end
@@ -7101,7 +7097,6 @@ function hall.settings()
 			imgui.OpenPopup(u8'Изменить клавишу активации открытия вкладки' .. i_tabs)
 			lockPlayerControl(true)
 			edit_key = true
-			win_key = setting.key_tabs[1][2]
 		end
 		
 		local bool_result = key_edit(u8'Изменить клавишу активации открытия вкладки' .. i_tabs, setting.key_tabs[i_tabs])
@@ -10528,7 +10523,7 @@ function hall.settings()
 			imgui.PopStyleColor(1)
 			imgui.PopFont()
 			gui.Text(80, 87, 'State Helper ' .. update_info.version, font[3])
-			gui.Text(80, 105, tostring(update_info.size) .. ' кб.', font[3])
+			if update_info.size then gui.Text(80, 105, tostring(update_info.size) .. ' кб.', font[3]) end
 			
 			gui.DrawLine({16, 137}, {602, 137}, cl.line)
 			imgui.SetCursorPos(imgui.ImVec2(16, 138))
@@ -16811,15 +16806,115 @@ end
 local sh_browser_manager = nil
 local sh_browser_lock_owned = false
 local sh_browser_cursor_owned = false
+local sh_browser_input = {enabled = false, choosing_key = false}
+
+function sh_browser_input.valid_key(key)
+    return type(key) == 'number' and key % 1 == 0 and
+        ((key >= 0x30 and key <= 0x39) or (key >= 0x41 and key <= 0x5A) or
+         (key >= 0x60 and key <= 0x69) or (key >= 0x70 and key <= 0x7B) or
+         (key >= 0x21 and key <= 0x28) or key == 0x2D or key == 0x2E)
+end
+
+function sh_browser_input.key()
+    local key = setting.browser_cursor_key
+    return sh_browser_input.valid_key(key) and key or 0x48
+end
+
+function sh_browser_input.modifiers()
+    return (isKeyDown(vkeys.VK_CONTROL) and 1 or 0)
+        + (isKeyDown(vkeys.VK_SHIFT) and 2 or 0)
+        + (isKeyDown(vkeys.VK_MENU) and 4 or 0)
+end
+
+function sh_browser_input.key_label(key, modifiers)
+    key = key or sh_browser_input.key()
+    modifiers = modifiers or setting.browser_cursor_modifiers
+    local names = {}
+    if bit.band(modifiers, 1) ~= 0 then names[#names + 1] = 'Ctrl' end
+    if bit.band(modifiers, 2) ~= 0 then names[#names + 1] = 'Shift' end
+    if bit.band(modifiers, 4) ~= 0 then names[#names + 1] = 'Alt' end
+    names[#names + 1] = (vkeys.id_to_name(key) or tostring(key)):gsub('^VK_', '')
+    return table.concat(names, ' + ')
+end
+
+function sh_browser_input.window_blocked()
+    local cursor_busy = not windows.fast[0] and not windows.action[0] and not sampIsChatInputActive() and not sh_browser_cursor_owned
+        and type(sampGetCursorMode) == 'function' and sampGetCursorMode() ~= 0
+    return windows.main[0] or windows.smart_su[0] or windows.stroi[0]
+        or windows.shpora[0] or windows.reminder[0] or cursor_busy or sampIsDialogActive()
+        or isGamePaused() or scene_active or edit_key or edit_cmd
+end
+
+function sh_browser_input.available(state)
+    return state and state.started and state.mode ~= 'external' and state.status.window_visible == true
+        and not windows.fast[0] and not windows.action[0] and not sampIsChatInputActive()
+        and not sh_browser_input.window_blocked()
+end
+
+function sh_browser_input.release_controls()
+    if sh_browser_cursor_owned then
+        local mode = type(sampGetCursorMode) == 'function' and sampGetCursorMode() or 4
+        if mode == 4 and not windows.fast[0] then sampSetCursorMode(0) end
+        sh_browser_cursor_owned = false
+    end
+    if sh_browser_lock_owned then
+        lockPlayerControl(false)
+        sh_browser_lock_owned = false
+    end
+end
+
+function sh_browser_input.disable(state)
+    if state.web_mouse_down and state.overlay_rect and state.started then
+        local x, y = getCursorPos()
+        local rect = state.overlay_rect
+        sh_browser_manager.pointer('mouseReleased', x - rect.x, y - rect.y - 78, 0, false)
+    end
+    sh_browser_input.enabled = false
+    state.address_edit = false
+    state.web_mouse_down = false
+    state.web_keyboard = false
+    state.web_surrogate = nil
+    state.pointer_drag = nil
+    state.pointer_down = false
+    sh_browser_input.release_controls()
+end
 pcall(ffi.cdef, 'short __stdcall GetAsyncKeyState(int vKey);')
+pcall(ffi.cdef, 'int __stdcall IsWindowUnicode(void* window);')
+pcall(ffi.cdef, 'int __stdcall MultiByteToWideChar(unsigned int codePage, unsigned long flags, const char* source, int sourceLength, unsigned short* output, int outputLength);')
 local sh_browser_user32=ffi.load('user32')
+
+function sh_browser_input.web_text(state, value)
+    if value >= 128 and value < 256
+        and sh_browser_user32.IsWindowUnicode(ffi.cast('void*', ffi.C.GetActiveWindow())) == 0 then
+        local wide = ffi.new('unsigned short[1]')
+        if ffi.C.MultiByteToWideChar(0, 0, string.char(value), 1, wide, 1) == 1 then value = wide[0] end
+    end
+    if value >= 0xD800 and value <= 0xDBFF then state.web_surrogate = value; return end
+    if value >= 0xDC00 and value <= 0xDFFF then
+        if not state.web_surrogate then return end
+        value = 0x10000 + (state.web_surrogate - 0xD800) * 1024 + value - 0xDC00
+    end
+    state.web_surrogate = nil
+    if value >= 32 or value == 13 then
+        sh_browser_manager.pointer('char', value, 0, sh_browser_input.web_modifiers(), false)
+    end
+end
+
+function sh_browser_input.web_modifiers()
+    local mods = sh_browser_input.modifiers()
+    return (bit.band(mods, 4) ~= 0 and 1 or 0)
+        + (bit.band(mods, 1) ~= 0 and 2 or 0)
+        + (bit.band(mods, 2) ~= 0 and 8 or 0)
+end
 local sh_browser_address_buf=ffi.new('char[2048]')
 imgui.OnFrame(function()
     local s=sh_browser_manager and sh_browser_manager.state
     return s and s.started and s.mode~='external' and s.status.window_visible==true and s.overlay_rect~=nil
 end,function(self)
-    self.HideCursor=true
     local bs=sh_browser_manager.state
+    local cursor_active = sh_browser_input.enabled and sh_browser_input.available(bs)
+    self.HideCursor = not cursor_active
+    if cursor_active and not bs.address_edit then imgui.SetMouseCursor(imgui.MouseCursor.Arrow) end
     local r=bs.overlay_rect
     local flags=imgui.WindowFlags.NoTitleBar+imgui.WindowFlags.NoResize+imgui.WindowFlags.NoMove+imgui.WindowFlags.NoSavedSettings+imgui.WindowFlags.NoFocusOnAppearing+imgui.WindowFlags.NoBackground
     if not bs.address_edit then flags=flags+imgui.WindowFlags.NoInputs end
@@ -16828,7 +16923,7 @@ end,function(self)
     imgui.Begin('##SHBrowserChrome',nil,flags)
     local dl=imgui.GetWindowDrawList()
     dl:AddRectFilled(imgui.ImVec2(r.x,r.y),imgui.ImVec2(r.x+r.w,r.y+32),0xFF302A25,6)
-    dl:AddText(imgui.ImVec2(r.x+12,r.y+8),0xFFF0E8E0,u8'Браузер — откройте чат для перемещения')
+    dl:AddText(imgui.ImVec2(r.x+12,r.y+8),0xFFF0E8E0,u8(cursor_active and 'Браузер — Esc: вернуть управление игре' or ('Браузер — курсор: ' .. sh_browser_input.key_label())))
     dl:AddText(imgui.ImVec2(r.x+r.w-25,r.y+8),0xFFFFFFFF,'X')
     dl:AddRectFilled(imgui.ImVec2(r.x,r.y+32),imgui.ImVec2(r.x+r.w,r.y+78),0xFF252321)
     local function button(x,w,label,enabled)
@@ -16876,29 +16971,24 @@ function sh_browser_tick()
         sh_browser_manager.state.message = 'Ошибка связи с браузером. Перезагрузите StateHelper.'
     end
     local state = sh_browser_manager.state
-    local hover=false
-    if state.mode~='external' and state.started and state.status.window_visible==true and not windows.fast[0] and sampIsChatInputActive() and state.overlay_rect then
-        local x,y=getCursorPos();local r=state.overlay_rect
-        hover=x>=r.x and x<r.x+r.w and y>=r.y and y<r.y+r.h
-    end
-    local focused = state.address_edit==true or hover or state.mode ~= 'external' and state.started and state.interactive == true and state.status.window_visible ~= false
+    if not (windows.main[0] and tab_settings == 24) then sh_browser_input.choosing_key = false end
+    local available = sh_browser_input.available(state)
+    if sh_browser_input.enabled and not available then sh_browser_input.disable(state) end
+    local focused = available and sh_browser_input.enabled
     if focused and not sh_browser_cursor_owned then
         local mode = type(sampGetCursorMode) == 'function' and sampGetCursorMode() or 0
         if mode == 0 then sampSetCursorMode(4); sh_browser_cursor_owned = true end
-    elseif not focused and sh_browser_cursor_owned then
-        local mode = type(sampGetCursorMode) == 'function' and sampGetCursorMode() or 4
-        if mode == 4 and not windows.fast[0] then sampSetCursorMode(0) end
-        sh_browser_cursor_owned = false
     end
     if focused and not sh_browser_lock_owned and type(isPlayerControlOn) == 'function' then
         local checked, enabled = pcall(isPlayerControlOn, PLAYER_HANDLE)
         if checked and enabled then lockPlayerControl(true); sh_browser_lock_owned = true end
-    elseif not focused and sh_browser_lock_owned then
-        lockPlayerControl(false); sh_browser_lock_owned = false
+    elseif not focused then
+        sh_browser_input.release_controls()
     end
 end
 
 function sh_browser_close()
+    sh_browser_input.enabled = false
     if sh_browser_manager then
         for _, logo in ipairs(sh_browser_manager.state.search_logos or {}) do
             if logo.texture then pcall(imgui.ReleaseTexture, logo.texture); logo.texture = nil end
@@ -16910,22 +17000,25 @@ function sh_browser_close()
 end
 
 local sh_browser_bootstrap = {
-    url = 'https://raw.githubusercontent.com/kysteno4ek/StateHelper/81f8dbcc86fa815222431b142a8f09222bca92da/statehelper-browser-files.zip',
-    size = 2947491,
-    sha256 = 'd92005cae1b5ef7c5f5751d18ba0b462519ffa5ced2d704d0391d955cb75ae5f',
-    -- Byte ranges in the verified, uncompressed ZIP. The archive hash fixes the layout.
+    url = 'https://raw.githubusercontent.com/kysteno4ek/StateHelper/beta/statehelper-browser-files-v2.zip',
+    size = 2947784,
+    sha256 = 'e668b2614cfdd505a8874d537f10083fecd0dd162df9647ef8be61527507aada',
     files = {
-        {'StateHelperBrowser.exe', 61, 66048},
-        {'Assets/forum-arizona-hq.png', 66174, 783405},
-        {'Assets/youtube-hq.png', 849638, 658104},
-        {'Assets/alice-ai-transparent.png', 1507811, 1069419},
-        {'Assets/weather-clouds.png', 2577293, 337028},
-        {'browser.lua', 2914370, 32639},
+        {'StateHelperBrowser.exe', 61, 65024},
+        {'Assets/forum-arizona-hq.png', 65150, 783405},
+        {'Assets/youtube-hq.png', 848614, 658104},
+        {'Assets/alice-ai-transparent.png', 1506787, 1069419},
+        {'Assets/weather-clouds.png', 2576269, 337028},
+        {'browser.lua', 2913346, 33956},
+    },
+    installed = {
+        {'StateHelperBrowser.exe', 65024, 'd3efa78e7f7e28fdc5649b44bdf838be287c6a18fecd9da317f2ada22a90faab'},
+        {'browser.lua', 33956, 'e435816a4d059fceb47f6595c4fc4bbf3b7f724a331e6ae09fe6c1c64d32f420'},
     },
 }
 
-function sh_browser_bootstrap.verify(data)
-    if type(data) ~= 'string' or #data ~= sh_browser_bootstrap.size then return false end
+function sh_browser_bootstrap.verify(data, size, digest_hex)
+    if type(data) ~= 'string' or #data ~= (size or sh_browser_bootstrap.size) then return false end
     ffi.cdef([[
         long __stdcall BCryptOpenAlgorithmProvider(void**, const wchar_t*, const wchar_t*, unsigned long);
         long __stdcall BCryptHash(void*, const void*, unsigned long, const void*, unsigned long, void*, unsigned long);
@@ -16940,7 +17033,7 @@ function sh_browser_bootstrap.verify(data)
     api.BCryptCloseAlgorithmProvider(provider[0], 0)
     if status ~= 0 then return false end
     local hex = ffi.string(digest, 32):gsub('.', function(byte) return ('%02x'):format(byte:byte()) end)
-    return hex == sh_browser_bootstrap.sha256
+    return hex == (digest_hex or sh_browser_bootstrap.sha256)
 end
 
 function sh_browser_bootstrap.unpack(path, root)
@@ -16973,9 +17066,11 @@ function sh_browser_bootstrap.start()
     setup.downloading = true
     setup.message = 'Скачиваем файлы браузера с GitHub…'
     local root = dir .. '/State Helper/Browser'
-    local archive = root .. '.download-' .. os.time()
+    setup.attempt = (setup.attempt or 0) + 1
+    local attempt = setup.attempt
+    local archive = root .. '.download-' .. os.time() .. '-' .. attempt
     local function finish(success)
-        if not setup.downloading then return end
+        if not setup.downloading or setup.attempt ~= attempt then return end
         setup.downloading = false
         local ok, reason = false, 'download failed'
         if success then ok, reason = pcall(setup.unpack, archive, root) end
@@ -16990,9 +17085,13 @@ function sh_browser_bootstrap.start()
     end
     local ok, id = pcall(downloadUrlToFile, setup.url, archive, function(_, status)
         if status == dlstatus.STATUS_ENDDOWNLOADDATA then finish(true)
-        elseif status == dlstatus.STATUS_DOWNLOAD_ERROR then finish(false) end
+        elseif status == dlstatus.STATUS_DOWNLOAD_ERROR or status == dlstatus.STATUSEX_ENDDOWNLOAD then finish(false) end
     end)
-    if not ok or not id or id == 0 then finish(false) end
+    if not ok or not id or id == 0 then finish(false); return end
+    lua_thread.create(function()
+        wait(120000)
+        finish(false)
+    end)
 end
 
 function sh_browser_bootstrap.draw()
@@ -17053,12 +17152,27 @@ local function sh_browser_ensure()
             sh_browser_load_error = 'Не установлен загрузчик браузера.'
             return
         end
+        for _, entry in ipairs(sh_browser_bootstrap.installed) do
+            local file = io.open(root .. '/' .. entry[1], 'rb')
+            local data = file and file:read(entry[2] + 1)
+            if file then file:close() end
+            local ok, valid = pcall(sh_browser_bootstrap.verify, data, entry[2], entry[3])
+            if not ok or not valid then
+                sh_browser_load_error = 'Файлы браузера требуют обновления.'
+                sh_browser_bootstrap.message = sh_browser_load_error
+                return
+            end
+        end
         local factory, err = loadfile(root .. '/browser.lua')
         if factory then
             local loaded, constructor = pcall(factory)
             if loaded and type(constructor) == 'function' then
                 local browser_gui = setmetatable({Text = function(x, y, label, face)
-                    if label == 'Ctrl+B — переключить управление игрой и браузером.' or label == 'Файлы скачаны.' then return end
+                    if label == 'Ctrl+B — переключить управление игрой и браузером.' or label == 'Файлы скачаны.'
+                        or label == 'Режим сохранён.' or label == 'Настройки сохранены.' then return end
+                    if x == 26 and y == 365 and sh_browser_manager then
+                        y = 332 + 44 * (sh_browser_manager.state.cursor_settings_progress or 0)
+                    end
                     gui.Text(x, y, label, face)
                 end, DrawBox = function(pos, size, ...)
                     if pos[1] == 16 and pos[2] == 220 and size[1] == 586 and size[2] == 132 then
@@ -17066,18 +17180,35 @@ local function sh_browser_ensure()
                     end
                     return gui.DrawBox(pos, size, ...)
                 end, Button = function(label, pos, size, ...)
-                    if pos[2] == 266 and (pos[1] == 26 or pos[1] == 258) and size[1] == 220 and size[2] == 30 then
-                        pos, size = {pos[1], 270}, {220, 32}
+                    local is_mode = pos[2] == 266 and (pos[1] == 26 or pos[1] == 258)
+                        and size[1] == 220 and size[2] == 30
+                    if is_mode then pos, size = {pos[1], 270}, {220, 32} end
+                    local selected
+                    if is_mode or (pos[2] == 160 and (pos[1] == 26 or pos[1] == 258) and size[1] == 220) then
+                        label, selected = label:gsub(u8' %(выбран%)$', '')
                     end
-                    return gui.Button(label, pos, size, ...)
+                    local clicked = gui.Button(label, pos, size, ...)
+                    if selected == 1 then
+                        gui.FaText(pos[1] + size[1] - 24, pos[2] + 9, fa.CHECK, fa_font[2],
+                            imgui.ImVec4(0.30, 0.85, 0.38, 1))
+                    end
+                    return clicked
                 end}, {__index = gui})
-                local ok, manager = pcall(constructor, {ffi=ffi,json=json,imgui=imgui,gui=browser_gui,u8=u8,shell32=shell32,search_font=notify_font,hide_main=function() windows.main[0]=false end,begin_address_edit=function() sampSetChatInputEnabled(false) end,game_context=function()
+                local ok, manager = pcall(constructor, {ffi=ffi,json=json,imgui=imgui,gui=browser_gui,u8=u8,shell32=shell32,search_font=notify_font,hide_main=function() windows.main[0]=false end,begin_address_edit=function() sampSetChatInputEnabled(false) end,input_failed=function()
+                    local state = sh_browser_manager.state
+                    state.web_mouse_down = false
+                    sh_browser_input.disable(state)
+                    sampAddChatMessage('[SH] {FFFFFF}Браузер не успевает обработать ввод. Управление возвращено игре.', 0xFF5345)
+                end,game_context=function()
                     local width,height=getScreenResolution()
-                    local chat_open=not windows.fast[0] and (sampIsChatInputActive() or (sh_browser_manager and sh_browser_manager.state.address_edit==true))
-                    local mouse_x,mouse_y=0,0
-                    if chat_open then mouse_x,mouse_y=getCursorPos() end
-                    local cursor_busy=not windows.fast[0] and not chat_open and not sh_browser_cursor_owned and type(sampGetCursorMode)=='function' and sampGetCursorMode()~=0
-                    return {width=width,height=height,input_blocked=windows.fast[0],chat_mouse=chat_open,mouse_x=mouse_x,mouse_y=mouse_y,mouse_down=chat_open and bit.band(tonumber(sh_browser_user32.GetAsyncKeyState(1)),0x8000)~=0,blocked=windows.main[0] or windows.smart_su[0] or windows.action[0] or windows.stroi[0] or windows.shpora[0] or windows.reminder[0] or cursor_busy or sampIsDialogActive() or isGamePaused() or scene_active or edit_key or edit_cmd}
+                    local state = sh_browser_manager and sh_browser_manager.state
+                    local cursor = sh_browser_input.enabled and sh_browser_input.available(state)
+                    local mouse_x, mouse_y = 0, 0
+                    if cursor then mouse_x, mouse_y = getCursorPos() end
+                    return {width=width, height=height, input_blocked=windows.fast[0], chat_mouse=cursor,
+                        mouse_x=mouse_x, mouse_y=mouse_y,
+                        mouse_down=cursor and bit.band(tonumber(sh_browser_user32.GetAsyncKeyState(1)), 0x8000) ~= 0,
+                        blocked=sh_browser_input.window_blocked()}
                 end,root=dir .. '/State Helper/Browser'})
                 if ok and type(manager) == 'table' then
                     sh_browser_manager = manager
@@ -17092,10 +17223,86 @@ local function sh_browser_ensure()
     end
 end
 
+function sh_browser_input.draw_key_popup()
+    if not imgui.BeginPopupModal('##SHBrowserCursorKeyPopup', null,
+        imgui.WindowFlags.AlwaysAutoResize + imgui.WindowFlags.NoMove + imgui.WindowFlags.NoTitleBar) then return end
+
+    imgui.SetCursorPos(imgui.ImVec2(10, 10))
+    local close = imgui.InvisibleButton('##SHCloseBrowserKey', imgui.ImVec2(16, 16))
+    gui.DrawCircle({18, 18}, 7, imgui.ImVec4(0.98, 0.40, 0.38, 1))
+    if close or not sh_browser_input.choosing_key then
+        sh_browser_input.choosing_key = false
+        imgui.CloseCurrentPopup()
+    else
+        imgui.SetCursorPos(imgui.ImVec2(10, 40))
+        imgui.BeginChild('##SHBrowserCursorKeyBody', imgui.ImVec2(390, 181), false, imgui.WindowFlags.NoScrollbar)
+        gui.Text(10, 0, 'Нажмите на необходимую клавишу или комбинацию', font[3])
+        gui.Text(10, 25, 'Текущее сочетание:', font[3])
+        imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.90, 0.63, 0.22, 1))
+        gui.Text(145, 25, sh_browser_input.key_label(), font[3])
+        imgui.PopStyleColor()
+        gui.DrawLine({0, 50}, {381, 50}, cl.line)
+
+        local key = sh_browser_input.pending_key
+        local label = key and sh_browser_input.key_label(key, sh_browser_input.pending_modifiers) or ''
+        imgui.PushFont(bold_font[3])
+        local width = imgui.CalcTextSize(label).x
+        imgui.PopFont()
+        imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.15, 0.75, 0.23, 1))
+        gui.Text(195 - width / 2, 80, label, bold_font[3])
+        imgui.PopStyleColor()
+
+        local disabled
+        if not key then disabled = false end
+        if gui.Button(u8'Применить', {0, 144}, {185, 29}, disabled) and key then
+            setting.browser_cursor_key = key
+            setting.browser_cursor_modifiers = sh_browser_input.pending_modifiers
+            save()
+            sh_browser_input.choosing_key = false
+            imgui.CloseCurrentPopup()
+        end
+        if gui.Button(u8'Очистить', {194, 144}, {185, 29}) then
+            sh_browser_input.pending_key = nil
+        end
+        imgui.EndChild()
+    end
+    imgui.EndPopup()
+end
+
 function hall.browser_settings()
     sh_browser_ensure()
     if sh_browser_manager then
+        local state = sh_browser_manager.state
+        local embedded = (state.pending_mode or state.mode) ~= 'external'
+        local progress = state.cursor_settings_progress
+        if progress == nil then progress = embedded and 1 or 0 end
+        local step = math.max(0, imgui.GetIO().DeltaTime) * 6
+        progress = embedded and math.min(1, progress + step) or math.max(0, progress - step)
+        state.cursor_settings_progress = progress
+        if not embedded then sh_browser_input.choosing_key = false end
+
         sh_browser_manager.draw_settings(cl, font, bold_font)
+        local top, height = 324, 44
+        if gui.BeginReveal(progress, top, height) then
+            local y = top - height * (1 - progress)
+            gui.DrawBox({16, y}, {586, height}, cl.tab, cl.line, 7, 15)
+            local activation = 'Текущая активация'
+            gui.Text(26, y + 16, activation, font[3])
+            imgui.PushFont(font[3])
+            local label_width = imgui.CalcTextSize(u8(activation)).x
+            imgui.PopFont()
+            imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.30, 0.85, 0.38, 1))
+            gui.Text(26 + label_width + 12, y + 16, sh_browser_input.key_label(), font[3])
+            imgui.PopStyleColor()
+            if gui.Button(u8'Изменить клавишу активации##BrowserCursorKey', {392, y + 10}, {200, 25})
+                and embedded and progress == 1 then
+                sh_browser_input.choosing_key = true
+                sh_browser_input.pending_key = nil
+                imgui.OpenPopup('##SHBrowserCursorKeyPopup')
+            end
+            gui.EndReveal()
+        end
+        sh_browser_input.draw_key_popup()
     else
         sh_browser_bootstrap.draw()
     end
@@ -17191,7 +17398,7 @@ function sh_browser_bootstrap.draw_search_choice(manager)
             if write_file(path, data) then
                 state.search_engine = logo.engine
                 state.message = ''
-                state.settings_message = 'Настройки сохранены.'
+                state.settings_message = nil
             else
                 state.message = 'Не удалось сохранить выбор. Попробуйте ещё раз.'
                 state.settings_message = state.message
@@ -17815,6 +18022,7 @@ function cmd_edit(nm_cmd_edit, cmd_cur)
 end
 
 function key_edit(name_popup_key, key_cur)
+	local saved_keys = key_cur[2] or {}
 	if imgui.BeginPopupModal(name_popup_key, null, imgui.WindowFlags.AlwaysAutoResize + imgui.WindowFlags.NoMove + imgui.WindowFlags.NoTitleBar) then
 		if imgui.IsKeyPressed(27, false) then
 			lockPlayerControl(false)
@@ -17843,12 +18051,12 @@ function key_edit(name_popup_key, key_cur)
 		imgui.SetCursorPos(imgui.ImVec2(10, 25))
 		imgui.Text(u8'Текущее сочетание:')
 		imgui.SetCursorPos(imgui.ImVec2(145, 25))
-		if #key_bool_cur == 0 then
+		if #saved_keys == 0 then
 			imgui.TextColored(imgui.ImVec4(0.90, 0.22, 0.22 ,1.00), u8'Отсутствует')
 		else
 			local all_key = {}
-			for i = 1, #key_bool_cur do
-				table.insert(all_key, vkeys.id_to_name(key_bool_cur[i]))
+			for i = 1, #saved_keys do
+				table.insert(all_key, vkeys.id_to_name(saved_keys[i]))
 			end
 			imgui.TextColored(imgui.ImVec4(0.90, 0.63, 0.22 ,1.00), table.concat(all_key, ' + '))
 		end
@@ -24014,24 +24222,64 @@ function sh_license.begin(id, license, term)
 	sh_license.pending = {id = id, nick = sampGetPlayerNickname(id), license = license, term = term, phase = 'sale', expected_command = '/givelicense '..id, server = table.concat({sampGetCurrentServerAddress()}, ':'), deadline = os.clock() + 30}
 	return true
 end
-function sh_license.dialog(id, title)
-	local request = sh_license.pending
-	if not request then return end
-	if not sh_license.valid(request) then sh_license.cancel('истекло время ожидания или изменился игрок/подключение'); return end
-	sh_license.trace('dialog '..tostring(id)..': '..title,request)
-	local name = to_lowercase(title:gsub('{%x+}', '')):match('^%s*(.-)%s*$')
-	if name == 'продажа лицензии' and request.phase == 'sale' then
-		request.phase, request.deadline = 'term', os.clock() + 30
-		sampSendDialogResponse(id, 1, request.license, '')
-		return false
-	elseif name == 'выбор срока лицензий' and request.phase == 'term' then
-		local term = request.term
-		sh_license.trace('term response sent (server confirmation pending)',request)
-		sh_license.cancel()
-		sampSendDialogResponse(id, 1, term, '')
-		return false
-	end
-	sh_license.cancel('открылся другой диалог: '..name)
+-- Keep the existing template IDs, but resolve the actual row from the current server list.
+sh_license.names = {
+    [0] = {'авто'}, {'мото'}, {'полёт', 'полет'}, {'рыбал'}, {'водн'}, {'оруж'},
+    {'охот'}, {'раскоп'}, {'такси'}, {'механ'}, {'криптовалют'}, {'акци'}
+}
+
+function sh_license.find_row(style, text, matches, check_details)
+    if (style ~= 2 and style ~= 4 and style ~= 5) or type(text) ~= 'string' then return nil end
+    local index, found = style == 5 and -2 or -1, nil
+    for line in (text:gsub('\r\n', '\n'):gsub('\r', '\n') .. '\n'):gmatch('(.-)\n') do
+        index = index + 1
+        if index >= 0 then
+            local label = to_lowercase((line:match('^[^	]*') or ''):gsub('{%x+}', ''))
+            if matches(label) then
+                local clean = check_details and to_lowercase(line:gsub('{%x+}', '')) or label
+                if found or clean:find('недоступ', 1, true) then return nil end
+                found = index
+            end
+        end
+    end
+    return found
+end
+
+function sh_license.dialog(id, style, title, text)
+    local request = sh_license.pending
+    if not request then return end
+    if not sh_license.valid(request) then sh_license.cancel('истекло время ожидания или изменился игрок/подключение'); return end
+    sh_license.trace('dialog '..tostring(id)..': '..title,request)
+    local name = to_lowercase(title:gsub('{%x+}', '')):match('^%s*(.-)%s*$')
+    local row
+    if name == 'продажа лицензии' and request.phase == 'sale' then
+        row = sh_license.find_row(style, text, function(label)
+            if not label:match('^%s*%d+%.') then return false end
+            -- Test the more specific names before the generic "авто".
+            for offset = 1, 12 do
+                local kind = offset % 12
+                for _, alias in ipairs(sh_license.names[kind]) do
+                    if label:find(alias, 1, true) then return kind == request.license end
+                end
+            end
+            return false
+        end, false)
+        if row == nil then sh_license.cancel('лицензия не найдена или недоступна. Выберите её вручную'); return end
+        request.phase, request.deadline = 'term', os.clock() + 30
+    elseif name == 'выбор срока лицензий' and request.phase == 'term' then
+        local short = request.license == 10 or request.license == 11
+        row = sh_license.find_row(style, text, function(label)
+            if short then return label:match('5%s*дн') ~= nil end
+            return tonumber(label:match('(%d+)%s*месяц')) == request.term + 1
+        end, true)
+        if row == nil then sh_license.cancel('срок не найден или недоступен. Выберите его вручную'); return end
+        sh_license.cancel()
+    else
+        sh_license.cancel('открылся другой диалог: '..name)
+        return
+    end
+    sampSendDialogResponse(id, 1, row, '')
+    return false
 end
 function sh_license.send(text)
 	local request = sh_license.pending
@@ -26534,7 +26782,7 @@ local function sign_pick_open_city()
 	end)
 end
 function hook.onShowDialog(id, style, title, but_1, but_2, text, payload)
-	if sh_license.pending and sh_license.dialog(id, title) == false then return false end
+	if sh_license.pending and sh_license.dialog(id, style, title, text) == false then return false end
 	do
 		local ok, hide = pcall(function()
 			local result = stroi.members_dialog(id, style, title, text)
@@ -27290,16 +27538,74 @@ function check_and_correct(variable)
 end
 
 function onWindowMessage(msg, wparam, lparam)
+    local browser_state = sh_browser_manager and sh_browser_manager.state
+    if msg == 0x0008 then
+        sh_browser_input.swallow_key = nil
+        if sh_browser_input.enabled and browser_state then sh_browser_input.disable(browser_state) end
+    end
+    local key_down, key_up = msg == 0x100 or msg == 0x104, msg == 0x101 or msg == 0x105
+    if (key_down or key_up) and sh_browser_input.swallow_key == wparam then
+        if key_up then sh_browser_input.swallow_key = nil end
+        consumeWindowMessage(true, false)
+        return
+    end
+    if key_down and sh_browser_input.choosing_key and windows.main[0] and tab_settings == 24
+        and not sampIsChatInputActive() and not sampIsDialogActive() then
+        if bit.band(lparam, 0x40000000) ~= 0 then return end
+        if wparam == 0x1B or sh_browser_input.valid_key(wparam) then
+            sh_browser_input.swallow_key = wparam
+            consumeWindowMessage(true, false)
+            if wparam == 0x1B then
+                sh_browser_input.choosing_key = false
+            else
+                sh_browser_input.pending_key = wparam
+                sh_browser_input.pending_modifiers = sh_browser_input.modifiers()
+            end
+            return
+        end
+    end
+    if key_down and wparam == 0x1B and sh_browser_input.enabled and sh_browser_input.available(browser_state) then
+        sh_browser_input.swallow_key = wparam
+        consumeWindowMessage(true, true, true)
+        sh_browser_input.disable(browser_state)
+        return
+    end
+    if sh_browser_input.enabled and sh_browser_input.available(browser_state) and browser_state.web_keyboard
+        and (key_down or key_up or msg == 0x102 or msg == 0x106) then
+        consumeWindowMessage(true, true, true)
+        if msg == 0x102 or msg == 0x106 then
+            sh_browser_input.web_text(browser_state, wparam)
+        else
+            sh_browser_manager.pointer(key_down and 'rawKeyDown' or 'keyUp', wparam,
+                bit.band(bit.rshift(lparam, 16), 0x1FF), sh_browser_input.web_modifiers(),
+                key_down and bit.band(lparam, 0x40000000) ~= 0)
+        end
+        return
+    end
+    if key_down and wparam == sh_browser_input.key() and sh_browser_input.available(browser_state)
+        and not browser_state.address_edit and sh_browser_input.modifiers() == setting.browser_cursor_modifiers then
+        consumeWindowMessage(true, false)
+        if bit.band(lparam, 0x40000000) == 0 then
+            sh_browser_input.swallow_key = wparam
+            if sh_browser_input.enabled then sh_browser_input.disable(browser_state)
+            else sh_browser_input.enabled = true end
+        end
+        return
+    end
     if sh_browser_manager and sh_browser_manager.state.address_edit and (msg==0x100 or msg==0x101) and wparam==0x1B then
         sh_browser_manager.state.address_edit=false;consumeWindowMessage(true,false);return
     end
-    if sh_browser_manager and sh_browser_manager.state.started and sh_browser_manager.state.mode~='external' and sh_browser_manager.state.status.window_visible==true and not windows.fast[0] and sampIsChatInputActive() and not sampIsDialogActive() then
+    if sh_browser_input.enabled and sh_browser_input.available(browser_state) then
         local state=sh_browser_manager.state;local r=state.overlay_rect
         if r and (msg==0x200 or msg==0x201 or msg==0x202 or msg==0x203 or msg==0x20A) then
             local x,y=getCursorPos()
             local inside=x>=r.x and x<r.x+r.w and y>=r.y and y<r.y+r.h
             local page=inside and y>=r.y+78 and y<r.y+r.h-12
             local captured=state.web_mouse_down==true
+            if msg==0x201 then
+                state.web_keyboard=page
+                state.web_surrogate=nil
+            end
             if page or (msg==0x202 and captured) then
                 local action=msg==0x201 and 'mousePressed' or msg==0x202 and 'mouseReleased' or msg==0x20A and 'mouseWheel' or 'mouseMoved'
                 local delta=bit.rshift(wparam,16);if delta>=32768 then delta=delta-65536 end
@@ -27309,11 +27615,7 @@ function onWindowMessage(msg, wparam, lparam)
             if msg~=0x200 and (inside or (msg==0x202 and captured)) then consumeWindowMessage(true,false);return end
         end
     end
-    if sh_browser_manager and sh_browser_manager.state.started and not sh_browser_manager.state.interactive and sh_browser_manager.state.mode ~= 'external' and not windows.fast[0] and wparam == 0x42 and (msg == 0x100 or msg == 0x101) and isKeyDown(vkeys.VK_CONTROL) and not isKeyDown(vkeys.VK_MENU) and not isKeyDown(vkeys.VK_SHIFT) and not sampIsChatInputActive() and not sampIsDialogActive() and not edit_key and not edit_cmd then
-        consumeWindowMessage(true, false)
-        if msg == 0x100 and bit.band(lparam, 0x40000000) == 0 then sh_browser_manager.toggle_input() end
-        return
-    end
+
 	if stroi.run.active and stroi.run.phase == 'wait' and (msg == 0x100 or msg == 0x101) and stroi.can_confirm() then
 		local keys = setting.enter_key[1]
 		if #keys == 0 and wparam == vkeys.VK_RETURN then consumeWindowMessage(true, false) end
@@ -30007,7 +30309,11 @@ function update_check()
 					if not f then return end
 					local ok_info, info = pcall(decodeJson, f:read('*a'))
 					f:close()
-					if not ok_info or type(info) ~= 'table' or not info.version then return end
+					if not ok_info or type(info) ~= 'table' or type(info.version) ~= 'string'
+						or not info.version:match('^%d+%.%d+%.%d+$') then return end
+					if type(info.text) ~= 'string' or info.text == '' then info.text = u8'Описание обновления недоступно.' end
+					info.size = tonumber(info.size)
+					if info.size and (info.size <= 0 or info.size == math.huge) then info.size = nil end
 					update_info = info
 					
 					local function versionToNumber(version)
@@ -30208,23 +30514,41 @@ function update_error()
 end
 function apply_settings(name_file, description_file, array_arg)
  local path = dir .. '/State Helper/' .. name_file
- if not doesFileExist(path) then
-  print('[SH] Settings file not found: ' .. name_file)
-  return array_arg
+ local function read_settings(filename)
+  local file = io.open(filename, 'rb')
+  if not file then return nil end
+  local data = file:read('*a'); file:close()
+  if not data then return nil end
+  data = data:gsub('^\239\187\191', '')
+  if data:match('^%s*{') then
+   local ok, value = pcall(decodeJson, data)
+   if ok and type(value) == 'table' then return value, data end
+  end
  end
- local file, open_error = io.open(path, 'rb')
- if not file then
-  print('[SH] Cannot read settings: ' .. tostring(open_error))
-  return array_arg
+ local saved = read_settings(path)
+ if not saved then
+  local can_restore = not doesFileExist(path)
+  if not can_restore then
+   local invalid_base = path .. '.invalid-' .. os.time()
+   local invalid, index = invalid_base, 1
+   while doesFileExist(invalid) do
+    index = index + 1
+    invalid = invalid_base .. '-' .. index
+   end
+   can_restore = os.rename(path, invalid) ~= nil
+  end
+  for _, suffix in ipairs({'.last-good', '.old'}) do
+   local fallback, data = read_settings(path .. suffix)
+   if fallback then
+    saved = fallback
+    local restored = can_restore and write_file(path, data)
+    print(restored and '[SH] Settings restored from backup.' or '[SH] Using backup settings; could not restore the file.')
+    break
+   end
+  end
  end
- local data = file:read('*a'); file:close()
- local ok, saved = pcall(decodeJson, data)
- if not ok or type(saved) ~= 'table' then
-  local invalid = path .. '.invalid-' .. os.time()
-  local n = 1
-  while doesFileExist(invalid) do n = n + 1; invalid = path .. '.invalid-' .. os.time() .. '-' .. n end
-  local moved, err = os.rename(path, invalid)
-  print('[SH] Invalid settings: ' .. (moved and invalid or tostring(err)))
+ if not saved then
+  print('[SH] No valid settings or backup: ' .. name_file)
   return array_arg
  end
  local encoding_updated = false
