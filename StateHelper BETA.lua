@@ -995,7 +995,8 @@ setting = {
 	winter_show_garland = true,
 	winter_show_icicles = false,
 	cmd_open_win = '',
-	tab = {'settings', 'cmd', 'shpora', 'dep', 'sob', 'reminder', 'stat', 'music', 'rp_zona', 'actions', 'help'},
+	tab = {'settings', 'cmd', 'shpora', 'dep', 'sob', 'reminder', 'stat', 'music', 'rp_zona', 'help', 'actions'},
+	browser_before_actions = false,
 	auto_update = false,
 	name_rus = '',
 	sex = 1,
@@ -1547,6 +1548,47 @@ function sh_audit.migrate_commands()
 	end
 	if setting.org == 5 and (names.licnewbie or added_newbie) then setting.newbie_variant_migrated = true; save() end
 	return changed
+end
+
+sh_audit.settings_backups = {'.last-good', '.old'}
+
+function sh_audit.archive_settings_for_reset()
+	local base = dir .. '/State Helper/'
+	local archive = base .. 'Archive'
+	if not doesDirectoryExist(archive) then lfs.mkdir(archive) end
+	if not doesDirectoryExist(archive) then return false, archive end
+
+	local prefix = archive .. '/settings-reset-' .. os.time()
+	local destination, index = prefix, 1
+	while doesDirectoryExist(destination) or doesFileExist(destination) do
+		index = index + 1
+		destination = prefix .. '-' .. index
+	end
+	local created, create_error = lfs.mkdir(destination)
+	if not created then return false, destination .. ': ' .. tostring(create_error) end
+
+	local names = {'Настройки.json', 'Отыгровки', 'Отыгровки-last-good.json'}
+	for _, suffix in ipairs(sh_audit.settings_backups) do
+		names[#names + 1] = 'Настройки.json' .. suffix
+	end
+	local moved = {}
+	for _, name in ipairs(names) do
+		local path = base .. name
+		if doesFileExist(path) or doesDirectoryExist(path) then
+			local ok, problem = os.rename(path, destination .. '/' .. name)
+			if not ok then
+				local failure = name .. ': ' .. tostring(problem)
+				for i = #moved, 1, -1 do
+					local item = moved[i]
+					local restored, restore_error = os.rename(destination .. '/' .. item, base .. item)
+					if not restored then failure = failure .. ' | ' .. item .. ': ' .. tostring(restore_error) end
+				end
+				return false, failure .. ' | ' .. destination
+			end
+			moved[#moved + 1] = name
+		end
+	end
+	return true, destination
 end
 
 function save(force)
@@ -2563,7 +2605,19 @@ local fast_action_names = {
 	['Выдать строгий выговор сотруднику организации'] = 'Выдать выговор',
 	['Провести лекцию'] = 'Провести лекцию',
 	['Начать или прекратить видеофиксацию'] = 'Видеофиксация',
-	['Показать игроку свои документы'] = 'Показать документы'
+	['Показать игроку свои документы'] = 'Показать документы',
+	['Продать лицензию на вождение автомобиля'] = 'Вождение автомобиля',
+	['Продать лицензию на вождение мотоцикла'] = 'Вождение мотоцикла',
+	['Продать лицензию на полёты'] = 'Полёты',
+	['Продать лицензию на рыболовство'] = 'Рыболовство',
+	['Продать лицензию на водный транспорт'] = 'Водный транспорт',
+	['Продать лицензию на оружие'] = 'Оружие',
+	['Продать лицензию на охоту'] = 'Охота',
+	['Продать лицензию на раскопки'] = 'Раскопки',
+	['Продать лицензию для работы в такси'] = 'Работа в такси',
+	['Продать лицензию для работы на механика'] = 'Работа механиком',
+	['Продать лицензию на криптовалюту'] = 'Криптовалюта',
+	['Продать лицензию на торговлю акциями'] = 'Торговля акциями'
 }
 
 local function fast_action_name(name)
@@ -2855,18 +2909,37 @@ function main()
         if changed then save() end
     end
 	setting.tab = normalize_tab_order(setting.tab)
-	-- setting.debug_mode left as loaded from settings (default false)
-	debug_init()
-	for _, list in ipairs({setting.fast.one_win, setting.fast.two_win}) do
-		for _, entry in ipairs(list) do
-			if fast_action_names[u8:decode(entry.name):match('^%s*(.-)%s*$')] then
-				local name = fast_action_name(entry.name)
-				if entry.name ~= name then
-					entry.name = name
-					settingsUpdated = true
-				end
+	if not setting.browser_before_actions then
+		for i, name in ipairs(setting.tab) do
+			if name == 'actions' then
+				table.remove(setting.tab, i)
+				table.insert(setting.tab, 'actions')
+				break
 			end
 		end
+		setting.browser_before_actions = true
+		settingsUpdated = true
+	end
+	-- setting.debug_mode left as loaded from settings (default false)
+	debug_init()
+	local function shorten_fast_names(list)
+		if type(list) ~= 'table' then return end
+		for _, entry in ipairs(list) do
+			if type(entry) == 'table' then
+				if type(entry.name) == 'string' and fast_action_names[u8:decode(entry.name):match('^%s*(.-)%s*$')] then
+					local name = fast_action_name(entry.name)
+					if entry.name ~= name then entry.name, settingsUpdated = name, true end
+				end
+				shorten_fast_names(entry.items)
+			end
+		end
+	end
+	shorten_fast_names(setting.fast.one_win)
+	shorten_fast_names(setting.fast.two_win)
+	shorten_fast_names(setting.fast.wheel)
+	shorten_fast_names(setting.fast.custom)
+	if type(setting.fast.by_org) == 'table' then
+		for _, list in pairs(setting.fast.by_org) do shorten_fast_names(list) end
 	end
 
 	if setting.auto_jack == nil then setting.auto_jack = false settingsUpdated = true end
@@ -3175,8 +3248,62 @@ function main()
 		end
 		if changed and not save_cmd() then print('[SH] Could not persist lecture rank 5; access updated for this session.') end
 	end
+	local license_command_changed = false
+	if tonumber(setting.org) == 5 then
+		local old_auto, auto_name_taken
+		for _, command in ipairs(cmd[1]) do
+			local name = command.cmd:lower()
+			if name == 'licmauto' then old_auto = command end
+			if name == 'licauto' then auto_name_taken = true end
+			if name == 'licgun' and command.arg[1] and command.arg[1].type == 1 then
+				command.arg[1].type = 2
+				license_command_changed = true
+			end
+		end
+		for _, name in ipairs(setting.command_tabs) do
+			if type(name) == 'string' and name:lower() == 'licauto' then auto_name_taken = true end
+		end
+		for _, shorthand in ipairs(setting.shp) do
+			if type(shorthand.cmd) == 'string' and shorthand.cmd:lower() == 'licauto' then auto_name_taken = true end
+		end
+		if old_auto and not auto_name_taken then
+			old_auto.cmd = 'licauto'
+			license_command_changed = true
+		end
+		if not old_auto or not auto_name_taken then
+			local fast, changed = setting.fast, false
+			local function rename_fast_auto(list)
+				if type(list) ~= 'table' then return end
+				for _, entry in ipairs(list) do
+					if type(entry) == 'table' then
+						if entry.cmd == 'licmauto' or entry.cmd == '/licmauto' then
+							entry.cmd = entry.cmd:gsub('licmauto$', 'licauto')
+							changed = true
+						end
+						rename_fast_auto(entry.items)
+					end
+				end
+			end
+			rename_fast_auto(fast.one_win)
+			rename_fast_auto(fast.two_win)
+			rename_fast_auto(fast.wheel)
+			rename_fast_auto(fast.custom)
+			if type(fast.by_org) == 'table' then
+				for _, list in pairs(fast.by_org) do rename_fast_auto(list) end
+			end
+			if type(fast.menu) == 'table' then
+				for _, menu in pairs(fast.menu) do
+					if type(menu) == 'table' and type(menu.off) == 'table' and menu.off.licmauto ~= nil then
+						if menu.off.licauto == nil then menu.off.licauto = menu.off.licmauto end
+						menu.off.licmauto, changed = nil, true
+					end
+				end
+			end
+			if changed then save() end
+		end
+	end
 	if #cmd[1] ~= 0 then
-		local bool_uid_save = false
+		local bool_uid_save = license_command_changed
 		for i = 1, #cmd[1] do
 			if cmd[1][i].UID == nil then
 				cmd[1][i].UID = math.random(20, 95000000)
@@ -7029,8 +7156,8 @@ function hall.settings()
 	new_tab_setting(imgui.ImVec4(0.56, 0.56, 0.58, 1.00), fa.CHART_SIMPLE, 'Статистика', 19, 1.5 + pos_tab_pl, {1, 0})
 	new_tab_setting(imgui.ImVec4(0.56, 0.56, 0.58, 1.00), fa.MUSIC, 'Музыка', 20, 1.5 + pos_tab_pl)
 	new_tab_setting(imgui.ImVec4(0.56, 0.56, 0.58, 1.00), fa.OBJECT_UNGROUP, 'РП зона', 21, 1.5 + pos_tab_pl, {-1, 0})
-	new_tab_setting(imgui.ImVec4(0.56, 0.56, 0.58, 1.00), fa.CUBE, 'Действия', 22, 1.5 + pos_tab_pl) --(0.11, 0.80, 0.62, 1.00)
-	new_tab_setting(imgui.ImVec4(0.56, 0.56, 0.58, 1.00), fa.GLOBE, 'Браузер', 24, 0.5 + pos_tab_pl)
+	new_tab_setting(imgui.ImVec4(0.56, 0.56, 0.58, 1.00), fa.GLOBE, 'Браузер', 24, -0.5 + pos_tab_pl)
+	new_tab_setting(imgui.ImVec4(0.56, 0.56, 0.58, 1.00), fa.CUBE, 'Действия', 22, 2.5 + pos_tab_pl)
 	
 	imgui.Dummy(imgui.ImVec2(0, 8))
 	if bool_go_stat_set then
@@ -16772,15 +16899,21 @@ function hall.actions()
 		script_ac.reset = script_ac.reset + 1
 		if script_ac.reset > 1 then
 			settings_reset_pending = true
-			os.remove(dir .. '/State Helper/Настройки.json')
-			remove(dir .. '/State Helper/Отыгровки')
-			if not setting.cef_notif then
-				sampAddChatMessage('[SH] {FFFFFF}Настройки сброшены. Перезагрузка скрипта...', 0xFF5345)
+			local archived, detail = sh_audit.archive_settings_for_reset()
+			if not archived then
+				settings_reset_pending = false
+				script_ac.reset = 0
+				sh_audit.io_error('Не удалось сбросить настройки. Проверьте доступ к папке State Helper.', detail)
 			else
-				cefnotig("[SH] {FFFFFF}Настройки сброшены. Перезагрузка скрипта...", 3000)
+				print('[SH] Reset backup: ' .. detail)
+				if not setting.cef_notif then
+					sampAddChatMessage('[SH] {FFFFFF}Настройки сброшены. Перезагрузка скрипта...', 0xFF5345)
+				else
+					cefnotig("[SH] {FFFFFF}Настройки сброшены. Перезагрузка скрипта...", 3000)
+				end
+				showCursor(false)
+				scr:reload()
 			end
-			showCursor(false)
-			scr:reload()
 		end
 	end
 	if gui.Button(script_ac.del == 0 and u8'Удалить скрипт с этого устройства' or u8'Нажмите снова для удаления скрипта', {220, 462}, {400, 27}) then
@@ -21930,7 +22063,7 @@ local function fast_section_defs()
 		{id = 'doc', name = 'Документы', icon = 'doc', cmds = {'showpassrp', 'showmcrp', 'showlicrp', 'showworkrp', 'pass', 'mc', 'visa', 'lic', 'wed', 'givemilitary', 'giveplate'}},
 		{id = 'cuff', name = 'Задержание', icon = 'cuff', cmds = {'cuff', 'uncuff', 'frisk', 'gotome', 'ungotome', 'pull', 'take', 'incar', 'miranda', 'unmask', 'untie', 'unbag', 'ungag', 'bot', 'arrest', 'clear', 'meg', 'bk', 'zp', 'bribe', 'punish', 'unpunish', 'carcer', 'setcarcer', 'uncarcer', 'getjail'}},
 		{id = 'med', name = 'Медицина', icon = 'plus', cmds = {'hl', 'hlactor', 'narko', 'ant', 'cur', 'cure', 'strah', 'mt', 'osm', 'rec', 'hme'}},
-		{id = 'lic', name = 'Лицензии', icon = 'card', cmds = {'licmauto', 'licmoto', 'licfly', 'licswim', 'licfish', 'lichunt', 'licdig', 'licgun', 'licmec', 'lictaxi', 'liccrypto', 'licstocks', 'price'}},
+		{id = 'lic', name = 'Лицензии', icon = 'card', cmds = {'licauto', 'licmoto', 'licfly', 'licswim', 'licfish', 'lichunt', 'licdig', 'licgun', 'licmec', 'lictaxi', 'liccrypto', 'licstocks', 'price'}},
 		{id = 'duty', name = 'Служба', icon = 'dot', cmds = {'z', 'za', 'cam', 'mb', 'exp', 'agenda', 'freely', 'car', 'visit', 'uvalgos'}},
 		{id = 'lek', name = 'Лекции', icon = 'lines', cmds = {'lekmz1', 'lekmz2', 'lekmz3', 'lekmz4', 'lekmz5', 'lekcl1', 'lekcl2', 'lekcl3', 'lekcl4', 'lekcl5', 'lekgov1', 'lekgov2', 'lekgov3', 'lekgov4', 'lekgov5', 'lekgov6', 'lekarmy1', 'lekarmy2', 'lekarmy3', 'lekarmy4', 'lekarmy5', 'lekfd1', 'lekfd2', 'lekfd3', 'lekfd4', 'lekfd5', 'lekzeks1', 'lekzeks2', 'lekzeks3', 'lektsr1', 'lektsr2', 'lektsr3', 'lektsr4', 'lektsr5'}},
 		{id = 'lead', name = 'Руководство', icon = 'star', cmds = {'inv', 'rank', 'uval', 'mutechat', 'unmutechat', 'warnorg', 'unwarnorg'}}
@@ -22139,7 +22272,7 @@ function FAST_UI.tree()
 			if entry.kind == 'dir' and type(entry.items) == 'table' then
 				if entry.name == u8'Лицензии' then licenses = entry end
 				for _, item in ipairs(entry.items) do
-					if item.cmd == 'licmauto' or item.cmd == 'lictaxi' then licenses = entry end
+					if item.cmd == 'licauto' or item.cmd == 'licmauto' or item.cmd == 'lictaxi' then licenses = entry end
 				end
 			end
 		end
@@ -24726,7 +24859,7 @@ function cmd_start(argument, cmd_name) --> Запуск команды
 	end
 	thread = lua_thread.create(function() --> Функция отыгровки
 		local license_request
-		if tonumber(setting.org) == 5 and (CMD.cmd == 'licmauto' or tonumber(CMD.id_element) == 16 or CMD.newbie_license_template == true) then
+		if tonumber(setting.org) == 5 and (CMD.cmd == 'licauto' or CMD.cmd == 'licmauto' or tonumber(CMD.id_element) == 16 or CMD.newbie_license_template == true) then
 			local prepared, request, error_text = sh_auto_license.prepare(CMD, ARG)
 			if not prepared then
 				sampAddChatMessage('[SH]{FFFFFF} ' .. tostring(error_text), 0xFF5345)
@@ -30537,7 +30670,7 @@ function apply_settings(name_file, description_file, array_arg)
    end
    can_restore = os.rename(path, invalid) ~= nil
   end
-  for _, suffix in ipairs({'.last-good', '.old'}) do
+  for _, suffix in ipairs(sh_audit.settings_backups) do
    local fallback, data = read_settings(path .. suffix)
    if fallback then
     saved = fallback
@@ -33207,7 +33340,7 @@ local cmd_defoult_json_for_driving_school = {
   ],
   "delay": 2.5,
   "id_element": 16,
-  "cmd": "licmauto",
+  "cmd": "licauto",
   "key": [
     "",
     {}
@@ -33423,7 +33556,7 @@ local cmd_defoult_json_for_driving_school = {
     {
       "desc": "id игрока",
       "name": "arg1",
-      "type": 1
+      "type": 2
     }
   ],
   "delay": 2.5,
