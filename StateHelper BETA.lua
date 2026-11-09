@@ -297,14 +297,20 @@ function sh_resource.valid(data, extension)
 	end
 	return false
 end
-function sh_resource.download(url, path, callback)
+function sh_resource.download(url, path, callback, validate)
 	sh_resource.sequence = sh_resource.sequence + 1
 	local temporary = path .. '.download-' .. os.time() .. '-' .. sh_resource.sequence
 	return downloadUrlToFile(url, temporary, function(id, status, p1, p2)
 		if status == dlstatus.STATUS_ENDDOWNLOADDATA then
 			local file = io.open(temporary, 'rb'); local data = file and file:read('*a'); if file then file:close() end
 			local extension = path:match('%.([A-Za-z]+)$')
-			local ok = sh_resource.valid(data, extension and extension:lower())
+			local ok
+			if validate then
+				local checked, valid = pcall(validate, data)
+				ok = checked and valid
+			else
+				ok = sh_resource.valid(data, extension and extension:lower())
+			end
 			if ok then local library = ffi.load('kernel32'); ok = library.MoveFileExA(temporary, path, 9) ~= 0 end
 			if not ok then
 				os.remove(temporary)
@@ -391,7 +397,7 @@ if not doesDirectoryExist(dir .. '/State Helper/Изображения/') then
 end
 local notification_path = dir .. '/State Helper/Изображения/notification.png'
 if not doesFileExist(notification_path) then
-	sh_resource.download('https://raw.githubusercontent.com/kysteno4ek/StateHelper/main/images/notification.png', notification_path, function() end)
+	sh_resource.download('https://raw.githubusercontent.com/kysteno4ek/StateHelper/beta/images/notification.png', notification_path, function() end)
 end
 local sounds_dir = dir .. '/State Helper/Звуки/'
 if not doesDirectoryExist(sounds_dir) then
@@ -402,7 +408,7 @@ if not doesFileExist(beep_path) then
 	sh_resource.download('https://raw.githubusercontent.com/kysteno4ek/StateHelper/main/sounds/beep.wav', beep_path, function() end)
 end
 if not doesFileExist(dir .. '/State Helper/Изображения/logo update.png') then
-	download_id = sh_resource.download('https://raw.githubusercontent.com/kysteno4ek/StateHelper/main/images/logo%20update.png', dir .. '/State Helper/Изображения/logo update.png', function(id, status, p1, p2)
+	download_id = sh_resource.download('https://raw.githubusercontent.com/kysteno4ek/StateHelper/beta/images/logo%20update.png', dir .. '/State Helper/Изображения/logo update.png', function(id, status, p1, p2)
 		if status == dlstatus.STATUS_ENDDOWNLOADDATA then
 			image_version_init = true
 		end
@@ -1980,7 +1986,7 @@ function download_image()
 		createDirectory(getWorkingDirectory() .. '/State Helper/Изображения/')
 	end
 	if not doesFileExist(getWorkingDirectory() .. '/State Helper/Изображения/No label.png') then
-		download_id = sh_resource.download('https://raw.githubusercontent.com/kysteno4ek/StateHelper/main/images/No%20label.png', getWorkingDirectory() .. '/State Helper/Изображения/No label.png', function(id, status, p1, p2)
+		download_id = sh_resource.download('https://raw.githubusercontent.com/kysteno4ek/StateHelper/beta/images/No%20label.png', getWorkingDirectory() .. '/State Helper/Изображения/No label.png', function(id, status, p1, p2)
 			if status == dlstatus.STATUS_ENDDOWNLOADDATA then 
 				--image_no_label = imgui.CreateTextureFromFile(getWorkingDirectory() .. '/State Helper/Изображения/No label.png')
 			end
@@ -2007,35 +2013,35 @@ function download_image()
 		end
 	end
 	
-	download_record_label('https://raw.githubusercontent.com/kysteno4ek/StateHelper/main/images/Record%20Dance%20Label.png', 'Record Dance Label', 1)
-	download_record_label('https://raw.githubusercontent.com/kysteno4ek/StateHelper/main/images/Record%20Megamix%20Label.png', 'Record Megamix Label', 2)
-	download_record_label('https://raw.githubusercontent.com/kysteno4ek/StateHelper/main/images/Record%20Party%20Label.png', 'Record Party Label', 3)
-	download_record_label('https://raw.githubusercontent.com/kysteno4ek/StateHelper/main/images/Record%20Phonk%20Label.png', 'Record Phonk Label', 4)
-	download_record_label('https://raw.githubusercontent.com/kysteno4ek/StateHelper/main/images/Record%20GopFM%20Label.png', 'Record GopFM Label', 5)
-	download_record_label('https://raw.githubusercontent.com/kysteno4ek/StateHelper/main/images/Record%20Ruki%20Vverh%20Label.png', 'Record Ruki Vverh Label', 6)
-	download_record_label('https://raw.githubusercontent.com/kysteno4ek/StateHelper/main/images/Record%20Dupstep%20Label.png', 'Record Dupstep Label', 7)
-	download_record_label('https://raw.githubusercontent.com/kysteno4ek/StateHelper/main/images/Record%20Bighits%20Label.png', 'Record Bighits Label', 8)
-	download_record_label('https://raw.githubusercontent.com/kysteno4ek/StateHelper/main/images/Record%20Organic%20Label.png', 'Record Organic Label', 9)
-	download_record_label('https://raw.githubusercontent.com/kysteno4ek/StateHelper/main/images/Record%20Russianhits%20Label.png', 'Record Russianhits Label', 10)
+	download_record_label('https://raw.githubusercontent.com/kysteno4ek/StateHelper/beta/images/Record%20Dance%20Label.png', 'Record Dance Label', 1)
+	download_record_label('https://raw.githubusercontent.com/kysteno4ek/StateHelper/beta/images/Record%20Megamix%20Label.png', 'Record Megamix Label', 2)
+	download_record_label('https://raw.githubusercontent.com/kysteno4ek/StateHelper/beta/images/Record%20Party%20Label.png', 'Record Party Label', 3)
+	download_record_label('https://raw.githubusercontent.com/kysteno4ek/StateHelper/beta/images/Record%20Phonk%20Label.png', 'Record Phonk Label', 4)
+	download_record_label('https://raw.githubusercontent.com/kysteno4ek/StateHelper/beta/images/Record%20GopFM%20Label.png', 'Record GopFM Label', 5)
+	download_record_label('https://raw.githubusercontent.com/kysteno4ek/StateHelper/beta/images/Record%20Ruki%20Vverh%20Label.png', 'Record Ruki Vverh Label', 6)
+	download_record_label('https://raw.githubusercontent.com/kysteno4ek/StateHelper/beta/images/Record%20Dupstep%20Label.png', 'Record Dupstep Label', 7)
+	download_record_label('https://raw.githubusercontent.com/kysteno4ek/StateHelper/beta/images/Record%20Bighits%20Label.png', 'Record Bighits Label', 8)
+	download_record_label('https://raw.githubusercontent.com/kysteno4ek/StateHelper/beta/images/Record%20Organic%20Label.png', 'Record Organic Label', 9)
+	download_record_label('https://raw.githubusercontent.com/kysteno4ek/StateHelper/beta/images/Record%20Russianhits%20Label.png', 'Record Russianhits Label', 10)
 	
-	download_radio_label('https://raw.githubusercontent.com/kysteno4ek/StateHelper/main/images/Europa%20Plus.png', 'Europa Plus', 1)
-	download_radio_label('https://raw.githubusercontent.com/kysteno4ek/StateHelper/main/images/DFM.png', 'DFM', 2)
-	download_radio_label('https://raw.githubusercontent.com/kysteno4ek/StateHelper/main/images/Chanson.png', 'Chanson', 3)
-	download_radio_label('https://raw.githubusercontent.com/kysteno4ek/StateHelper/main/images/Dacha.png', 'Dacha', 4)
-	download_radio_label('https://raw.githubusercontent.com/kysteno4ek/StateHelper/main/images/Road.png', 'Road', 5)
-	download_radio_label('https://raw.githubusercontent.com/kysteno4ek/StateHelper/main/images/Mayak.png', 'Mayak', 6)
-	download_radio_label('https://raw.githubusercontent.com/kysteno4ek/StateHelper/main/images/Nashe.png', 'Nashe', 7)
-	download_radio_label('https://raw.githubusercontent.com/kysteno4ek/StateHelper/main/images/LoFi%20Hip-Hop.png', 'LoFi Hip-Hop', 8)
-	download_radio_label('https://raw.githubusercontent.com/kysteno4ek/StateHelper/main/images/Maximum.png', 'Maximum', 9)
-	download_radio_label('https://raw.githubusercontent.com/kysteno4ek/StateHelper/main/images/90s%20Eurodance.png', '90s Eurodance', 10)
-	download_radio_label('https://raw.githubusercontent.com/kysteno4ek/StateHelper/main/images/YandexMusic.png', 'YandexMusic', 11)
-	download_radio_label('https://raw.githubusercontent.com/kysteno4ek/StateHelper/main/images/SeFon.png', 'SeFon', 12)
-	download_radio_label('https://raw.githubusercontent.com/kysteno4ek/StateHelper/main/images/Hitmoz.png', 'Hitmoz', 13)
-	for _, engine in ipairs({'yandex', 'google'}) do
-		local name = 'search-' .. engine .. '.png'
+	download_radio_label('https://raw.githubusercontent.com/kysteno4ek/StateHelper/beta/images/Europa%20Plus.png', 'Europa Plus', 1)
+	download_radio_label('https://raw.githubusercontent.com/kysteno4ek/StateHelper/beta/images/DFM.png', 'DFM', 2)
+	download_radio_label('https://raw.githubusercontent.com/kysteno4ek/StateHelper/beta/images/Chanson.png', 'Chanson', 3)
+	download_radio_label('https://raw.githubusercontent.com/kysteno4ek/StateHelper/beta/images/Dacha.png', 'Dacha', 4)
+	download_radio_label('https://raw.githubusercontent.com/kysteno4ek/StateHelper/beta/images/Road.png', 'Road', 5)
+	download_radio_label('https://raw.githubusercontent.com/kysteno4ek/StateHelper/beta/images/Mayak.png', 'Mayak', 6)
+	download_radio_label('https://raw.githubusercontent.com/kysteno4ek/StateHelper/beta/images/Nashe.png', 'Nashe', 7)
+	download_radio_label('https://raw.githubusercontent.com/kysteno4ek/StateHelper/beta/images/LoFi%20Hip-Hop.png', 'LoFi Hip-Hop', 8)
+	download_radio_label('https://raw.githubusercontent.com/kysteno4ek/StateHelper/beta/images/Maximum.png', 'Maximum', 9)
+	download_radio_label('https://raw.githubusercontent.com/kysteno4ek/StateHelper/beta/images/90s%20Eurodance.png', '90s Eurodance', 10)
+	download_radio_label('https://raw.githubusercontent.com/kysteno4ek/StateHelper/beta/images/YandexMusic.png', 'YandexMusic', 11)
+	download_radio_label('https://raw.githubusercontent.com/kysteno4ek/StateHelper/beta/images/SeFon.png', 'SeFon', 12)
+	download_radio_label('https://raw.githubusercontent.com/kysteno4ek/StateHelper/beta/images/Hitmoz.png', 'Hitmoz', 13)
+	for _, name in ipairs({'search-yandex.png', 'search-google.png',
+		'forum-arizona-hq.png', 'youtube-hq.png', 'alice-ai-transparent.png', 'weather-clouds.png'}) do
 		local path = dir .. '/State Helper/Изображения/' .. name
 		if not doesFileExist(path) then
-			sh_resource.download('https://raw.githubusercontent.com/kysteno4ek/StateHelper/main/images/' .. name, path)
+			sh_resource.download('https://raw.githubusercontent.com/kysteno4ek/StateHelper/beta/images/' .. name, path)
 		end
 	end
 	
@@ -17375,25 +17381,15 @@ function sh_browser_close()
 end
 
 local sh_browser_bootstrap = {
-    url = 'https://raw.githubusercontent.com/kysteno4ek/StateHelper/beta/statehelper-browser-files-v6.zip',
-    size = 2949048,
-    sha256 = '8d6036f25c8065a36bee1fbdd45cb7f7fc5bcd522b5a79ffc7a3e33f3e0658c4',
-    files = {
-        {'StateHelperBrowser.exe', 61, 66048},
-        {'Assets/forum-arizona-hq.png', 66174, 783405},
-        {'Assets/youtube-hq.png', 849638, 658104},
-        {'Assets/alice-ai-transparent.png', 1507811, 1069419},
-        {'Assets/weather-clouds.png', 2577293, 337028},
-        {'browser.lua', 2914370, 34196},
-    },
+    url = 'https://raw.githubusercontent.com/kysteno4ek/StateHelper/beta/Browser/',
     installed = {
-        {'StateHelperBrowser.exe', 66048, '285f06a919253c5c13af6c2754e8032e2f0bd72c1c1fc44cd06e9bfe2bb1dfc9'},
-        {'browser.lua', 34196, 'a00b149f26594152efd5d2e15ae00d796c9f94f72c181eb5acc12edbd9dbfa87'},
+        {'StateHelperBrowser.exe', 66048, '07b68b7713dfea13d9eccb8e34910f4ceb4afbc667808328ce13f689c3f5bc1e'},
+        {'browser.lua', 34468, '7a8f4d0b679660d0fd832d31435f6b2d38deb07475a7be1366676c4215158949'},
     },
 }
 
 function sh_browser_bootstrap.verify(data, size, digest_hex)
-    if type(data) ~= 'string' or #data ~= (size or sh_browser_bootstrap.size) then return false end
+    if type(data) ~= 'string' or #data ~= size then return false end
     ffi.cdef([[
         long __stdcall BCryptOpenAlgorithmProvider(void**, const wchar_t*, const wchar_t*, unsigned long);
         long __stdcall BCryptHash(void*, const void*, unsigned long, const void*, unsigned long, void*, unsigned long);
@@ -17408,62 +17404,57 @@ function sh_browser_bootstrap.verify(data, size, digest_hex)
     api.BCryptCloseAlgorithmProvider(provider[0], 0)
     if status ~= 0 then return false end
     local hex = ffi.string(digest, 32):gsub('.', function(byte) return ('%02x'):format(byte:byte()) end)
-    return hex == (digest_hex or sh_browser_bootstrap.sha256)
-end
-
-function sh_browser_bootstrap.unpack(path, root)
-    local file = assert(io.open(path, 'rb'))
-    local data = file:read(sh_browser_bootstrap.size + 1)
-    file:close()
-    assert(sh_browser_bootstrap.verify(data), 'browser package checksum')
-    local module = sh_browser_bootstrap.files[#sh_browser_bootstrap.files]
-    assert(loadstring(data:sub(module[2], module[2] + module[3] - 1), '@browser.lua'))
-
-    if not doesDirectoryExist(root) then createDirectory(root) end
-    if not doesDirectoryExist(root .. '/Assets') then createDirectory(root .. '/Assets') end
-    local kernel = ffi.load('kernel32')
-    for _, entry in ipairs(sh_browser_bootstrap.files) do
-        local target = root .. '/' .. entry[1]
-        local temporary = target .. '.bootstrap-part'
-        local out = assert(io.open(temporary, 'wb'))
-        local written = out:write(data:sub(entry[2], entry[2] + entry[3] - 1))
-        local closed = out:close()
-        if not written or not closed or kernel.MoveFileExA(temporary, target, 9) == 0 then
-            os.remove(temporary)
-            error('could not install ' .. entry[1])
-        end
-    end
+    return hex == digest_hex
 end
 
 function sh_browser_bootstrap.start()
     local setup = sh_browser_bootstrap
     if setup.downloading then return end
+    local root = dir .. '/State Helper/Browser'
+    if not doesDirectoryExist(root) then createDirectory(root) end
+
     setup.downloading = true
     setup.message = 'Скачиваем файлы браузера с GitHub…'
-    local root = dir .. '/State Helper/Browser'
     setup.attempt = (setup.attempt or 0) + 1
     local attempt = setup.attempt
-    local archive = root .. '.download-' .. os.time() .. '-' .. attempt
+    local function active()
+        return setup.downloading and setup.attempt == attempt
+    end
     local function finish(success)
-        if not setup.downloading or setup.attempt ~= attempt then return end
+        if not active() then return end
         setup.downloading = false
-        local ok, reason = false, 'download failed'
-        if success then ok, reason = pcall(setup.unpack, archive, root) end
-        os.remove(archive)
-        if ok then
+        if success then
             sh_browser_load_error = nil
             setup.message = nil
             setup.install_libraries = true
         else
             setup.message = 'Не удалось установить браузер. Проверьте соединение и повторите загрузку.'
-            print('[SH Browser] ' .. tostring(reason))
         end
     end
-    local ok, id = pcall(downloadUrlToFile, setup.url, archive, function(_, status)
-        if status == dlstatus.STATUS_ENDDOWNLOADDATA then finish(true)
-        elseif status == dlstatus.STATUS_DOWNLOAD_ERROR or status == dlstatus.STATUSEX_ENDDOWNLOAD then finish(false) end
-    end)
-    if not ok or not id or id == 0 then finish(false); return end
+
+    local function download(index)
+        if not active() then return end
+        local entry = setup.installed[index]
+        if not entry then finish(true); return end
+        local name, size, digest = unpack(entry)
+        local completed = false
+        local ok, id = pcall(sh_resource.download, setup.url .. name, root .. '/' .. name, function(_, status)
+            if completed or not active() then return end
+            if status == dlstatus.STATUS_ENDDOWNLOADDATA then
+                completed = true
+                download(index + 1)
+            elseif status == dlstatus.STATUS_DOWNLOAD_ERROR or status == dlstatus.STATUSEX_ENDDOWNLOAD then
+                completed = true
+                finish(false)
+            end
+        end, function(data)
+            return active() and setup.verify(data, size, digest)
+                and (name ~= 'browser.lua' or loadstring(data, '@browser.lua') ~= nil)
+        end)
+        if not completed and (not ok or not id or id == 0) then finish(false) end
+    end
+
+    download(1)
     lua_thread.create(function()
         wait(120000)
         finish(false)
@@ -17750,7 +17741,7 @@ local function sh_browser_ensure()
                         mouse_x=mouse_x, mouse_y=mouse_y,
                         mouse_down=mouse_down and not sh_browser_input.close_pressed,
                         blocked=sh_browser_input.window_blocked()}
-                end,root=dir .. '/State Helper/Browser',private_root=sh_audit.private_root .. '/Browser'})
+                end,root=dir .. '/State Helper/Browser',private_root=sh_audit.private_root .. '/Browser',images_root=dir .. '/State Helper/Изображения'})
                 if ok and type(manager) == 'table' then
                     local draw_settings = manager.draw_settings
                     manager.draw_settings = function(colors, fonts, bold, offset)
