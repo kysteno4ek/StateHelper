@@ -277,6 +277,25 @@ end
 -- Validate staged assets before replacing an existing usable resource.
 sh_resource = {sequence = 0}
 pcall(ffi.cdef, 'int __stdcall MoveFileExA(const char*, const char*, unsigned long);')
+function sh_resource.verify_sha256(data, size, digest_hex)
+    if type(data) ~= 'string' or #data ~= size then return false end
+    ffi.cdef([[
+        long __stdcall BCryptOpenAlgorithmProvider(void**, const wchar_t*, const wchar_t*, unsigned long);
+        long __stdcall BCryptHash(void*, const void*, unsigned long, const void*, unsigned long, void*, unsigned long);
+        long __stdcall BCryptCloseAlgorithmProvider(void*, unsigned long);
+    ]])
+    local api = ffi.load('bcrypt')
+    local provider = ffi.new('void*[1]')
+    local algorithm = ffi.new('wchar_t[7]', {83, 72, 65, 50, 53, 54, 0}) -- SHA256
+    if api.BCryptOpenAlgorithmProvider(provider, algorithm, nil, 0) ~= 0 then return false end
+    local digest = ffi.new('unsigned char[32]')
+    local status = api.BCryptHash(provider[0], nil, 0, data, #data, digest, 32)
+    api.BCryptCloseAlgorithmProvider(provider[0], 0)
+    if status ~= 0 then return false end
+    local hex = ffi.string(digest, 32):gsub('.', function(byte) return ('%02x'):format(byte:byte()) end)
+    return hex == digest_hex
+end
+
 function sh_resource.valid(data, extension)
 	if type(data) ~= 'string' or #data > 32 * 1024 * 1024 then return false end
 	if extension == 'ttf' then
@@ -300,41 +319,45 @@ end
 function sh_resource.download(url, path, callback, validate)
 	sh_resource.sequence = sh_resource.sequence + 1
 	local temporary = path .. '.download-' .. os.time() .. '-' .. sh_resource.sequence
+	local finished = false
 	return downloadUrlToFile(url, temporary, function(id, status, p1, p2)
-		if status == dlstatus.STATUS_ENDDOWNLOADDATA then
-			local file = io.open(temporary, 'rb'); local data = file and file:read('*a'); if file then file:close() end
+		if finished then return end
+		local terminal = status == dlstatus.STATUSEX_ENDDOWNLOAD or status == dlstatus.STATUS_DOWNLOAD_ERROR
+		if status == dlstatus.STATUS_ENDDOWNLOADDATA or terminal then
+			local file = io.open(temporary, 'rb')
+			local data = file and file:read(32 * 1024 * 1024 + 1)
+			if file then file:close() end
 			local extension = path:match('%.([A-Za-z]+)$')
-			local ok
-			if validate then
-				local checked, valid = pcall(validate, data)
-				ok = checked and valid
-			else
-				ok = sh_resource.valid(data, extension and extension:lower())
-			end
-			if ok then local library = ffi.load('kernel32'); ok = library.MoveFileExA(temporary, path, 9) ~= 0 end
-			if not ok then
+			local checked, valid = pcall(validate or sh_resource.valid, data, extension and extension:lower())
+			if checked and valid and ffi.load('kernel32').MoveFileExA(temporary, path, 9) ~= 0 then
+				finished = true
+				if callback then callback(id, dlstatus.STATUS_ENDDOWNLOADDATA, p1, p2) end
+			elseif terminal then
+				finished = true
 				os.remove(temporary)
-				print('[SH Resource] Rejected or could not install: ' .. path)
+				print('[SH Resource] Could not validate or install: ' .. path)
 				if callback then callback(id, dlstatus.STATUS_DOWNLOAD_ERROR, p1, p2) end
-				return
 			end
-		elseif status == dlstatus.STATUS_DOWNLOAD_ERROR or status == dlstatus.STATUSEX_ENDDOWNLOAD then
-		os.remove(temporary)
-	end
-		if callback then callback(id, status, p1, p2) end
+		elseif callback then
+			callback(id, status, p1, p2)
+		end
 	end)
 end
 
 --> Скачивание шрифтов
 image_version_init = false
 sh_resource.font_dir = dir .. '/State Helper/Шрифты/'
+sh_resource.font_manifest = {
+	['SF600.ttf'] = {453296, 'c7efc5d8037664a594680f179e55c6f89c220366da9bb8d2d0cac35047c7a795'},
+	['SF800.ttf'] = {456924, 'e75223787620bb8ba1b9f97f68c5e1fbe659d92cc61439cb81b4cef1ec8c0544'},
+}
 
-function sh_resource.read_font(path)
+function sh_resource.read_font(path, entry)
 	local file = io.open(path, 'rb')
 	if not file then return end
-	local data = file:read(32 * 1024 * 1024 + 1)
+	local data = file:read(entry[1] + 1)
 	file:close()
-	if sh_resource.valid(data, 'ttf') then return data end
+	if sh_resource.verify_sha256(data, entry[1], entry[2]) then return data end
 end
 
 sh_resource.font_data = {}
@@ -351,10 +374,11 @@ function sh_resource.download_fonts()
 	for _, name in ipairs({'SF600.ttf', 'SF800.ttf'}) do
 		if not sh_resource.font_data[name] and not sh_resource.font_pending[name] then
 			local path = sh_resource.font_dir .. name
+			local entry = sh_resource.font_manifest[name]
 			local url = 'https://raw.githubusercontent.com/kysteno4ek/StateHelper/main/fonts/' .. name
 			local attempts = 0
 			local function attempt()
-				local data = sh_resource.read_font(path)
+				local data = sh_resource.read_font(path, entry)
 				if data then
 					sh_resource.font_data[name] = data
 					sh_resource.font_pending[name] = nil
@@ -365,7 +389,7 @@ function sh_resource.download_fonts()
 				local function complete()
 					if finished then return end
 					finished = true
-					local downloaded = sh_resource.read_font(path)
+					local downloaded = sh_resource.read_font(path, entry)
 					if downloaded then
 						sh_resource.font_data[name] = downloaded
 						sh_resource.font_pending[name] = nil
@@ -382,8 +406,17 @@ function sh_resource.download_fonts()
 				local ok, id = pcall(sh_resource.download, url, path, function(_, status)
 					if status == dlstatus.STATUS_ENDDOWNLOADDATA or status == dlstatus.STATUSEX_ENDDOWNLOAD
 						or status == dlstatus.STATUS_DOWNLOAD_ERROR then complete() end
+				end, function(data)
+					return not finished and sh_resource.verify_sha256(data, entry[1], entry[2])
 				end)
-				if not ok or id == nil or id == false then complete() end
+				if not ok or not id or id == 0 then
+					complete()
+				elseif not finished then
+					lua_thread.create(function()
+						wait(30000)
+						complete()
+					end)
+				end
 			end
 			sh_resource.font_pending[name] = true
 			attempt()
@@ -446,14 +479,6 @@ local windows = {
 }
 
 function open_main()
-	if setting.blockl then
-		if not setting.cef_notif then
-			sampAddChatMessage('[SH]{FFFFFF} Доступ к StateHelper был заблокирован разработчиком.', 0xFF5345)
-		else
-			cefnotig('{FF5345}[SH]{FFFFFF} Доступ к StateHelper был заблокирован разработчиком.', 3000)
-		end
-		return
-	end
 	if not sh_resource.fonts_ready() then
 		sh_resource.download_fonts()
 		if not sh_resource.fonts_ready() then
@@ -699,7 +724,6 @@ nickname_dialog2 = false
 nickname_dialog3 = false
 nickname_dialog4 = false
 time_dialog_nickname = 20
-ret_check = 0
 replace_not_flood = {0, 0, 0, 0, 1}
 popup_open_tags = false
 anim_func = false
@@ -1292,7 +1316,6 @@ setting = {
 	},
 	mb_tags = false,
 	sob_moto_lic = false,
-	blockl = false,
 	time_offset = 0,
 	close_button = true,
 	police_settings = {
@@ -1435,6 +1458,10 @@ end
 settings_reset_pending = false
 -- Shared validation for imported commands and the command executor.
 sh_audit = {}
+function sh_audit.command_uid(uid)
+	return type(uid) == 'number' and uid >= 1 and uid <= 2147483647 and uid == math.floor(uid)
+end
+
 function sh_audit.command(value)
 	if type(value) ~= 'table' or type(value.cmd) ~= 'string' or not value.cmd:match('^[A-Za-z0-9_]*$') then return false, 'неверное имя команды' end
 	if type(value.act) ~= 'table' or #value.act > 10000 then return false, 'нет корректного списка действий' end
@@ -1446,20 +1473,25 @@ function sh_audit.command(value)
 	for _, key in ipairs(value.key[2]) do if type(key) ~= 'number' then return false, 'неверный код клавиши' end end
 	for _, arg in ipairs(value.arg) do if type(arg) ~= 'table' or type(arg.name) ~= 'string' or type(arg.desc) ~= 'string' or (arg.type ~= 1 and arg.type ~= 2) then return false, 'неверный аргумент' end end
 	for _, var in ipairs(value.var) do if type(var) ~= 'table' or type(var.name) ~= 'string' or type(var.value) ~= 'string' then return false, 'неверная переменная' end end
-	local allowed = {SEND=true,SEND_CMD=true,OPEN_INPUT=true,SEND_ME=true,DELAY=true,NEW_VAR=true,DIALOG=true,IF=true,ELSE=true,END=true,STOP=true,WAIT_ENTER=true,SEND_DIALOG=true,SELECT_DIALOG_ROW=true}
+	local allowed = {SEND=true,SEND_CMD=true,OPEN_INPUT=true,SEND_ME=true,DELAY=true,NEW_VAR=true,DIALOG=true,IF=true,ELSE=true,END=true,STOP=true,WAIT_ENTER=true,SEND_DIALOG=true,SELECT_DIALOG_ROW=true,COMMENT=true}
 	local stack = {}
 	for _, action in ipairs(value.act) do
 		if type(action) ~= 'table' or not allowed[action[1]] then return false, 'неизвестное действие' end
 		local kind = action[1]
 		if kind == 'IF' then
 			if type(action[2]) ~= 'number' or action[2] < 2 or action[2] > 4 or type(action[3]) ~= 'table' or action[3][1] == nil or action[3][2] == nil or type(action[4]) ~= 'number' then return false, 'неверное условие' end
+			local comparison = action[5]
+			if action[2] % 1 ~= 0 or (action[2] ~= 2 and comparison ~= nil
+				and (type(comparison) ~= 'number' or comparison < 1 or comparison > 6 or comparison % 1 ~= 0)) then
+				return false, 'неверный оператор сравнения'
+			end
 			stack[#stack + 1] = {id = action[4], otherwise = false}
 		elseif kind == 'ELSE' or kind == 'END' then
 			local top = stack[#stack]
 			if not top or top.id ~= action[2] or (kind == 'ELSE' and top.otherwise) then return false, 'нарушена структура условий' end
 			if kind == 'END' then table.remove(stack) else top.otherwise = true end
 		elseif kind == 'DIALOG' then
-			if type(action[2]) ~= 'string' or type(action[3]) ~= 'table' or #action[3] > 10 then return false, 'неверный диалог' end
+			if type(action[2]) ~= 'string' or type(action[3]) ~= 'table' or #action[3] < 1 or #action[3] > 10 then return false, 'неверный диалог' end
 			for _, label in ipairs(action[3]) do if type(label) ~= 'string' then return false, 'неверный пункт диалога' end end
 		elseif kind == 'DELAY' then
 			if type(action[2]) ~= 'number' or action[2] < 0 or action[2] > 3600 then return false, 'неверная пауза' end
@@ -1494,13 +1526,29 @@ function sh_reminders.tick()
 	end
 end
 
+function sh_audit.safe_command_name(name)
+	if type(name) ~= 'string' or name == '' or name:find('[%z\1-\31<>:"/\\|?*]')
+		or name:find('[. ]$') then return false end
+	local first = name:match('^[^.]+')
+	if not first then return false end
+	local stem = first:upper()
+	return stem ~= 'CON' and stem ~= 'PRN' and stem ~= 'AUX' and stem ~= 'NUL'
+		and not stem:match('^COM[1-9]$') and not stem:match('^LPT[1-9]$')
+end
+
+function sh_audit.command_path_safe(path)
+	local clean = path:gsub('/$', '')
+	local attributes = tonumber(ffi.C.GetFileAttributesA(clean))
+	return attributes == 0xFFFFFFFF or bit.band(attributes, 0x400) == 0
+end
+
 function sh_audit.categories(value)
 	if type(value) ~= 'table' or #value == 0 or #value > 1000 then return false end
 	local seen = {}
 	for _, item in ipairs(value) do
 		local name = type(item) == 'table' and item[1]
-		if type(name) ~= 'string' or name == '' or name == '.' or name == '..' or name:find('[<>:"/\\|?*]') or seen[name] then return false end
-		seen[name] = true
+		if not sh_audit.safe_command_name(name) or seen[name:lower()] then return false end
+		seen[name:lower()] = true
 	end
 	return true
 end
@@ -1786,6 +1834,7 @@ function save(force)
 		return false
 	end
 	local public = {}
+	setting.blockl = nil
 	for key, value in pairs(setting) do
 		if not sh_audit.private_fields[key] then public[key] = value end
 	end
@@ -1921,25 +1970,67 @@ end
 
 local cmd_loaded_files = {}
 
+function sh_audit.recover_commands(base)
+	local journal = base .. '.transaction.json'
+	if not doesFileExist(journal) then return true end
+	if not sh_audit.command_path_safe(base) or not sh_audit.command_path_safe(journal) then return false end
+	local file = io.open(journal, 'rb')
+	if not file then return false end
+	local data = file:read(32 * 1024 * 1024 + 1)
+	file:close()
+	if not data or #data > 32 * 1024 * 1024 then return false end
+	local ok, before = pcall(decodeJson, data)
+	if not ok or type(before) ~= 'table' then return false end
+	for path, old in pairs(before) do
+		if type(path) ~= 'string' or path:sub(1, #base) ~= base or (old ~= false and type(old) ~= 'string') then return false end
+		local relative = path:sub(#base + 1)
+		local folder, filename = relative:match('^([^/]+)/([^/]+%.json)$')
+		if relative ~= 'categories.json' then
+			if not sh_audit.safe_command_name(folder) or not sh_audit.safe_command_name(filename)
+				or not sh_audit.command_path_safe(base .. folder) then return false end
+		end
+		if not sh_audit.command_path_safe(path) or not sh_audit.command_path_safe(path .. '.tmp') then return false end
+	end
+	for path, old in pairs(before) do
+		if old then
+			if not write_file(path, old) then return false end
+		elseif doesFileExist(path) and not os.remove(path) then
+			return false
+		end
+	end
+	return os.remove(journal) ~= nil
+end
+
 function save_cmd()
 	if settings_reset_pending or setting.first_start then return false end
 	local base = dir .. '/State Helper/Отыгровки/'
 	if not doesDirectoryExist(base) then createDirectory(base) end
 	local plan, current, before, staged = {}, {}, {}, {}
+	local journal = base .. '.transaction.json'
 	local function fail(detail)
 		sh_audit.io_error('Не удалось сохранить команды. Изменения остались в памяти; повторите сохранение.', detail)
 		for _, temp in ipairs(staged) do os.remove(temp) end
 		return false
 	end
+	if not sh_audit.command_path_safe(base) or not sh_audit.recover_commands(base) then
+		return fail('unfinished command transaction or unsafe directory')
+	end
+	local seen_uids = {}
 	for _, c in ipairs(cmd[1]) do
 		local valid, problem = sh_audit.command(c)
 		if not valid then return fail(problem) end
 		local category = cmd[2][c.folder]
 		local folder = category and category[1]
-		if type(folder) ~= 'string' or folder == '' or folder == '.' or folder == '..' or folder:find('[<>:"/\\|?*]') then return fail('invalid folder') end
+		if not sh_audit.safe_command_name(folder) then return fail('invalid folder') end
 		local directory = base .. folder .. '/'
+		if not sh_audit.command_path_safe(directory) then return fail('unsafe command directory') end
 		if not doesDirectoryExist(directory) then createDirectory(directory) end
+		if not sh_audit.command_uid(c.UID) or seen_uids[c.UID] then
+			repeat c.UID = math.random(20, 95000000) until not seen_uids[c.UID]
+		end
+		seen_uids[c.UID] = true
 		local name = c.cmd ~= '' and c.cmd or tostring(c.UID)
+		if not sh_audit.safe_command_name(name) then return fail('invalid command file name') end
 		local path, duplicate = directory .. name .. '.json', 2
 		while current[path] do path = directory .. name .. ' (' .. duplicate .. ').json'; duplicate = duplicate + 1 end
 		local ok, data = pcall(encodeJson, c); if not ok then return fail(data) end
@@ -1949,6 +2040,8 @@ function save_cmd()
 	plan[base .. 'categories.json'] = categories
 	for path in pairs(cmd_loaded_files) do if not current[path] then plan[path] = false end end
 	for path in pairs(plan) do
+		if not sh_audit.command_path_safe(path) or not sh_audit.command_path_safe(path .. '.pending')
+			or not sh_audit.command_path_safe(path .. '.pending.tmp') then return fail('unsafe command file') end
 		local file = io.open(path, 'rb')
 		if file then before[path] = file:read('*a'); file:close()
 		elseif doesFileExist(path) then return fail('cannot read old file: ' .. path)
@@ -1964,16 +2057,16 @@ function save_cmd()
 			staged[#staged + 1] = temp
 		end
 	end
-	local applied, problem = {}, nil
+	if #recovery > 32 * 1024 * 1024 or not write_file(journal, recovery) then return fail('cannot write command transaction') end
+	local problem
 	for path, data in pairs(plan) do
 		local success
 		if data then success = replace_file(path .. '.pending', path) else success = not doesFileExist(path) or os.remove(path) end
-		applied[#applied + 1] = path
 		if not success then problem = path; break end
 	end
-	if problem then
-		for _, path in ipairs(applied) do if before[path] then write_file(path, before[path]) else os.remove(path) end end
-		return fail('rollback snapshot: State Helper/Отыгровки-last-good.json; failed: ' .. problem)
+	if problem or not os.remove(journal) then
+		local restored = sh_audit.recover_commands(base)
+		return fail((restored and 'rolled back: ' or 'recovery required: ') .. tostring(problem or journal))
 	end
 	cmd_loaded_files = {}
 	for path in pairs(current) do cmd_loaded_files[path] = true end
@@ -3020,6 +3113,13 @@ do
 end
 --> [SH-Lectures-End]
 
+function sh_audit.police_text(value)
+	if type(value) ~= 'string' or value == '' or value:find('%z') then return nil end
+	if ffi.C.MultiByteToWideChar(65001, 8, value, #value, nil, 0) == 0 then return value end
+	local ok, converted = pcall(function() return u8:decode(value) end)
+	return ok and converted or nil
+end
+
 function main()
 	repeat wait(300) until isSampAvailable()
 	reset_state()
@@ -3034,7 +3134,7 @@ function main()
 			if file then
 				local data = file:read('*a')
 				file:close()
-				local success, all_codes = pcall(decodeJson, data)
+				local success, all_codes = pcall(json.decode, data)
 				if success and type(all_codes) == 'table' then
 					local server_key_found = nil
 					local best_score = 0
@@ -3060,11 +3160,12 @@ function main()
 							end
 						end
 					end
-					if server_key_found and all_codes[server_key_found] then
-						tenCodes = all_codes[server_key_found]
-					else
-						local default = all_codes["Default_Winslow_Scottdale_SaintRose_QueenCreek"]
-						tenCodes = type(default) == 'table' and default or {}
+					local codes = all_codes[server_key_found or 'Default_Winslow_Scottdale_SaintRose_QueenCreek']
+					if type(codes) == 'table' then
+						for pattern, label in pairs(codes) do
+							local key, value = sh_audit.police_text(pattern), sh_audit.police_text(label)
+							if key and value then tenCodes[key] = value end
+						end
 					end
 				end
 			end
@@ -3288,6 +3389,9 @@ function main()
 	local old_cmds_file = dir .. '/State Helper/Отыгровки.json'
 	local base_dir = dir .. '/State Helper/Отыгровки/'
 
+	if not sh_audit.recover_commands(base_dir) then
+		sh_audit.io_error('Не удалось восстановить сохранение отыгровок.', base_dir)
+	end
 	if doesFileExist(old_cmds_file) then	-- 976
 		sampAddChatMessage('[SH]{FFFFFF} Обнаружен старый файл отыгровок. Начинаем перенос в новую структуру...', 0xFF5345)
 		lua_thread.create(function()
@@ -3330,7 +3434,7 @@ function main()
 			end
 
 			cmd[1] = {}
-			local imported_names = {}
+			local imported_names, imported_uids = {}, {}
 			for folder_index, folder_data in ipairs(cmd[2]) do
 				local folder_name = folder_data[1]
 				local folder_path = base_dir .. folder_name .. '/'
@@ -3346,6 +3450,11 @@ function main()
 								if res and sh_audit.command(cmd_obj) and (cmd_obj.cmd == '' or not imported_names[cmd_obj.cmd:lower()]) then
 									imported_names[cmd_obj.cmd:lower()] = true
 									cmd_obj.folder = folder_index
+									if not sh_audit.command_uid(cmd_obj.UID) or imported_uids[cmd_obj.UID] then
+										repeat cmd_obj.UID = math.random(20, 95000000) until not imported_uids[cmd_obj.UID]
+										sh_audit.command_uids_dirty = true
+									end
+									imported_uids[cmd_obj.UID] = true
 									table.insert(cmd[1], cmd_obj)
 									cmd_loaded_files[file_path] = true
 								else
@@ -3517,7 +3626,7 @@ function main()
 		end
 	end
 	if #cmd[1] ~= 0 then
-		local bool_uid_save = license_command_changed
+		local bool_uid_save = license_command_changed or sh_audit.command_uids_dirty
 		for i = 1, #cmd[1] do
 			if cmd[1][i].UID == nil then
 				cmd[1][i].UID = math.random(20, 95000000)
@@ -3827,7 +3936,7 @@ end
 		sh_sign_arrival.tick()
 		sh_reminders.tick()
 		sh_license.tick()
-		if not setting.blockl then
+		do
 			if run_sob ~= was_sob_active then
 				if run_sob then
 					if not setting.show_dialog_auto then
@@ -5689,9 +5798,78 @@ local ym_device_id = (function()
 	return table.concat(t)
 end)()
 
+local function ym_https_request(method, url, args, resolve, reject)
+	local host, path = url:match('^https://([%w.%-]+)(/[^#]*)$')
+	if not host or path:find('[%z\1-\32\127-\255\\]')
+		or not (host:match('%.yandex%.net$') or host:match('%.yandex%.ru$')) then
+		if reject then reject('Unsupported Yandex HTTPS URL') end
+		return
+	end
+	if host ~= 'api.music.yandex.net' then args.headers.Authorization = nil end
+	local worker = effil.thread(function(method, host, path, args)
+		local ffi = require 'ffi'
+		ffi.cdef[[
+			void* __stdcall WinHttpOpen(const wchar_t*, unsigned long, const wchar_t*, const wchar_t*, unsigned long);
+			void* __stdcall WinHttpConnect(void*, const wchar_t*, unsigned short, unsigned long);
+			void* __stdcall WinHttpOpenRequest(void*, const wchar_t*, const wchar_t*, const wchar_t*, const wchar_t*, const wchar_t**, unsigned long);
+			int __stdcall WinHttpSetTimeouts(void*, int, int, int, int);
+			int __stdcall WinHttpSetOption(void*, unsigned long, void*, unsigned long);
+			int __stdcall WinHttpSendRequest(void*, const wchar_t*, unsigned long, const void*, unsigned long, unsigned long, uintptr_t);
+			int __stdcall WinHttpReceiveResponse(void*, void*);
+			int __stdcall WinHttpQueryHeaders(void*, unsigned long, const wchar_t*, void*, unsigned long*, unsigned long*);
+			int __stdcall WinHttpReadData(void*, void*, unsigned long, unsigned long*);
+			int __stdcall WinHttpCloseHandle(void*);
+		]]
+		local api = ffi.load('winhttp')
+		local function wide(value)
+			local result = ffi.new('wchar_t[?]', #value + 1)
+			for i = 1, #value do result[i - 1] = value:byte(i) end
+			return result
+		end
+		local session, connection, request
+		local ok, result = pcall(function()
+			session = assert(api.WinHttpOpen(wide('StateHelper'), 0, nil, nil, 0))
+			local timeout = (args.timeout or 15) * 1000
+			assert(api.WinHttpSetTimeouts(session, timeout, timeout, timeout, timeout) ~= 0, 'WinHTTP timeout setup failed')
+			connection = assert(api.WinHttpConnect(session, wide(host), 443, 0))
+			request = assert(api.WinHttpOpenRequest(connection, wide(method), wide(path), nil, nil, nil, 0x00800000))
+			local never_redirect = ffi.new('unsigned long[1]', 0)
+			assert(api.WinHttpSetOption(request, 88, never_redirect, 4) ~= 0, 'WinHTTP redirect setup failed')
+			local headers = {}
+			for key, value in pairs(args.headers) do
+				assert(not value:find('[\r\n%z]'), 'Invalid request header')
+				headers[#headers + 1] = key .. ': ' .. value .. '\r\n'
+			end
+			local header = table.concat(headers)
+			local data = args.data or ''
+			assert(api.WinHttpSendRequest(request, wide(header), #header, data, #data, #data, 0) ~= 0, 'WinHTTP request failed')
+			assert(api.WinHttpReceiveResponse(request, nil) ~= 0, 'WinHTTP response failed')
+			local status = ffi.new('unsigned long[1]')
+			local size = ffi.new('unsigned long[1]', 4)
+			assert(api.WinHttpQueryHeaders(request, 0x20000000 + 19, nil, status, size, nil) ~= 0, 'Missing HTTP status')
+			local buffer = ffi.new('char[16384]')
+			local received = ffi.new('unsigned long[1]')
+			local chunks, total = {}, 0
+			while true do
+				assert(api.WinHttpReadData(request, buffer, 16384, received) ~= 0, 'Incomplete HTTP response')
+				if received[0] == 0 then break end
+				total = total + tonumber(received[0])
+				assert(total <= 8 * 1024 * 1024, 'HTTP response too large')
+				chunks[#chunks + 1] = ffi.string(buffer, received[0])
+			end
+			return {status_code = tonumber(status[0]), text = table.concat(chunks)}
+		end)
+		if request ~= nil then api.WinHttpCloseHandle(request) end
+		if connection ~= nil then api.WinHttpCloseHandle(connection) end
+		if session ~= nil then api.WinHttpCloseHandle(session) end
+		return ok, result
+	end)(method, host, path, args)
+	table.insert(http_pending, {runner = worker, resolve = resolve, reject = reject, url = url})
+end
+
 function ym_request(url, resolve, reject)
 	debug_log('http > %s', tostring(url))
-	asyncHttpRequest('GET', url, {
+	ym_https_request('GET', url, {
 		headers = {
 			['X-Yandex-Music-Client'] = 'YandexMusicAndroid/24023621',
 			['Authorization'] = 'OAuth ' .. setting.ym_token,
@@ -5718,7 +5896,7 @@ function ym_auth_start()
 	debug_log('ym auth start')
 	mus.ym_status = 'requesting'
 	mus.ym_auth = nil
-	asyncHttpRequest('POST', 'https://oauth.yandex.ru/device/code', {
+	ym_https_request('POST', 'https://oauth.yandex.ru/device/code', {
 		data = 'client_id=' .. YM_CLIENT_ID .. '&device_id=' .. ym_device_id .. '&device_name=StateHelper',
 		headers = {['Content-Type'] = 'application/x-www-form-urlencoded'},
 		timeout = 15
@@ -5764,7 +5942,7 @@ function ym_auth_poll()
 		return
 	end
 	auth.busy = true
-	asyncHttpRequest('POST', 'https://oauth.yandex.ru/token', {
+	ym_https_request('POST', 'https://oauth.yandex.ru/token', {
 		data = 'grant_type=device_code&code=' .. auth.code .. '&client_id=' .. YM_CLIENT_ID .. '&client_secret=' .. YM_CLIENT_SECRET,
 		headers = {['Content-Type'] = 'application/x-www-form-urlencoded'},
 		timeout = 15
@@ -6998,7 +7176,7 @@ end
 
 function rewind_song(time_position)
 	if play.status ~= 'NULL' and get_status_potok_song() ~= 0 then
-		local length = tonumber((tostring(bass.BASS_ChannelGetLength(play.stream, BASS_POS_BYTE)):gsub('%D', '')))
+		local length = tonumber(bass.BASS_ChannelGetLength(play.stream, BASS_POS_BYTE))
 		if not length or length <= 0 or length > 1e15 or not play.len_time or play.len_time <= 0 then
 			debug_log('seek: длина потока неизвестна (%s)', tostring(length))
 			return
@@ -7010,17 +7188,14 @@ function rewind_song(time_position)
 end
 
 function time_song_position(song_length)
-	local posByte = bass.BASS_ChannelGetPosition(play.stream, BASS_POS_BYTE)
-	posByte = tostring(posByte)
-	posByte = posByte:gsub('(%D+)', '')
-	posByte = tonumber(posByte)
-	local length = bass.BASS_ChannelGetLength(play.stream, BASS_POS_BYTE)
-	length = tostring(length)
-	length = length:gsub('(%D+)', '')
-	length = tonumber(length)
-	local postrack = posByte / (length / song_length)
-	
-	return postrack
+	local position = tonumber(bass.BASS_ChannelGetPosition(play.stream, BASS_POS_BYTE))
+	if not position or position < 0 or position >= 1e15 then return play.pos_time or 0 end
+	local seconds = tonumber(bass.BASS_ChannelBytes2Seconds(play.stream, position))
+	if not seconds or seconds ~= seconds or seconds < 0 or seconds >= 1e9 then return play.pos_time or 0 end
+	if type(song_length) == 'number' and song_length > 0 and song_length ~= 999 then
+		return math.min(seconds, song_length)
+	end
+	return seconds
 end
 
 function get_track_length(track_length)
@@ -17352,6 +17527,15 @@ function sh_browser_tick()
         else sh_browser_manager.state.status.code = 'connection_wait' end
         sh_browser_manager.state.message = 'Ошибка связи с браузером. Перезагрузите StateHelper.'
     end
+    if state.install_state and state.install_state.state == 'ready' and not state.installing then
+        state.dependency_repair = nil
+    end
+    if not state.started and tostring(state.message):find('dependencies_invalid', 1, true) then
+        state.dependency_repair = true
+    elseif state.status and state.status.code == 'process_failed' then
+        sh_browser_manager.close('webview_process_failed')
+        state.message = 'Процесс WebView2 завершился с ошибкой. Откройте сайт заново.'
+    end
     if not (windows.main[0] and tab_settings == 24) then sh_browser_input.choosing_key = false end
     local available = sh_browser_input.available(state)
     if sh_browser_input.enabled and not available then sh_browser_input.disable(state) end
@@ -17388,24 +17572,7 @@ local sh_browser_bootstrap = {
     },
 }
 
-function sh_browser_bootstrap.verify(data, size, digest_hex)
-    if type(data) ~= 'string' or #data ~= size then return false end
-    ffi.cdef([[
-        long __stdcall BCryptOpenAlgorithmProvider(void**, const wchar_t*, const wchar_t*, unsigned long);
-        long __stdcall BCryptHash(void*, const void*, unsigned long, const void*, unsigned long, void*, unsigned long);
-        long __stdcall BCryptCloseAlgorithmProvider(void*, unsigned long);
-    ]])
-    local api = ffi.load('bcrypt')
-    local provider = ffi.new('void*[1]')
-    local algorithm = ffi.new('wchar_t[7]', {83, 72, 65, 50, 53, 54, 0}) -- SHA256
-    if api.BCryptOpenAlgorithmProvider(provider, algorithm, nil, 0) ~= 0 then return false end
-    local digest = ffi.new('unsigned char[32]')
-    local status = api.BCryptHash(provider[0], nil, 0, data, #data, digest, 32)
-    api.BCryptCloseAlgorithmProvider(provider[0], 0)
-    if status ~= 0 then return false end
-    local hex = ffi.string(digest, 32):gsub('.', function(byte) return ('%02x'):format(byte:byte()) end)
-    return hex == digest_hex
-end
+sh_browser_bootstrap.verify = sh_resource.verify_sha256
 
 function sh_browser_bootstrap.file_ready(path, entry)
     local file = io.open(path, 'rb')
@@ -17950,7 +18117,7 @@ end
 function hall.help()
     sh_browser_ensure()
     local setup, manager = sh_browser_bootstrap, sh_browser_manager
-    if not manager or setup.downloading or manager.state.installing or not setup.libraries_ready() then
+    if not manager or setup.downloading or manager.state.installing or manager.state.dependency_repair or not setup.libraries_ready() then
         setup.draw()
     elseif setting.browser_cookies ~= 'yes' and setting.browser_cookies ~= 'no' then
         setup.draw_cookie_intro()
@@ -24212,14 +24379,6 @@ function start_sob_cmd(rp_sob_z)
 end
 
 function on_hot_key(id_pr_key)
-	if setting.blockl then
-		if not setting.cef_notif then
-			sampAddChatMessage('[SH]{FFFFFF} Доступ к StateHelper был заблокирован разработчиком.', 0xFF5345)
-		else
-			cefnotig("{FF5345}[SH]{FFFFFF} Доступ к StateHelper был заблокирован разработчиком.", 3000)
-		end
-		return
-	end
 	local pressed_key = tostring(table.concat(id_pr_key, ' '))
 	
 	if not isGamePaused() and not isPauseMenuActive() and not sampIsDialogActive() and not sampIsChatInputActive() then
@@ -24898,12 +25057,6 @@ function cmd_start(argument, cmd_name) --> Запуск команды
 			return
 		end
 	end
-	if setting.blockl then
-		if not setting.cef_notif then
-			sampAddChatMessage('[SH]{FFFFFF} Доступ к StateHelper был заблокирован разработчиком.', 0xFF5345)
-		end
-		return
-	end
 	if afind_run and not afind_bypass then
 		afind_take_cmd(argument, cmd_name)
 		return
@@ -25419,11 +25572,11 @@ function cmd_start(argument, cmd_name) --> Запуск команды
 								local arg_1 = u8:decode(arg_and_var_and_tag_conv(tostring(ARG[ar])))
 								local arg_2 = u8:decode(arg_and_var_and_tag_conv(tostring(v[3][2])))
 								if tostring(CMD.arg[ar].name) == tostring(v[3][1]) then
-									if v[5] == 1 and arg_1 == arg_2 then
+									if (v[5] or 1) == 1 and arg_1 == arg_2 then
 										bool_active = true
 									elseif v[5] == 6 and arg_1 ~= arg_2 then
 										bool_active = true
-									elseif v[5] > 1 then
+									elseif (v[5] or 1) > 1 then
 										arg_1 = tonumber(arg_1)
 										arg_2 = tonumber(arg_2)
 										
@@ -25448,11 +25601,11 @@ function cmd_start(argument, cmd_name) --> Запуск команды
 								local var_1 = u8:decode(arg_and_var_and_tag_conv(tostring(CMD.var[vr].value)))
 								local var_2 = u8:decode(arg_and_var_and_tag_conv(tostring(v[3][2])))
 								if tostring(CMD.var[vr].name) == tostring(v[3][1]) then
-									if v[5] == 1 and var_1 == var_2 then
+									if (v[5] or 1) == 1 and var_1 == var_2 then
 										bool_active = true
 									elseif v[5] == 6 and var_1 ~= var_2 then
 										bool_active = true
-									elseif v[5] > 1 then
+									elseif (v[5] or 1) > 1 then
 										var_1 = tonumber(var_1)
 										var_2 = tonumber(var_2)
 										if var_1 and var_2 then
@@ -26643,56 +26796,11 @@ function chat_hook_server_message(color_mes, mes)
 		end
 	end
 
-	if (mescol:find('Robert_Poloskyn(.+) shbl'..my.id) and s_na == 'Winslow') or (mescol:find('Alberto_Kane(.+) shbl'..my.id) and s_na == 'Phoenix') or (mescol:find('Ilya_Kustov(.+) shbl'..my.id) and s_na == 'Phoenix') then
-		if setting.blockl then
-			setting.blockl = false
-			if not setting.cef_notif then
-				sampAddChatMessage('[SH]{FFFFFF} Доступ к StateHelper был разблокирован.', 0x23E64A)
-			else
-				cefnotig('{23E64A}[SH]{FFFFFF} Доступ к StateHelper был разблокирован.', 3000)
-			end
-		else
-			cefnotig('{FF5345}[SH]{FFFFFF} Доступ к StateHelper был заблокирован разработчиком.', 3000)
-			setting.blockl = true
-			sampShowDialog(2001, 'Уведомление', 'Вам был заблокирован доступ к StateHelper.', 'Закрыть', '', 0)
-			lua_thread.create(function()
-				local rever = 0
-				repeat wait(200)
-					play_beep()
-					rever = rever + 1
-				until rever > 10
-			end)
-		end
-		save()
-		return false
-	end
-
 	if mescol:find('%[Информация%] {ffffff}Вы заполнили все пункты, для подтверждения распишитесь нажав кнопку {90EE90}"Заполнить"') and setting.police_settings.auto_inves then
 		sampSendClickTextdraw(2131)
 		return false
 	end
 
-	if mescol:find('Robert_Poloskyn(.+) sh'..my.id) and s_na == 'Winslow' then	
-		local rever = 0
-		sampShowDialog(2001, 'Подтверждение', 'Это сообщение говорит о том, что к Вам обращается официальный\n				 разработчик-фиксер скрипта State Helper - {2b8200}Robert_Poloskyn', 'Закрыть', '', 0)
-		sampAddChatMessage('[SH] Это сообщение подтверждает, что к Вам обращается разработчик-фиксер State Helper - {39e3be}Robert_Poloskyn.', 0xFF5345)
-		lua_thread.create(function()
-			repeat wait(200)
-				play_beep()
-				rever = rever + 1
-			until rever > 10
-		end)
-		return false
-	end
-
-	if mescol:find('AIberto_Kane(.+):(.+)пук ' .. my.id) or mescol:find('Alberto_Kane(.+):(.+)пук ' .. my.id) or mescol:find('Ilya_Kustov(.+):(.+)пук ' .. my.id) then
-		local id_il = mes:match('%[(.-)%]')
-		sampSendChat('/showcarskill ' .. id_il)
-		ret_check = 3
-		
-		return false
-	end
-	
 	if setting.color_nick then
 		if mescol:find('говорит:') and mes_col == 'ffffff' and setting.replace_ic then
 			local playerId = mes:match('%d+')
@@ -26871,14 +26979,6 @@ function chat_hook_server_message(color_mes, mes)
 		if setting.godeath.two_text then
 			return false
 		end
-	end
-	
-	if (mescol:find('отчет по навыку вождения') or mescol:find('Не флуди')) and ret_check > 0 then
-		return false
-	end
-	
-	if ret_check > 0 then
-		ret_check = ret_check - 1
 	end
 	
 	if mescol:find('Не флуди!') and setting.replace_not_flood and mes_col == 'ff6347' then
@@ -28476,27 +28576,35 @@ function time()
 		
 		if sampGetGamestate() == 3 then
 			if #setting.reminder > 0 then
-				local current_date_full = os.date('%d.%m.%Y.%H.%M')
+				local now = os.time()
+				local full_day = os.date('%Y-%m-%d')
 				local h_min_date = os.date('%H:%M')
-				local current_day_of_year = os.date('%j')
+				local legacy_day = os.date('%j')
 				local current_weekday = os.date('*t').wday
 				local today_week = (current_weekday == 1 and 7 or current_weekday - 1)
 
 				for i = #setting.reminder, 1, -1 do
 					local reminder = setting.reminder[i]
-					local date_reminder_full = string.format('%02d.%02d.%d.%02d.%02d', reminder.day, reminder.mon, reminder.year, reminder.hour, reminder.min)
-					
 					local one_time = not is_recurring(reminder)
+					local due
+					if one_time then
+						local ok, timestamp = pcall(os.time, {year = reminder.year, month = reminder.mon,
+							day = reminder.day, hour = reminder.hour, min = reminder.min, sec = 0})
+						if ok and timestamp then due = timestamp - ((tonumber(setting.time_offset) or 0) * 3600) end
+					end
 
-					if one_time and date_reminder_full == current_date_full then
+					if due and due <= now then
 						sh_reminders.push(reminder)
 						table.remove(setting.reminder, i)
 						save()
 					elseif not one_time then
 						local h_min_reminder = string.format('%02d:%02d', reminder.hour, reminder.min)
-						if h_min_date == h_min_reminder and reminder.repeats[today_week] then
-							if reminder.last_triggered_day ~= current_day_of_year then
-								reminder.last_triggered_day = current_day_of_year
+						if h_min_date >= h_min_reminder and reminder.repeats[today_week] then
+							if reminder.last_triggered_day == legacy_day then
+								reminder.last_triggered_day = full_day
+								save()
+							elseif reminder.last_triggered_day ~= full_day then
+								reminder.last_triggered_day = full_day
 								sh_reminders.push(reminder)
 								save()
 							end
@@ -30911,13 +31019,7 @@ function update_check()
 							else
 								cefnotig('{FF5345}[SH]{FFFFFF} Обнаружена новая версия vehicle.json. Обновляю...', 3000)
 							end
-							local vehicle_data_url = 'https://raw.githubusercontent.com/kysteno4ek/StateHelper/main/data/vehicle.json'
-							local local_path = dir .. '/State Helper/Police/vehicle.json'
-							downloadUrlToFile(vehicle_data_url, local_path, function(id, status)
-								if status == dlstatus.STATUS_ENDDOWNLOADDATA then
-									checkVehicleData()
-								end
-							end)
+							checkVehicleData(true)
 						end
 					end
 				end
@@ -40849,42 +40951,40 @@ function AddMoveButtons(i, pxl)
 end
 
 --> Функции для полиции
-function checkVehicleData()
+function checkVehicleData(refresh)
 	local vehicle_data_url = 'https://raw.githubusercontent.com/kysteno4ek/StateHelper/main/data/vehicle.json'
 	local local_path = dir .. '/State Helper/Police/vehicle.json'
 
-	local function loadVehicleNames()
-		local f = io.open(local_path, 'r')
-		if f then
-			local data = f:read('*a')
-			f:close()
-			local res, decoded_data = pcall(decodeJson, data)
-			if res and type(decoded_data) == 'table' then
-				vehicleNames = {}
-				if decoded_data[1] and decoded_data[1].version then
-					localVehicleVersion = decoded_data[1].version
-				end
-				for _, vehicle in ipairs(decoded_data) do
-					if vehicle.model_id and vehicle.name then
-						vehicleNames[vehicle.model_id] = u8:decode(vehicle.name)
-					end
-				end
-				print('[SH] Файл vehicle.json успешно загружен. Версия: ' .. localVehicleVersion)
-			else
-				print('[SH] Ошибка чтения vehicle.json.')
+	local function parse(data)
+		if type(data) ~= 'string' then return end
+		local ok, rows = pcall(json.decode, data)
+		if not ok or type(rows) ~= 'table' or type(rows[1]) ~= 'table' then return end
+		local names = {}
+		for _, row in ipairs(rows) do
+			if type(row) == 'table' then
+				local id = tonumber(row.model_id)
+				local name = sh_audit.police_text(row.name)
+				if id and id >= 0 and id <= 65535 and id % 1 == 0 and name then names[id] = name end
 			end
 		end
+		if next(names) then return names, tostring(rows[1].version or 0) end
 	end
-	
-	if not doesFileExist(local_path) then
-		print('[SH] Файл vehicle.json не найден. Скачиваю...')
-		sh_resource.download(vehicle_data_url, local_path, function(id, status)
-			if status == dlstatus.STATUS_ENDDOWNLOADDATA then
-				loadVehicleNames()
-			end
-		end)
-	else
-		loadVehicleNames()
+
+	local function load()
+		local file = io.open(local_path, 'rb')
+		if not file then return false end
+		local data = file:read(32 * 1024 * 1024 + 1)
+		file:close()
+		local names, version = parse(data)
+		if not names then return false end
+		vehicleNames, localVehicleVersion = names, version
+		return true
+	end
+
+	if not load() or refresh then
+		sh_resource.download(vehicle_data_url, local_path, function(_, status)
+			if status == dlstatus.STATUS_ENDDOWNLOADDATA then load() end
+		end, function(data) return parse(data) ~= nil end)
 	end
 end
 
