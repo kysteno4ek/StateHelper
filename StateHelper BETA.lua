@@ -17407,71 +17407,57 @@ function sh_browser_bootstrap.verify(data, size, digest_hex)
     return hex == digest_hex
 end
 
-function sh_browser_bootstrap.file_ready(path, entry)
-    local file = io.open(path, 'rb')
-    if not file then return false end
-    local data = file:read(entry[2] + 1)
-    file:close()
-    local ok, valid = pcall(sh_browser_bootstrap.verify, data, entry[2], entry[3])
-    return ok and valid
-end
-
 function sh_browser_bootstrap.start()
     local setup = sh_browser_bootstrap
     if setup.downloading then return end
     local root = dir .. '/State Helper/Browser'
     if not doesDirectoryExist(root) then createDirectory(root) end
+
     setup.downloading = true
     setup.message = 'Скачиваем файлы браузера с GitHub…'
-
-    lua_thread.create(function()
-        for _, entry in ipairs(setup.installed) do
-            local name, size, digest = unpack(entry)
-            local path = root .. '/' .. name
-            local installed = setup.file_ready(path, entry)
-            local reason
-            for attempt = 1, 2 do
-                if installed then break end
-                local pending = true
-                local ok, id = pcall(sh_resource.download, setup.url .. name, path, function(_, status)
-                    if not pending then return end
-                    if status == dlstatus.STATUS_ENDDOWNLOADDATA then
-                        installed = true
-                        pending = false
-                    elseif status == dlstatus.STATUS_DOWNLOAD_ERROR or status == dlstatus.STATUSEX_ENDDOWNLOAD then
-                        reason = 'download ended without a verified file'
-                        pending = false
-                    end
-                end, function(data)
-                    return pending and setup.verify(data, size, digest)
-                        and (name ~= 'browser.lua' or loadstring(data, '@browser.lua') ~= nil)
-                end)
-                if pending and (not ok or not id or id == 0) then
-                    reason = ok and 'download did not start' or tostring(id)
-                    pending = false
-                end
-                local elapsed = 0
-                while pending and elapsed < 30000 do
-                    wait(100)
-                    elapsed = elapsed + 100
-                end
-                if pending then
-                    reason = 'download timed out'
-                    pending = false
-                end
-                if not installed and attempt == 1 then wait(1000) end
-            end
-            if not installed then
-                setup.message = 'Не удалось загрузить ' .. name .. '. Повторите загрузку.'
-                setup.downloading = false
-                print('[SH Browser] ' .. name .. ': ' .. tostring(reason))
-                return
-            end
-        end
-        sh_browser_load_error = nil
-        setup.message = nil
-        setup.install_libraries = true
+    setup.attempt = (setup.attempt or 0) + 1
+    local attempt = setup.attempt
+    local function active()
+        return setup.downloading and setup.attempt == attempt
+    end
+    local function finish(success)
+        if not active() then return end
         setup.downloading = false
+        if success then
+            sh_browser_load_error = nil
+            setup.message = nil
+            setup.install_libraries = true
+        else
+            setup.message = 'Не удалось установить браузер. Проверьте соединение и повторите загрузку.'
+        end
+    end
+
+    local function download(index)
+        if not active() then return end
+        local entry = setup.installed[index]
+        if not entry then finish(true); return end
+        local name, size, digest = unpack(entry)
+        local completed = false
+        local ok, id = pcall(sh_resource.download, setup.url .. name, root .. '/' .. name, function(_, status)
+            if completed or not active() then return end
+            if status == dlstatus.STATUS_ENDDOWNLOADDATA then
+                completed = true
+                download(index + 1)
+            elseif status == dlstatus.STATUS_DOWNLOAD_ERROR or status == dlstatus.STATUSEX_ENDDOWNLOAD then
+                completed = true
+                finish(false)
+            end
+        end, function(data)
+            return active() and setup.verify(data, size, digest)
+                and (name ~= 'browser.lua' or loadstring(data, '@browser.lua') ~= nil)
+        end)
+        if not completed and (not ok or not id or id == 0) then finish(false) end
+    end
+
+    download(1)
+    lua_thread.create(function()
+        wait(120000)
+        finish(false)
     end)
 end
 
@@ -17686,7 +17672,11 @@ local function sh_browser_ensure()
             return
         end
         for _, entry in ipairs(sh_browser_bootstrap.installed) do
-            if not sh_browser_bootstrap.file_ready(root .. '/' .. entry[1], entry) then
+            local file = io.open(root .. '/' .. entry[1], 'rb')
+            local data = file and file:read(entry[2] + 1)
+            if file then file:close() end
+            local ok, valid = pcall(sh_browser_bootstrap.verify, data, entry[2], entry[3])
+            if not ok or not valid then
                 sh_browser_load_error = 'Файлы браузера требуют обновления.'
                 sh_browser_bootstrap.message = sh_browser_load_error
                 return
