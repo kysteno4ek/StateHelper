@@ -206,8 +206,7 @@ do
   local n, args = select('#', ...), {...}
   if type(args[n]) == 'function' then args[n] = guard(args[n]) end
   return onframe(function(...)
-   if not (inst_suc_font and inst_suc_font[1] and inst_suc_font[2]) then return false end
-   return cond(...)
+   return sh_resource and sh_resource.fonts_ready() and cond(...)
   end, unpack(args, 1, n))
  end
 end
@@ -313,42 +312,79 @@ function sh_resource.download(url, path, callback)
 				if callback then callback(id, dlstatus.STATUS_DOWNLOAD_ERROR, p1, p2) end
 				return
 			end
-		elseif status == dlstatus.STATUS_DOWNLOAD_ERROR then os.remove(temporary) end
+		elseif status == dlstatus.STATUS_DOWNLOAD_ERROR or status == dlstatus.STATUSEX_ENDDOWNLOAD then
+		os.remove(temporary)
+	end
 		if callback then callback(id, status, p1, p2) end
 	end)
 end
 
 --> Скачивание шрифтов
-inst_suc_font = {false, false}
 image_version_init = false
-function download_font()
-	local link_meduim_font = 'https://raw.githubusercontent.com/kysteno4ek/StateHelper/main/fonts/SF600.ttf'
-	local link_bold_font = 'https://raw.githubusercontent.com/kysteno4ek/StateHelper/main/fonts/SF800.ttf'
-	if not doesDirectoryExist(dir .. '/State Helper/Шрифты/') then
-		print('{F54A4A}Ошибка. Отсутствует папка для шрифтов. {82E28C}Создание папки для шрифтов...')
-		createDirectory(dir .. '/State Helper/Шрифты/')
+sh_resource.font_dir = dir .. '/State Helper/Шрифты/'
+
+function sh_resource.read_font(path)
+	local file = io.open(path, 'rb')
+	if not file then return end
+	local data = file:read(32 * 1024 * 1024 + 1)
+	file:close()
+	if sh_resource.valid(data, 'ttf') then return data end
+end
+
+sh_resource.font_data = {}
+sh_resource.font_pending = {}
+
+function sh_resource.fonts_ready()
+	return sh_resource.font_data['SF600.ttf'] ~= nil and sh_resource.font_data['SF800.ttf'] ~= nil
+end
+
+function sh_resource.download_fonts()
+	if not doesDirectoryExist(sh_resource.font_dir) then
+		createDirectory(sh_resource.font_dir)
 	end
-	local function file_ok(path)
-		local file = io.open(path, 'rb'); if not file then return false end
-		local data = file:read('*a'); file:close(); return sh_resource.valid(data, 'ttf')
-	end
-	local fonts = {
-		{link_meduim_font, 'SF600.ttf'},
-		{link_bold_font, 'SF800.ttf'},
-	}
-	for index, font in ipairs(fonts) do
-		local path = dir .. '/State Helper/Шрифты/' .. font[2]
-		inst_suc_font[index] = file_ok(path)
-		if not inst_suc_font[index] then
-			sh_resource.download(font[1], path, function(_, status)
-				if status == dlstatus.STATUS_ENDDOWNLOADDATA then
-					inst_suc_font[index] = true
+	for _, name in ipairs({'SF600.ttf', 'SF800.ttf'}) do
+		if not sh_resource.font_data[name] and not sh_resource.font_pending[name] then
+			local path = sh_resource.font_dir .. name
+			local url = 'https://raw.githubusercontent.com/kysteno4ek/StateHelper/main/fonts/' .. name
+			local attempts = 0
+			local function attempt()
+				local data = sh_resource.read_font(path)
+				if data then
+					sh_resource.font_data[name] = data
+					sh_resource.font_pending[name] = nil
+					return
 				end
-			end)
+				attempts = attempts + 1
+				local finished = false
+				local function complete()
+					if finished then return end
+					finished = true
+					local downloaded = sh_resource.read_font(path)
+					if downloaded then
+						sh_resource.font_data[name] = downloaded
+						sh_resource.font_pending[name] = nil
+					elseif attempts < 3 then
+						lua_thread.create(function()
+							wait(5000 * attempts)
+							attempt()
+						end)
+					else
+						sh_resource.font_pending[name] = nil
+						print('[SH Font] Could not download ' .. name .. ' after ' .. attempts .. ' attempts.')
+					end
+				end
+				local ok, id = pcall(sh_resource.download, url, path, function(_, status)
+					if status == dlstatus.STATUS_ENDDOWNLOADDATA or status == dlstatus.STATUSEX_ENDDOWNLOAD
+						or status == dlstatus.STATUS_DOWNLOAD_ERROR then complete() end
+				end)
+				if not ok or id == nil or id == false then complete() end
+			end
+			sh_resource.font_pending[name] = true
+			attempt()
 		end
 	end
 end
-download_font()
+sh_resource.download_fonts()
 
 if not doesDirectoryExist(dir .. '/State Helper/Изображения/') then
 	createDirectory(dir .. '/State Helper/Изображения/')
@@ -412,37 +448,39 @@ function open_main()
 		end
 		return
 	end
-	if inst_suc_font[1] and inst_suc_font[2] then
-		windows.main[0] = not windows.main[0]
-		if windows.main[0] then
-			if sampIsLocalPlayerSpawned() then
-				local _, myid = sampGetPlayerIdByCharHandle(PLAYER_PED)
-				my = {id = myid, nick = sampGetPlayerNickname(myid)}
-			else
-				if not setting.cef_notif then
-					sampAddChatMessage('[SH]{FFFFFF} Дождитесь спавна персонажа перед использованием.', 0xFF5345)
-				else
-					cefnotig('{FF5345}[SH]{FFFFFF} Дождитесь спавна персонажа перед использованием.', 3000)
-				end
-				windows.main[0] = false
-				return
-			end
-			sx, sy = getScreenResolution()
-			fix_bug_input_bool = true
-			if setting.anim_win then
-				anim_func = true
-			else
-				win_x = sx / 2
-			end
+	if not sh_resource.fonts_ready() then
+		sh_resource.download_fonts()
+		if not sh_resource.fonts_ready() then
+			sampAddChatMessage('[SH]{FFFFFF} Не удалось обнаружить шрифты. Попробуйте снова через несколько секунд...', 0xFF5345)
+			return
+		end
+	end
+	windows.main[0] = not windows.main[0]
+	if windows.main[0] then
+		if sampIsLocalPlayerSpawned() then
+			local _, myid = sampGetPlayerIdByCharHandle(PLAYER_PED)
+			my = {id = myid, nick = sampGetPlayerNickname(myid)}
 		else
-			if setting.anim_win then
-				close_win_anim = true
-				windows.main[0] = true
+			if not setting.cef_notif then
+				sampAddChatMessage('[SH]{FFFFFF} Дождитесь спавна персонажа перед использованием.', 0xFF5345)
+			else
+				cefnotig('{FF5345}[SH]{FFFFFF} Дождитесь спавна персонажа перед использованием.', 3000)
 			end
+			windows.main[0] = false
+			return
+		end
+		sx, sy = getScreenResolution()
+		fix_bug_input_bool = true
+		if setting.anim_win then
+			anim_func = true
+		else
+			win_x = sx / 2
 		end
 	else
-		sampAddChatMessage('[SH]{FFFFFF} Не удалось обнаружить шрифты. Попробуйте снова через несколько секунд...', 0xFF5345)
-		sampAddChatMessage('[SH]{FFFFFF} Если проблема не решилась, напишите разработчику ВК: vk.com/marseloy', 0xFF5345)
+		if setting.anim_win then
+			close_win_anim = true
+			windows.main[0] = true
+		end
 	end
 end
 
@@ -997,6 +1035,7 @@ setting = {
 	cmd_open_win = '',
 	tab = {'settings', 'cmd', 'shpora', 'dep', 'sob', 'reminder', 'stat', 'music', 'rp_zona', 'help', 'actions'},
 	browser_before_actions = false,
+	browser_cookies = 'ask',
 	auto_update = false,
 	name_rus = '',
 	sex = 1,
@@ -1529,6 +1568,13 @@ function sh_audit.migrate_commands()
 				c.desc = u8(label[2])
 				changed = true
 			end
+			local first = c.act and c.act[1]
+			if c.newbie_license_template == true and first and first[1] == 'SEND'
+				and first[2] == u8'/me снял{sex[][а]} со спины сумку, после чего открыл{sex[][а]} её' then
+				c = deep_copy(c)
+				c.act[1][2] = u8'/me достал{sex[][а]} из под стола пустой бланк для выдачи лицензии '
+				changed = true
+			end
 			result[#result + 1] = c
 		end
 	end
@@ -1550,11 +1596,141 @@ function sh_audit.migrate_commands()
 	return changed
 end
 
+sh_audit.private_root = dir .. '/StateHelper passwords'
+sh_audit.private_fields = {ym_token = true, ym_uid = true, vk_cookie = true, vk_uid = true}
 sh_audit.settings_backups = {'.last-good', '.old'}
+
+function sh_audit.ensure_private_storage()
+	if not doesDirectoryExist(sh_audit.private_root) then lfs.mkdir(sh_audit.private_root) end
+	return doesDirectoryExist(sh_audit.private_root)
+end
+
+function sh_audit.move_private_file(from, to)
+	if not doesFileExist(from) and not doesDirectoryExist(from) then return true end
+	local target, index = to, 1
+	while doesFileExist(target) or doesDirectoryExist(target) do
+		index = index + 1
+		target = to .. '.legacy-' .. index
+	end
+	return os.rename(from, target)
+end
+
+function sh_audit.save_private_music()
+	local token, uid = setting.ym_token or '', setting.ym_uid or ''
+	if sh_audit.saved_ym_token == token and sh_audit.saved_ym_uid == uid then return true end
+	if not sh_audit.ensure_private_storage() then return false, sh_audit.private_root end
+	local ok, data = pcall(encodeJson, {ym_token = token, ym_uid = uid})
+	if not ok then return false, data end
+	local written, problem = write_file(sh_audit.private_root .. '/yandex-music.json', data)
+	if written then sh_audit.saved_ym_token, sh_audit.saved_ym_uid = token, uid end
+	return written, problem
+end
+
+function sh_audit.migrate_private_storage()
+	if not sh_audit.ensure_private_storage() then
+		sh_audit.io_error('Не удалось создать папку личных данных StateHelper.')
+		return false
+	end
+	local base = dir .. '/State Helper/'
+	local function read_json(path)
+		local file = io.open(path, 'rb')
+		if not file then return end
+		local data = file:read('*a')
+		file:close()
+		if not data then return end
+		local ok, value = pcall(decodeJson, (data:gsub('^\239\187\191', '')))
+		if ok and type(value) == 'table' then return value, data end
+		return nil, data
+	end
+	local private_file = sh_audit.private_root .. '/yandex-music.json'
+	local saved = read_json(private_file)
+	if saved and type(saved.ym_token) == 'string' then
+		setting.ym_token = saved.ym_token
+		setting.ym_uid = type(saved.ym_uid) == 'string' and saved.ym_uid or ''
+		sh_audit.saved_ym_token, sh_audit.saved_ym_uid = setting.ym_token, setting.ym_uid
+	elseif doesFileExist(private_file) then
+		if not sh_audit.move_private_file(private_file, private_file .. '.invalid') then
+			sh_audit.io_error('Не удалось сохранить повреждённую копию данных входа.', private_file)
+			return false
+		end
+	elseif setting.ym_token == '' and setting.ym_uid == '' then
+		sh_audit.saved_ym_token, sh_audit.saved_ym_uid = '', ''
+	end
+	local ok, problem = sh_audit.save_private_music()
+	if not ok then
+		sh_audit.io_error('Не удалось перенести данные входа в Яндекс Музыку.', problem)
+		return false
+	end
+
+	local function strip_credentials(folder)
+		for name in lfs.dir(folder) do
+			if name:sub(1, 14) == 'Настройки.json' then
+				local path = folder .. '/' .. name
+				local config, raw = read_json(path)
+				if config then
+					local changed = false
+					for key in pairs(sh_audit.private_fields) do
+						if config[key] ~= nil then config[key], changed = nil, true end
+					end
+					if changed then
+						local encoded, data = pcall(encodeJson, config)
+						if not encoded or not write_file(path, data) then
+							sh_audit.io_error('Не удалось очистить старую копию настроек от данных входа.', path)
+						end
+					end
+				elseif raw then
+					for key in pairs(sh_audit.private_fields) do
+						if raw:find('"' .. key .. '"', 1, true) then
+							local moved = sh_audit.move_private_file(path, sh_audit.private_root .. '/invalid-' .. name)
+							if not moved then sh_audit.io_error('Не удалось перенести повреждённую копию настроек.', path) end
+							break
+						end
+					end
+				end
+			end
+		end
+	end
+	if doesDirectoryExist(base) then strip_credentials(base) end
+	local archive = base .. 'Archive'
+	if doesDirectoryExist(archive) then
+		for name in lfs.dir(archive) do
+			local folder = archive .. '/' .. name
+			if name:match('^settings%-reset%-') and doesDirectoryExist(folder) then strip_credentials(folder) end
+		end
+	end
+	for _, name in ipairs({'debug.log', 'debug.log.old', 'sign-trace.log', 'license-trace.log', 'crashlog.log'}) do
+		local moved = sh_audit.move_private_file(base .. name, sh_audit.private_root .. '/' .. name)
+		if not moved then sh_audit.io_error('Не удалось перенести личный журнал.', name) end
+	end
+	return true
+end
+
+function sh_audit.prepare_private_browser()
+	if not sh_audit.ensure_private_storage() then return false end
+	local target = sh_audit.private_root .. '/Browser'
+	if not doesDirectoryExist(target) then lfs.mkdir(target) end
+	if not doesDirectoryExist(target) then return false end
+	local legacy = dir .. '/State Helper/Browser/'
+	for _, name in ipairs({'Profile', 'PrivateProfile', 'control.json', 'status.json', 'host-error.json', 'sites.json',
+		'control.json.lua.tmp', 'status.json.tmp', 'host-error.json.tmp', 'sites.json.lua.tmp'}) do
+		local moved = sh_audit.move_private_file(legacy .. name, target .. '/' .. name)
+		if not moved then return false, name end
+	end
+	if doesDirectoryExist(legacy) then
+		for name in lfs.dir(legacy) do
+			if name:match('^status%.json%.tmp%-%d+$') or name:match('^host%-error%.json%.tmp%-%d+$') then
+				local moved = sh_audit.move_private_file(legacy .. name, target .. '/' .. name)
+				if not moved then return false, name end
+			end
+		end
+	end
+	return true
+end
 
 function sh_audit.archive_settings_for_reset()
 	local base = dir .. '/State Helper/'
-	local archive = base .. 'Archive'
+	if not sh_audit.ensure_private_storage() then return false, sh_audit.private_root end
+	local archive = sh_audit.private_root .. '/Archive'
 	if not doesDirectoryExist(archive) then lfs.mkdir(archive) end
 	if not doesDirectoryExist(archive) then return false, archive end
 
@@ -1567,20 +1743,24 @@ function sh_audit.archive_settings_for_reset()
 	local created, create_error = lfs.mkdir(destination)
 	if not created then return false, destination .. ': ' .. tostring(create_error) end
 
-	local names = {'Настройки.json', 'Отыгровки', 'Отыгровки-last-good.json'}
+	local names = {'Настройки.json', 'Отыгровки', 'Отыгровки-last-good.json', 'yandex-music.json'}
+	local function active_path(name)
+		if name == 'yandex-music.json' then return sh_audit.private_root .. '/' .. name end
+		return base .. name
+	end
 	for _, suffix in ipairs(sh_audit.settings_backups) do
 		names[#names + 1] = 'Настройки.json' .. suffix
 	end
 	local moved = {}
 	for _, name in ipairs(names) do
-		local path = base .. name
+		local path = active_path(name)
 		if doesFileExist(path) or doesDirectoryExist(path) then
 			local ok, problem = os.rename(path, destination .. '/' .. name)
 			if not ok then
 				local failure = name .. ': ' .. tostring(problem)
 				for i = #moved, 1, -1 do
 					local item = moved[i]
-					local restored, restore_error = os.rename(destination .. '/' .. item, base .. item)
+					local restored, restore_error = os.rename(destination .. '/' .. item, active_path(item))
 					if not restored then failure = failure .. ' | ' .. item .. ': ' .. tostring(restore_error) end
 				end
 				return false, failure .. ' | ' .. destination
@@ -1594,7 +1774,16 @@ end
 function save(force)
 	if settings_reset_pending then return false end
 	if not force and setting.first_start then return false end
-	local ok, data = pcall(encodeJson, setting)
+	local private_saved, private_error = sh_audit.save_private_music()
+	if not private_saved then
+		sh_audit.io_error('Не удалось сохранить данные входа в Яндекс Музыку.', private_error)
+		return false
+	end
+	local public = {}
+	for key, value in pairs(setting) do
+		if not sh_audit.private_fields[key] then public[key] = value end
+	end
+	local ok, data = pcall(encodeJson, public)
 	if not ok then sh_audit.io_error('Не удалось подготовить настройки к сохранению.'); return false end
 	if not force and data == last_saved_json then return true end
 	local written, problem = write_file(dir .. '/State Helper/Настройки.json', data)
@@ -1631,7 +1820,7 @@ local function debug_write(msg)
 		debug_file = nil
 	end
 	if not debug_file then
-		local path = dir .. '/State Helper/debug.log'
+		local path = sh_audit.private_root .. '/debug.log'
 		local old = io.open(path, 'r')
 		if old then
 			local size = old:seek('end') or 0
@@ -1842,6 +2031,13 @@ function download_image()
 	download_radio_label('https://raw.githubusercontent.com/kysteno4ek/StateHelper/main/images/YandexMusic.png', 'YandexMusic', 11)
 	download_radio_label('https://raw.githubusercontent.com/kysteno4ek/StateHelper/main/images/SeFon.png', 'SeFon', 12)
 	download_radio_label('https://raw.githubusercontent.com/kysteno4ek/StateHelper/main/images/Hitmoz.png', 'Hitmoz', 13)
+	for _, engine in ipairs({'yandex', 'google'}) do
+		local name = 'search-' .. engine .. '.png'
+		local path = dir .. '/State Helper/Изображения/' .. name
+		if not doesFileExist(path) then
+			sh_resource.download('https://raw.githubusercontent.com/kysteno4ek/StateHelper/main/images/' .. name, path)
+		end
+	end
 	
 end
 download_image()
@@ -1857,12 +2053,19 @@ imgui.OnInitialize(function()
 	config.PixelSnapH = true
 	config.OversampleH = 1
 	config.OversampleV = 1
-	local glyph_ranges = imgui.new.ImWchar[7] { 0x0020, 0x00FF, 0x0400, 0x045F, 0x0401, 0x0401, 0}
-	bold_font[1] = imgui.GetIO().Fonts:AddFontFromFileTTF(u8(dir) .. u8'/State Helper/Шрифты/SF800.ttf', 17.0, config, glyph_ranges)
-	bold_font[2] = imgui.GetIO().Fonts:AddFontFromFileTTF(u8(dir) .. u8'/State Helper/Шрифты/SF800.ttf', 65.0, config, glyph_ranges)
-	bold_font[3] = imgui.GetIO().Fonts:AddFontFromFileTTF(u8(dir) .. u8'/State Helper/Шрифты/SF800.ttf', 35.0, config, glyph_ranges)
-	bold_font[4] = imgui.GetIO().Fonts:AddFontFromFileTTF(u8(dir) .. u8'/State Helper/Шрифты/SF800.ttf', 13.0, config, glyph_ranges)
-	
+	local atlas = imgui.GetIO().Fonts
+	local glyph_ranges = atlas:GetGlyphRangesCyrillic()
+	local bold = sh_resource.font_data['SF800.ttf']
+	local medium = sh_resource.font_data['SF600.ttf']
+	local function add_text_font(data, size)
+		local memory = assert(imgui.MemAlloc(#data))
+		ffi.copy(memory, data, #data)
+		return atlas:AddFontFromMemoryTTF(memory, #data, size, config, glyph_ranges)
+	end
+	for index, size in ipairs({17, 65, 35, 13}) do
+		bold_font[index] = add_text_font(bold, size)
+	end
+
 	iconRanges = imgui.new.ImWchar[3](fa.min_range, fa.max_range, 0)
 	fa_font[1] = imgui.GetIO().Fonts:AddFontFromMemoryCompressedBase85TTF(fa.get_font_data_base85('solid'), 8, config, iconRanges)
 	fa_font[2] = imgui.GetIO().Fonts:AddFontFromMemoryCompressedBase85TTF(fa.get_font_data_base85('solid'), 13, config, iconRanges)
@@ -1870,7 +2073,7 @@ imgui.OnInitialize(function()
 	fa_font[4] = imgui.GetIO().Fonts:AddFontFromMemoryCompressedBase85TTF(fa.get_font_data_base85('solid'), 17, config, iconRanges)
 	fa_font[5] = imgui.GetIO().Fonts:AddFontFromMemoryCompressedBase85TTF(fa.get_font_data_base85('solid'), 21, config, iconRanges)
 	fa_font[6] = imgui.GetIO().Fonts:AddFontFromMemoryCompressedBase85TTF(fa.get_font_data_base85('solid'), 35, config, iconRanges)
-	notify_font = imgui.GetIO().Fonts:AddFontFromFileTTF(u8(dir) .. u8'/State Helper/Шрифты/SF600.ttf', 18.0, config, glyph_ranges)
+	notify_font = add_text_font(medium, 18.0)
 	imgui.GetIO().Fonts.TexDesiredWidth = 2048
 	if image_version_init then
 		image_logo_update = imgui.CreateTextureFromFile(getWorkingDirectory() .. '/State Helper/Изображения/logo update.png')
@@ -1909,7 +2112,7 @@ imgui.OnInitialize(function()
 end)
 
 local sign_trace_active = false
-local sign_trace_path = dir .. '/State Helper/sign-trace.log'
+local sign_trace_path = sh_audit.private_root .. '/sign-trace.log'
 
 local function sign_trace_write(direction, text)
 	if not sign_trace_active then return end
@@ -1922,7 +2125,7 @@ end
 function sign_trace_start()
 	if sign_trace_active then
 		sign_trace_active = false
-		sampAddChatMessage('[SH]{FFFFFF} CEF trace stopped: State Helper/sign-trace.log', 0xFF5345)
+		sampAddChatMessage('[SH]{FFFFFF} CEF trace stopped: StateHelper passwords/sign-trace.log', 0xFF5345)
 		return
 	end
 	local file = io.open(sign_trace_path, 'wb')
@@ -2882,6 +3085,11 @@ function main()
 	
 	local settingsUpdated
 	setting, settingsUpdated = apply_settings('Настройки.json', 'настроек', setting)
+	sh_audit.migrate_private_storage()
+	local private_browser_ok, private_browser_error = sh_audit.prepare_private_browser()
+	if not private_browser_ok then
+		sh_audit.io_error('Не удалось перенести личные данные браузера.', private_browser_error)
+	end
 	do
         local changed = false
         for _, key in ipairs({'vk_cookie', 'vk_uid'}) do
@@ -5516,7 +5724,7 @@ function ym_auth_start()
 			return
 		end
 		mus.ym_status = 'pending'
-		debug_log('ym code=%s interval=%s', tostring(data.user_code), tostring(data.interval))
+		debug_log('ym device code received; interval=%s', tostring(data.interval))
 		mus.ym_user_code = data.user_code
 		mus.ym_interval = tonumber(data.interval) or 5
 		local url = data.verification_url or 'https://ya.ru/device'
@@ -17003,6 +17211,7 @@ function sh_browser_input.disable(state)
         sh_browser_manager.pointer('mouseReleased', x - rect.x, y - rect.y - 78, 0, false)
     end
     sh_browser_input.enabled = false
+    sh_browser_input.close_pressed = false
     state.address_edit = false
     state.web_mouse_down = false
     state.web_keyboard = false
@@ -17012,6 +17221,7 @@ function sh_browser_input.disable(state)
     sh_browser_input.release_controls()
 end
 pcall(ffi.cdef, 'short __stdcall GetAsyncKeyState(int vKey);')
+pcall(ffi.cdef, 'short __stdcall GetKeyState(int vKey);')
 pcall(ffi.cdef, 'int __stdcall IsWindowUnicode(void* window);')
 pcall(ffi.cdef, 'int __stdcall MultiByteToWideChar(unsigned int codePage, unsigned long flags, const char* source, int sourceLength, unsigned short* output, int outputLength);')
 local sh_browser_user32=ffi.load('user32')
@@ -17034,11 +17244,31 @@ function sh_browser_input.web_text(state, value)
 end
 
 function sh_browser_input.web_modifiers()
-    local mods = sh_browser_input.modifiers()
-    return (bit.band(mods, 4) ~= 0 and 1 or 0)
-        + (bit.band(mods, 1) ~= 0 and 2 or 0)
-        + (bit.band(mods, 2) ~= 0 and 8 or 0)
+    -- Use the Windows message queue state. Consumed events do not always update the game's keys.
+    local function pressed(key)
+        return bit.band(sh_browser_user32.GetKeyState(key), 0x8000) ~= 0
+    end
+    return (pressed(vkeys.VK_MENU) and 1 or 0)
+        + (pressed(vkeys.VK_CONTROL) and 2 or 0)
+        + (pressed(vkeys.VK_SHIFT) and 8 or 0)
 end
+
+function sh_browser_input.drag_to(state, x, y)
+    if x == state.web_drag_x and y == state.web_drag_y then return end
+    state.web_drag_x, state.web_drag_y = x, y
+    local rect = state.overlay_rect
+    sh_browser_manager.pointer('mouseMoved', x - rect.x, y - rect.y - 78, 0, true)
+end
+function sh_browser_input.close_hit(rect, x, y)
+    return rect and x >= rect.x + rect.w - 35 and x < rect.x + rect.w
+        and y >= rect.y and y < rect.y + 32
+end
+
+function sh_browser_input.finish_close()
+    sh_browser_input.close_pressed = false
+    sh_browser_manager.close('close_button')
+end
+
 local sh_browser_address_buf=ffi.new('char[2048]')
 imgui.OnFrame(function()
     local s=sh_browser_manager and sh_browser_manager.state
@@ -17097,13 +17327,25 @@ local sh_browser_load_error = nil
 function sh_browser_tick()
     if not sh_browser_manager then return end
     local visible = windows.main[0] and tab == 'help' and not anim_func and not close_win_anim
+    local state = sh_browser_manager.state
+    if sh_browser_input.close_pressed and bit.band(sh_browser_user32.GetAsyncKeyState(1), 0x8000) == 0 then
+        sh_browser_input.finish_close()
+    end
+    if state.web_mouse_down and state.overlay_rect and sh_browser_input.enabled and sh_browser_input.available(state) then
+        local x, y = getCursorPos()
+        sh_browser_input.drag_to(state, x, y)
+        if bit.band(sh_browser_user32.GetAsyncKeyState(1), 0x8000) == 0 then
+            state.web_mouse_down = false
+            local rect = state.overlay_rect
+            sh_browser_manager.pointer('mouseReleased', x - rect.x, y - rect.y - 78, 0, false)
+        end
+    end
     local ok, err = pcall(sh_browser_manager.poll, visible)
     if not ok then
         if sh_browser_manager.state.mode ~= 'external' then pcall(sh_browser_manager.close, 'poll_error')
         else sh_browser_manager.state.status.code = 'connection_wait' end
         sh_browser_manager.state.message = 'Ошибка связи с браузером. Перезагрузите StateHelper.'
     end
-    local state = sh_browser_manager.state
     if not (windows.main[0] and tab_settings == 24) then sh_browser_input.choosing_key = false end
     local available = sh_browser_input.available(state)
     if sh_browser_input.enabled and not available then sh_browser_input.disable(state) end
@@ -17133,20 +17375,20 @@ function sh_browser_close()
 end
 
 local sh_browser_bootstrap = {
-    url = 'https://raw.githubusercontent.com/kysteno4ek/StateHelper/beta/statehelper-browser-files-v2.zip',
-    size = 2947784,
-    sha256 = 'e668b2614cfdd505a8874d537f10083fecd0dd162df9647ef8be61527507aada',
+    url = 'https://raw.githubusercontent.com/kysteno4ek/StateHelper/beta/statehelper-browser-files-v6.zip',
+    size = 2949048,
+    sha256 = '8d6036f25c8065a36bee1fbdd45cb7f7fc5bcd522b5a79ffc7a3e33f3e0658c4',
     files = {
-        {'StateHelperBrowser.exe', 61, 65024},
-        {'Assets/forum-arizona-hq.png', 65150, 783405},
-        {'Assets/youtube-hq.png', 848614, 658104},
-        {'Assets/alice-ai-transparent.png', 1506787, 1069419},
-        {'Assets/weather-clouds.png', 2576269, 337028},
-        {'browser.lua', 2913346, 33956},
+        {'StateHelperBrowser.exe', 61, 66048},
+        {'Assets/forum-arizona-hq.png', 66174, 783405},
+        {'Assets/youtube-hq.png', 849638, 658104},
+        {'Assets/alice-ai-transparent.png', 1507811, 1069419},
+        {'Assets/weather-clouds.png', 2577293, 337028},
+        {'browser.lua', 2914370, 34196},
     },
     installed = {
-        {'StateHelperBrowser.exe', 65024, 'd3efa78e7f7e28fdc5649b44bdf838be287c6a18fecd9da317f2ada22a90faab'},
-        {'browser.lua', 33956, 'e435816a4d059fceb47f6595c4fc4bbf3b7f724a331e6ae09fe6c1c64d32f420'},
+        {'StateHelperBrowser.exe', 66048, '285f06a919253c5c13af6c2754e8032e2f0bd72c1c1fc44cd06e9bfe2bb1dfc9'},
+        {'browser.lua', 34196, 'a00b149f26594152efd5d2e15ae00d796c9f94f72c181eb5acc12edbd9dbfa87'},
     },
 }
 
@@ -17210,6 +17452,7 @@ function sh_browser_bootstrap.start()
         os.remove(archive)
         if ok then
             sh_browser_load_error = nil
+            setup.message = nil
             setup.install_libraries = true
         else
             setup.message = 'Не удалось установить браузер. Проверьте соединение и повторите загрузку.'
@@ -17227,29 +17470,189 @@ function sh_browser_bootstrap.start()
     end)
 end
 
-function sh_browser_bootstrap.draw()
+do
+    pcall(ffi.cdef, 'unsigned long __stdcall GetFileAttributesA(const char*);')
+    pcall(ffi.cdef, 'int __stdcall DeleteFileA(const char*);')
+    pcall(ffi.cdef, 'unsigned long __stdcall GetLastError(void);')
+    local kernel = ffi.load('kernel32')
+
+    local function attributes(path)
+        local value = tonumber(kernel.GetFileAttributesA(path))
+        if value == 0xFFFFFFFF then
+            local error_code = tonumber(kernel.GetLastError())
+            if error_code == 2 or error_code == 3 then return nil end
+            error('Could not inspect browser storage: ' .. error_code)
+        end
+        if bit.band(value, 0x400) ~= 0 then error('Browser storage is a reparse point') end
+        return value
+    end
+
+    local function is_directory(path)
+        local value = attributes(path)
+        if not value then return false end
+        if bit.band(value, 0x10) == 0 then error('Expected a browser storage directory') end
+        return true
+    end
+
+    local function clear_database(folder)
+        for _, suffix in ipairs({'', '-wal', '-shm', '-journal'}) do
+            local path = folder .. '/Cookies' .. suffix
+            local value = attributes(path)
+            if value then
+                if bit.band(value, 0x10) ~= 0 then error('Expected a cookie database file') end
+                if kernel.DeleteFileA(path) == 0 then
+                    local error_code = tonumber(kernel.GetLastError())
+                    if error_code ~= 2 and error_code ~= 3 then
+                        error('Could not remove browser cookies: ' .. error_code)
+                    end
+                end
+            end
+        end
+    end
+
+    function sh_browser_bootstrap.clear_saved_cookies()
+        for _, parent in ipairs({sh_audit.private_root, dir .. '/State Helper'}) do
+            local root = parent .. '/Browser'
+            if is_directory(parent) and is_directory(root) then
+                for name in lfs.dir(root) do
+                    if name == 'Profile' or name:match('^Profile%.legacy%-%d+$')
+                        or name:match('^Profile%-legacy%-%x+$') then
+                        local profile = root .. '/' .. name
+                        if is_directory(profile) and is_directory(profile .. '/EBWebView') then
+                            local default = profile .. '/EBWebView/Default'
+                            if is_directory(default) then
+                                clear_database(default)
+                                if is_directory(default .. '/Network') then clear_database(default .. '/Network') end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+function sh_browser_bootstrap.save_cookie_choice(selected)
+    local current = setting.browser_cookies
+    if selected == current then return true end
+    setting.browser_cookies = selected
+    if save() then return true end
+    setting.browser_cookies = current
+    return false
+end
+
+function sh_browser_bootstrap.centered_text(text, y, face)
+    if face then imgui.PushFont(face) end
+    local width = imgui.GetWindowWidth()
+    local label = u8(text)
+    local x = math.max(16, (width - imgui.CalcTextSize(label).x) / 2)
+    imgui.SetCursorPos(imgui.ImVec2(x, y))
+    imgui.PushTextWrapPos(width - 16)
+    imgui.TextUnformatted(label)
+    imgui.PopTextWrapPos()
+    if face then imgui.PopFont() end
+end
+
+function sh_browser_bootstrap.button(label, x, y, width)
+    imgui.SetCursorPos(imgui.ImVec2(x, y))
+    imgui.PushStyleVarFloat(imgui.StyleVar.FrameRounding, 12)
+    imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(1, 1, 1, 1))
+    imgui.PushStyleColor(imgui.Col.Button, imgui.ImVec4(0.22, 0.38, 0.90, 1))
+    imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(0.30, 0.46, 0.97, 1))
+    imgui.PushStyleColor(imgui.Col.ButtonActive, imgui.ImVec4(0.17, 0.30, 0.78, 1))
+    if bold_font[1] then imgui.PushFont(bold_font[1]) end
+    local clicked = imgui.Button(u8(label), imgui.ImVec2(width, 44))
+    if bold_font[1] then imgui.PopFont() end
+    imgui.PopStyleColor(4)
+    imgui.PopStyleVar()
+    return clicked
+end
+
+function sh_browser_bootstrap.draw_cookie_intro()
     local setup = sh_browser_bootstrap
     local width = imgui.GetWindowWidth()
     local top = math.max(72, (imgui.GetWindowHeight() - 144) / 2)
+    local gap = 12
+    local button_width = math.min(160, (width - 32 - gap) / 2)
+    local x = (width - 2 * button_width - gap) / 2
 
-    local function centered_text(text, y, face, color)
-        if face then imgui.PushFont(face) end
-        if color then imgui.PushStyleColor(imgui.Col.Text, color) end
-        local label = u8(text)
-        local x = math.max(16, (width - imgui.CalcTextSize(label).x) / 2)
-        imgui.SetCursorPos(imgui.ImVec2(x, y))
-        imgui.PushTextWrapPos(width - 16)
-        imgui.TextUnformatted(label)
-        imgui.PopTextWrapPos()
-        if color then imgui.PopStyleColor() end
-        if face then imgui.PopFont() end
+    setup.centered_text('Сохранять куки браузера?', top, bold_font[3] or bold_font[1])
+    if setup.button('Да##BrowserCookiesIntroYes', x, top + 53, button_width) then
+        setup.save_cookie_choice('yes')
     end
+    if setup.button('Нет##BrowserCookiesIntroNo', x + button_width + gap, top + 53, button_width) then
+        setup.save_cookie_choice('no')
+    end
+    setup.centered_text('Куки помогают сайтам запоминать тебя между посещениями.', top + 114, font[3])
+    setup.centered_text('Например, форум может запомнить, что ты уже вошёл в аккаунт.', top + 133, font[3])
+end
 
-    centered_text('Для браузера нужно загрузить файлы', top, bold_font[3] or bold_font[1])
-    centered_text('Модуль браузера, загрузчик, изображения и библиотеки WebView2', top + 48, font[3])
+function sh_browser_bootstrap.draw_cookie_choice(x, y)
+    local setup = sh_browser_bootstrap
+    local frame = imgui.GetFrameCount()
+    if setup.cookie_choice_frame ~= frame - 1 then
+        setup.confirm_cookie_clear = nil
+        setup.cookie_choice_error = nil
+    end
+    setup.cookie_choice_frame = frame
+
+    gui.Text(x, y, 'Сохранять куки браузера между запусками?', bold_font[1])
+    local state = sh_browser_manager and sh_browser_manager.state
+    if state and (state.started or state.pending_mode) then
+        setup.confirm_cookie_clear = nil
+        setup.cookie_choice_error = nil
+        gui.Text(x, y + 37, 'Закройте окно браузера, чтобы изменить выбор.', font[3])
+    else
+        local button_y = y + 30
+        if gui.Button(u8'Да##BrowserCookiesYes', {x, button_y}, {220, 32}) then
+            setup.confirm_cookie_clear = nil
+            setup.cookie_choice_error = nil
+            setup.save_cookie_choice('yes')
+        end
+        local no_label = setup.confirm_cookie_clear and 'Уверены?' or 'Нет'
+        if gui.Button(u8(no_label .. '###BrowserCookiesNo'), {x + 232, button_y}, {220, 32})
+            and setting.browser_cookies == 'yes' then
+            if not setup.confirm_cookie_clear then
+                setup.confirm_cookie_clear = true
+                setup.cookie_choice_error = nil
+            else
+                local ok, problem = pcall(setup.clear_saved_cookies)
+                if ok then
+                    setup.save_cookie_choice('no')
+                else
+                    print('[SH Browser] ' .. tostring(problem))
+                    setup.cookie_choice_error = 'Не удалось удалить куки. Закройте браузер и повторите.'
+                end
+                setup.confirm_cookie_clear = nil
+            end
+        end
+        local selected_x = setting.browser_cookies == 'yes' and x or x + 232
+        gui.FaText(selected_x + 196, button_y + 9, fa.CHECK, fa_font[2],
+            imgui.ImVec4(0.30, 0.85, 0.38, 1))
+    end
+    gui.Text(x, y + 72, setup.cookie_choice_error or 'Куки помогают сайтам запоминать твой вход и настройки.', font[3])
+end
+
+function sh_browser_bootstrap.libraries_ready()
+    local root = dir .. '/State Helper/Browser/'
+    for _, name in ipairs({'ready.json', 'Microsoft.Web.WebView2.Core.dll',
+        'Microsoft.Web.WebView2.WinForms.dll', 'WebView2Loader.dll'}) do
+        if not doesFileExist(root .. name) then return false end
+    end
+    return true
+end
+
+function sh_browser_bootstrap.draw()
+    local setup = sh_browser_bootstrap
+    local manager = sh_browser_manager
+    local width = imgui.GetWindowWidth()
+    local top = math.max(72, (imgui.GetWindowHeight() - 144) / 2)
+
+    setup.centered_text('Для браузера нужно загрузить файлы', top, bold_font[3] or bold_font[1])
+    setup.centered_text('Модуль браузера, загрузчик, изображения и библиотеки WebView2', top + 48, font[3])
 
     if setup.downloading or (sh_browser_manager and sh_browser_manager.state.installing) then
-        centered_text('Идет скачивание файлов...', top + 92, bold_font[1])
+        setup.centered_text('Идет скачивание файлов...', top + 92, bold_font[1])
         if sh_browser_manager and sh_browser_manager.state.installing then
             local cancel = u8'Отменить загрузку'
             if gui.Button(cancel, {(width - 180) / 2, top + 128}, {180, 28}) then
@@ -17259,23 +17662,15 @@ function sh_browser_bootstrap.draw()
         end
         return
     end
-    if setup.message then
-        centered_text(setup.message, top + 132, font[3])
+    local message = manager and manager.state.message or setup.message
+    if message and message ~= '' and message ~= 'Файлы скачаны.' then
+        setup.centered_text(message, top + 132, font[3])
     end
 
     local button_width = math.min(228, width - 32)
-    imgui.SetCursorPos(imgui.ImVec2((width - button_width) / 2, top + 80))
-    imgui.PushStyleVarFloat(imgui.StyleVar.FrameRounding, 12)
-    imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(1, 1, 1, 1))
-    imgui.PushStyleColor(imgui.Col.Button, imgui.ImVec4(0.22, 0.38, 0.90, 1))
-    imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(0.30, 0.46, 0.97, 1))
-    imgui.PushStyleColor(imgui.Col.ButtonActive, imgui.ImVec4(0.17, 0.30, 0.78, 1))
-    if bold_font[1] then imgui.PushFont(bold_font[1]) end
-    local clicked = imgui.Button(u8'Загрузить файлы##SHBrowserBootstrap', imgui.ImVec2(button_width, 44))
-    if bold_font[1] then imgui.PopFont() end
-    imgui.PopStyleColor(4)
-    imgui.PopStyleVar()
-    if clicked then setup.start() end
+    if setup.button('Загрузить файлы##SHBrowserBootstrap', (width - button_width) / 2, top + 80, button_width) then
+        if manager then manager.install() else setup.start() end
+    end
 end
 
 local function sh_browser_ensure()
@@ -17296,22 +17691,29 @@ local function sh_browser_ensure()
                 return
             end
         end
+        local private_ok, problem = sh_audit.prepare_private_browser()
+        if not private_ok then
+            sh_browser_bootstrap.message = 'Закройте браузер и откройте вкладку снова для переноса личных данных.'
+            if problem then print('[SH Browser] Private storage: ' .. problem) end
+            return
+        end
         local factory, err = loadfile(root .. '/browser.lua')
         if factory then
             local loaded, constructor = pcall(factory)
             if loaded and type(constructor) == 'function' then
+                local settings_offset = 0
                 local browser_gui = setmetatable({Text = function(x, y, label, face)
                     if label == 'Ctrl+B — переключить управление игрой и браузером.' or label == 'Файлы скачаны.'
                         or label == 'Режим сохранён.' or label == 'Настройки сохранены.' then return end
                     if x == 26 and y == 365 and sh_browser_manager then
-                        y = 332 + 44 * (sh_browser_manager.state.cursor_settings_progress or 0)
+                        y = 326
                     end
-                    gui.Text(x, y, label, face)
+                    gui.Text(x, y + settings_offset, label, face)
                 end, DrawBox = function(pos, size, ...)
                     if pos[1] == 16 and pos[2] == 220 and size[1] == 586 and size[2] == 132 then
                         size = {586, 96}
                     end
-                    return gui.DrawBox(pos, size, ...)
+                    return gui.DrawBox({pos[1], pos[2] + settings_offset}, size, ...)
                 end, Button = function(label, pos, size, ...)
                     local is_mode = pos[2] == 266 and (pos[1] == 26 or pos[1] == 258)
                         and size[1] == 220 and size[2] == 30
@@ -17320,6 +17722,7 @@ local function sh_browser_ensure()
                     if is_mode or (pos[2] == 160 and (pos[1] == 26 or pos[1] == 258) and size[1] == 220) then
                         label, selected = label:gsub(u8' %(выбран%)$', '')
                     end
+                    pos = {pos[1], pos[2] + settings_offset}
                     local clicked = gui.Button(label, pos, size, ...)
                     if selected == 1 then
                         gui.FaText(pos[1] + size[1] - 24, pos[2] + 9, fa.CHECK, fa_font[2],
@@ -17327,7 +17730,7 @@ local function sh_browser_ensure()
                     end
                     return clicked
                 end}, {__index = gui})
-                local ok, manager = pcall(constructor, {ffi=ffi,json=json,imgui=imgui,gui=browser_gui,u8=u8,shell32=shell32,search_font=notify_font,hide_main=function() windows.main[0]=false end,begin_address_edit=function() sampSetChatInputEnabled(false) end,input_failed=function()
+                local ok, manager = pcall(constructor, {ffi=ffi,json=json,imgui=imgui,gui=browser_gui,u8=u8,shell32=shell32,keep_cookies=function() return setting.browser_cookies == 'yes' end,search_font=notify_font,hide_main=function() windows.main[0]=false end,begin_address_edit=function() sampSetChatInputEnabled(false) end,input_failed=function()
                     local state = sh_browser_manager.state
                     state.web_mouse_down = false
                     sh_browser_input.disable(state)
@@ -17338,16 +17741,27 @@ local function sh_browser_ensure()
                     local cursor = sh_browser_input.enabled and sh_browser_input.available(state)
                     local mouse_x, mouse_y = 0, 0
                     if cursor then mouse_x, mouse_y = getCursorPos() end
+                    local mouse_down = cursor and bit.band(sh_browser_user32.GetAsyncKeyState(1), 0x8000) ~= 0
+                    if mouse_down and not state.pointer_down and not state.web_mouse_down
+                        and sh_browser_input.close_hit(state.overlay_rect, mouse_x, mouse_y) then
+                        sh_browser_input.close_pressed = true
+                    end
                     return {width=width, height=height, input_blocked=windows.fast[0], chat_mouse=cursor,
                         mouse_x=mouse_x, mouse_y=mouse_y,
-                        mouse_down=cursor and bit.band(tonumber(sh_browser_user32.GetAsyncKeyState(1)), 0x8000) ~= 0,
+                        mouse_down=mouse_down and not sh_browser_input.close_pressed,
                         blocked=sh_browser_input.window_blocked()}
-                end,root=dir .. '/State Helper/Browser'})
+                end,root=dir .. '/State Helper/Browser',private_root=sh_audit.private_root .. '/Browser'})
                 if ok and type(manager) == 'table' then
+                    local draw_settings = manager.draw_settings
+                    manager.draw_settings = function(colors, fonts, bold, offset)
+                        settings_offset = offset
+                        draw_settings(colors, fonts, bold)
+                        settings_offset = 0
+                    end
                     sh_browser_manager = manager
                     if sh_browser_bootstrap.install_libraries then
                         sh_browser_bootstrap.install_libraries = false
-                        manager.install()
+                        if not sh_browser_bootstrap.libraries_ready() then manager.install() end
                     end
                 end
             end
@@ -17403,6 +17817,7 @@ function sh_browser_input.draw_key_popup()
 end
 
 function hall.browser_settings()
+    local cookies_chosen = setting.browser_cookies == 'yes' or setting.browser_cookies == 'no'
     sh_browser_ensure()
     if sh_browser_manager then
         local state = sh_browser_manager.state
@@ -17414,8 +17829,8 @@ function hall.browser_settings()
         state.cursor_settings_progress = progress
         if not embedded then sh_browser_input.choosing_key = false end
 
-        sh_browser_manager.draw_settings(cl, font, bold_font)
-        local top, height = 324, 44
+        local top, height = 110, 44
+        local offset = (height + 10) * progress
         if gui.BeginReveal(progress, top, height) then
             local y = top - height * (1 - progress)
             gui.DrawBox({16, y}, {586, height}, cl.tab, cl.line, 7, 15)
@@ -17435,44 +17850,32 @@ function hall.browser_settings()
             end
             gui.EndReveal()
         end
+        sh_browser_manager.draw_settings(cl, font, bold_font, offset)
+        if cookies_chosen then
+            local cookies_y, cookies_height = 326 + offset, 106
+            gui.DrawBox({16, cookies_y}, {586, cookies_height}, cl.tab, cl.line, 7, 15)
+            sh_browser_bootstrap.draw_cookie_choice(26, cookies_y + 10)
+            imgui.SetCursorPos(imgui.ImVec2(16, cookies_y + cookies_height))
+            imgui.Dummy(imgui.ImVec2(1, 16))
+        end
         sh_browser_input.draw_key_popup()
-    else
-        sh_browser_bootstrap.draw()
     end
 end
 
 function sh_browser_bootstrap.search_logo(logo)
     if logo.texture then return logo.texture end
-    local folder = dir .. '/State Helper/Browser/Assets'
-    local filename = 'search-' .. logo.engine .. '.png'
-    local path = folder .. '/' .. filename
-    if not logo.checked then
-        local file = io.open(path, 'rb')
-        if file then
-            local data = file:read(2 * 1024 * 1024)
-            file:close()
-            if sh_resource.valid(data, 'png') then
-                local ok, texture = pcall(imgui.CreateTextureFromFile, path)
-                if ok and texture then logo.texture = texture end
-            end
-        end
-        logo.checked = true
+    if os.clock() < (logo.retry_at or 0) then return end
+    logo.retry_at = os.clock() + 1
+    local path = dir .. '/State Helper/Изображения/search-' .. logo.engine .. '.png'
+    local file = io.open(path, 'rb')
+    if not file then return end
+    local data = file:read(2 * 1024 * 1024)
+    file:close()
+    if sh_resource.valid(data, 'png') then
+        local ok, texture = pcall(imgui.CreateTextureFromFile, path)
+        if ok and texture then logo.texture = texture end
     end
-    if logo.texture then return logo.texture end
-    if not logo.downloading and os.time() >= (logo.retry_at or 0) then
-        if not doesDirectoryExist(folder) then createDirectory(folder) end
-        logo.downloading = true
-        logo.retry_at = os.time() + 30
-        local url = 'https://raw.githubusercontent.com/kysteno4ek/StateHelper/main/images/' .. filename
-        local ok, id = pcall(sh_resource.download, url, path, function(_, status)
-            if status == dlstatus.STATUS_ENDDOWNLOADDATA then
-                logo.checked, logo.downloading = false, false
-            elseif status == dlstatus.STATUS_DOWNLOAD_ERROR or status == dlstatus.STATUSEX_ENDDOWNLOAD then
-                logo.downloading = false
-            end
-        end)
-        if not ok or not id or id == 0 then logo.downloading = false end
-    end
+    return logo.texture
 end
 
 function sh_browser_bootstrap.draw_search_choice(manager)
@@ -17539,20 +17942,21 @@ function sh_browser_bootstrap.draw_search_choice(manager)
             state.settings_message_at = os.clock()
         end
     end
-    if state.message ~= '' then gui.Text(24, 300, state.message, font[3]) end
+    if state.message ~= '' and state.message ~= 'Файлы скачаны.' then gui.Text(24, 300, state.message, font[3]) end
     imgui.EndChild()
 end
 
 function hall.help()
     sh_browser_ensure()
-    if sh_browser_manager and not sh_browser_manager.state.installing then
-        if sh_browser_manager.state.search_engine then
-            sh_browser_manager.draw(cl, font, bold_font)
-        else
-            sh_browser_bootstrap.draw_search_choice(sh_browser_manager)
-        end
+    local setup, manager = sh_browser_bootstrap, sh_browser_manager
+    if not manager or setup.downloading or manager.state.installing or not setup.libraries_ready() then
+        setup.draw()
+    elseif setting.browser_cookies ~= 'yes' and setting.browser_cookies ~= 'no' then
+        setup.draw_cookie_intro()
+    elseif manager.state.search_engine then
+        manager.draw(cl, font, bold_font)
     else
-        sh_browser_bootstrap.draw()
+        setup.draw_search_choice(manager)
     end
 end
 -- [SH-Browser-End]
@@ -24326,7 +24730,7 @@ end
 
 sh_license = {pending = nil}
 function sh_license.trace(event, request)
-    local path=dir..'/State Helper/license-trace.log'
+    local path=sh_audit.private_root..'/license-trace.log'
     local file=io.open(path,'rb')
     if file then local size=file:seek('end');file:close();if size and size>65536 then os.remove(path..'.old');os.rename(path,path..'.old') end end
     file=io.open(path,'ab')
@@ -27672,6 +28076,11 @@ end
 
 function onWindowMessage(msg, wparam, lparam)
     local browser_state = sh_browser_manager and sh_browser_manager.state
+    if sh_browser_input.close_pressed and (msg == 0x201 or msg == 0x202 or msg == 0x203) then
+        consumeWindowMessage(true, true, true)
+        if msg == 0x202 then sh_browser_input.finish_close() end
+        return
+    end
     if msg == 0x0008 then
         sh_browser_input.swallow_key = nil
         if sh_browser_input.enabled and browser_state then sh_browser_input.disable(browser_state) end
@@ -27735,15 +28144,30 @@ function onWindowMessage(msg, wparam, lparam)
             local inside=x>=r.x and x<r.x+r.w and y>=r.y and y<r.y+r.h
             local page=inside and y>=r.y+78 and y<r.y+r.h-12
             local captured=state.web_mouse_down==true
+            if (msg == 0x201 or msg == 0x203) and not captured and sh_browser_input.close_hit(r, x, y) then
+                sh_browser_input.close_pressed = true
+                consumeWindowMessage(true, true, true)
+                return
+            end
             if msg==0x201 then
                 state.web_keyboard=page
                 state.web_surrogate=nil
             end
-            if page or (msg==0x202 and captured) then
-                local action=msg==0x201 and 'mousePressed' or msg==0x202 and 'mouseReleased' or msg==0x20A and 'mouseWheel' or 'mouseMoved'
-                local delta=bit.rshift(wparam,16);if delta>=32768 then delta=delta-65536 end
-                if msg==0x201 then state.web_mouse_down=true elseif msg==0x202 then state.web_mouse_down=false end
-                if msg~=0x203 then sh_browser_manager.pointer(action,x-r.x,y-r.y-78,msg==0x20A and -delta or 0,state.web_mouse_down==true) end
+            if msg == 0x200 and captured then
+                sh_browser_input.drag_to(state, x, y)
+            elseif (msg == 0x202 and captured) or (page and msg ~= 0x203 and msg ~= 0x202) then
+                local action = msg == 0x201 and 'mousePressed' or msg == 0x202 and 'mouseReleased'
+                    or msg == 0x20A and 'mouseWheel' or 'mouseMoved'
+                local delta = bit.rshift(wparam, 16)
+                if delta >= 32768 then delta = delta - 65536 end
+                if msg == 0x201 then
+                    state.web_mouse_down = true
+                    state.web_drag_x, state.web_drag_y = x, y
+                elseif msg == 0x202 then
+                    sh_browser_input.drag_to(state, x, y)
+                    state.web_mouse_down = false
+                end
+                sh_browser_manager.pointer(action, x - r.x, y - r.y - 78, msg == 0x20A and -delta or 0, state.web_mouse_down == true)
             end
             if msg~=0x200 and (inside or (msg==0x202 and captured)) then consumeWindowMessage(true,false);return end
         end
@@ -35146,7 +35570,7 @@ local cmd_defoult_json_for_driving_school = {
   "act": [
     [
       "SEND",
-      "/me снял{sex[][а]} со спины сумку, после чего открыл{sex[][а]} её"
+      "/me достал{sex[][а]} из под стола пустой бланк для выдачи лицензии "
     ],
     [
       "SEND",
@@ -40178,7 +40602,7 @@ function onScriptTerminate(script, game_quit)
 	if imgui.GetCurrentContext() ~= nil then
 		pcall(imgui.SetClipboardText, table.concat(clipboard, '\n'))
 	end
-	local fw = io.open(dir .. '/State Helper/crashlog.log', 'w')
+	local fw = io.open(sh_audit.private_root .. '/crashlog.log', 'w')
 	if fw then
 		fw:write(table.concat(clipboard, '\n'))
 		fw:flush()
