@@ -611,6 +611,7 @@ close_stats = true
 hovered_bool_not_child = false
 bool_tazer = false
 send_chat_rp = false
+sh_document_cef_at = nil
 num_win_fast = 1
 bool_edit_fast = false
 sc_cursor_pos = {0, 0}
@@ -1074,7 +1075,6 @@ setting = {
 	rank = 10,
 	put_mes = {false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false},
 	auto_cmd_doc = false,
-	auto_close_doc = true,
 	auto_cmd_tazer = true,
 	auto_cmd_time = '',
 	auto_cmd_r = '',
@@ -2248,6 +2248,17 @@ end
 
 function CefDialog()
 	local document_opened = false
+	local function finish_document_roleplay()
+		if not document_opened then return end
+		document_opened = false
+		if not setting.auto_cmd_doc then return end
+		lua_thread.create(function()
+			wait(run_sob and 1000 or 100)
+			if setting.auto_cmd_doc then
+				sampSendChat('/me осмотрел' .. sex('', 'а') .. ' документ, затем закрыл' .. sex('', 'а') .. ' его и вернул' .. sex('', 'а') .. ' человеку')
+			end
+		end)
+	end
 	addEventHandler('onSendRpc', function(id, bs)
 		if id == 62 then
 			sign_trace_stream('RAW_DIALOG_RESPONSE', bs)
@@ -2439,31 +2450,22 @@ function CefDialog()
 						local ok, data = pcall(json.decode, body)
 						if not ok or type(data) ~= 'table' then return end
 						if data['name'] ~= my.nick and data['type'] == 1 then
-							document_opened = true
-							if setting.auto_close_doc then
+							sh_document_cef_at = getGameTimer()
+							send_chat_rp = false
+							document_opened = setting.auto_cmd_doc
+							if document_opened then
 								lua_thread.create(function()
 									wait(0)
-									sampSendChat("/me взял".. sex('', 'а') .. " документ с рук человека, затем начал".. sex('', 'а') .. " его осматривать")
+									if setting.auto_cmd_doc then
+										sampSendChat("/me взял".. sex('', 'а') .. " документ с рук человека, затем начал".. sex('', 'а') .. " его осматривать")
+									end
 								end)
 							end
 						end
 					end
 
 					if event == 'event.documents.close' then --> Отыгровка после закрытия документов
-						if document_opened and setting.auto_close_doc then
-							if run_sob then
-								lua_thread.create(function()
-									wait(1000)
-									sampSendChat('/me осмотрел'.. sex('', 'а') .. ' документ, затем закрыл'.. sex('', 'а') .. ' его и вернул'.. sex('', 'а') .. ' человеку')
-								end)
-							else
-								lua_thread.create(function()
-									wait(100)
-									sampSendChat('/me осмотрел'.. sex('', 'а') .. ' документ, затем закрыл'.. sex('', 'а') .. ' его и вернул'.. sex('', 'а') .. ' человеку')
-								end)
-							end
-							document_opened = false
-						end
+						finish_document_roleplay()
 					end
 				end
 			end
@@ -2494,20 +2496,7 @@ function CefDialog()
 									setVirtualKeyDown(VK_R, false)
 								end)
 							end
-							if document_opened and setting.auto_close_doc then
-								if run_sob then
-									lua_thread.create(function()
-										wait(1000)
-										sampSendChat('/me осмотрел'.. sex('', 'а') .. ' документ, затем закрыл'.. sex('', 'а') .. ' его и вернул'.. sex('', 'а') .. ' человеку')
-									end)
-								else
-									lua_thread.create(function()
-										wait(100)
-										sampSendChat('/me осмотрел'.. sex('', 'а') .. ' документ, затем закрыл'.. sex('', 'а') .. ' его и вернул'.. sex('', 'а') .. ' человеку')
-									end)
-								end
-								document_opened = false
-							end
+							finish_document_roleplay()
 						end
 					end
 				end
@@ -4012,7 +4001,9 @@ end
 			end
 			
 			if send_chat_rp then
-				if not setting.auto_close_doc then
+				if not setting.auto_cmd_doc then
+					send_chat_rp = false
+				elseif getGameTimer() >= send_chat_rp then
 					local texts_rp_all = {
 						'/me взял' .. sex('', 'а') .. ' документ с рук человека напротив, внимательно его изучил' .. sex('', 'а') .. ', после чего вернул' .. sex('', 'а') .. ' обратно',
 						'/me взял' .. sex('', 'а') .. ' документ и тщательно изучил' .. sex('', 'а') .. ' его, после чего вернул' .. sex('', 'а') .. ' обратно'
@@ -8187,7 +8178,7 @@ function hall.settings()
 		end
 
 		gui.Text(25, 164, 'Отыгровки', bold_font[1])
-		new_draw(189, 630)
+		new_draw(189, 572)
 		
 		gui.Text(26, 198, 'Корректор чата', font[3])
 		imgui.SetCursorPos(imgui.ImVec2(561, 193))
@@ -8206,102 +8197,93 @@ function hall.settings()
 		end
 		gui.DrawLine({16, 288}, {602, 288}, cl.line)
 
-		gui.Text(26, 298, 'Автоотыгровка при принятии документов', font[3])
+		gui.Text(26, 298, 'Автоотыгровка при принятии и закрытии документов', font[3])
 		imgui.SetCursorPos(imgui.ImVec2(561, 293))
-		if gui.Switch(u8'##Автоотыгровка при принятии документов', setting.auto_cmd_doc) then
+		if gui.Switch(u8'##Автоотыгровка документов', setting.auto_cmd_doc) then
 			setting.auto_cmd_doc = not setting.auto_cmd_doc
 			save()
 		end
-		gui.TextInfo({26, 317}, {'При просмотре паспорта, лицензий, медицинской карты или трудовой книжки, будет', 'автоматически воспроизведена отыгровка взятия просматриваемого документа.'})
+		gui.TextInfo({26, 317}, {'Автоматически отыгрывает взятие и возврат паспорта, лицензий,', 'медицинской карты или трудовой книжки.'})
 		gui.DrawLine({16, 356}, {602, 356}, cl.line)
 
-		gui.Text(26, 366, 'Автоотыгровка при закрытии документов', font[3])
-		imgui.SetCursorPos(imgui.ImVec2(561, 362))
-		if gui.Switch(u8'##Автоотыгровка при закрытии документов', setting.auto_close_doc) then
-			setting.auto_close_doc = not setting.auto_close_doc
-			save()
-		end
-		gui.TextInfo({26, 385}, {'При закрытии окна с документами в чате автоматически будет воспроизведена отыгровка.'})
-		gui.DrawLine({16, 414}, {602, 414}, cl.line)
-
-        gui.Text(26, 424, 'Автоотыгровка дубинки', font[3])
-        imgui.SetCursorPos(imgui.ImVec2(561, 420))
+        gui.Text(26, 366, 'Автоотыгровка дубинки', font[3])
+        imgui.SetCursorPos(imgui.ImVec2(561, 362))
         if gui.Switch(u8'##Автоотыгровка дубинки', setting.auto_cmd_tazer) then
           setting.auto_cmd_tazer = not setting.auto_cmd_tazer
           save()
         end
-        gui.DrawLine({16, 451}, {602, 451}, cl.line)
+        gui.DrawLine({16, 393}, {602, 393}, cl.line)
 
-        gui.Text(26, 461, 'Автоотыгровка /time', font[3])
+        gui.Text(26, 403, 'Автоотыгровка /time', font[3])
         local bool_set_time = setting.auto_cmd_time
-        setting.auto_cmd_time = gui.InputText({190, 463}, 391, setting.auto_cmd_time, u8'Автоотыгровка time', 230, u8'Введите текст отыгровки')
+        setting.auto_cmd_time = gui.InputText({190, 405}, 391, setting.auto_cmd_time, u8'Автоотыгровка time', 230, u8'Введите текст отыгровки')
         if setting.auto_cmd_time ~= bool_set_time then
           save()
         end
-        gui.TextInfo({26, 492}, {'После ввода команды /time, будет автоматически воспроизведена введённая Вами отыгровка.', 'Оставьте поле пустым, если не нужно.'})
-        gui.DrawLine({16, 528}, {602, 528}, cl.line)
+        gui.TextInfo({26, 434}, {'После ввода команды /time, будет автоматически воспроизведена введённая Вами отыгровка.', 'Оставьте поле пустым, если не нужно.'})
+        gui.DrawLine({16, 470}, {602, 470}, cl.line)
 
-        gui.Text(26, 538, 'Автоотыгровка /r', font[3])
+        gui.Text(26, 480, 'Автоотыгровка /r', font[3])
         local bool_set_r = setting.auto_cmd_r
-        setting.auto_cmd_r = gui.InputText({190, 540}, 391, setting.auto_cmd_r, u8'Автоотыгровка r', 230, u8'Введите текст отыгровки')
+        setting.auto_cmd_r = gui.InputText({190, 482}, 391, setting.auto_cmd_r, u8'Автоотыгровка r', 230, u8'Введите текст отыгровки')
         if setting.auto_cmd_r ~= bool_set_r then
           save()
         end
-        gui.TextInfo({26, 569}, {'После ввода команды /r, будет автоматически воспроизведена введённая Вами отыгровка.', 'Оставьте поле пустым, если не нужно.'})
-        gui.DrawLine({16, 605}, {602, 605}, cl.line)
+        gui.TextInfo({26, 511}, {'После ввода команды /r, будет автоматически воспроизведена введённая Вами отыгровка.', 'Оставьте поле пустым, если не нужно.'})
+        gui.DrawLine({16, 547}, {602, 547}, cl.line)
 
-        gui.Text(26, 615, 'Тег в рацию /r', font[3])
+        gui.Text(26, 557, 'Тег в рацию /r', font[3])
         local bool_set_teg = setting.teg_r
-        setting.teg_r = gui.InputText({190, 617}, 391, setting.teg_r, u8'Тег в рацию организации', 250, u8'Введите тег для рации')
+        setting.teg_r = gui.InputText({190, 559}, 391, setting.teg_r, u8'Тег в рацию организации', 250, u8'Введите тег для рации')
         if setting.teg_r ~= bool_set_teg then
           save()
         end
-        gui.TextInfo({26, 646}, {'О необходимости использования тега уточните у лидера Вашей организации.'})
-        gui.DrawLine({16, 682}, {602, 682}, cl.line)
+        gui.TextInfo({26, 588}, {'О необходимости использования тега уточните у лидера Вашей организации.'})
+        gui.DrawLine({16, 624}, {602, 624}, cl.line)
 
-        gui.Text(26, 692, 'Использовать автоотыгровки при взаимодействии с оружием', font[3])
-        imgui.SetCursorPos(imgui.ImVec2(561, 688))
+        gui.Text(26, 634, 'Использовать автоотыгровки при взаимодействии с оружием', font[3])
+        imgui.SetCursorPos(imgui.ImVec2(561, 630))
         if gui.Switch(u8'##Автоотыгровка взаимодействия с оружием', setting.gun_func) then
           setting.gun_func = not setting.gun_func
           save()
         end
         if setting.gun_func then
-          gui.Text(26, 718, 'Отыгровки оружия', font[3])
-          if gui.Button(u8'Редактировать...', {460, 715}, {130, 25}) then
+          gui.Text(26, 660, 'Отыгровки оружия', font[3])
+          if gui.Button(u8'Редактировать...', {460, 657}, {130, 25}) then
             imgui.OpenPopup(u8'Редактировать отыгровки оружия')
             gun_bool = deep_copy(setting.gun)
           end
         else
           imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.50, 0.50, 0.50, 0.50))
-          gui.Text(26, 718, 'Отыгровки оружия', font[3])
+          gui.Text(26, 660, 'Отыгровки оружия', font[3])
           imgui.PopStyleColor(1)
-          gui.Button(u8'Редактировать...', {460, 715}, {130, 25}, false)
+          gui.Button(u8'Редактировать...', {460, 657}, {130, 25}, false)
         end
-        gui.DrawLine({16, 746}, {602, 746}, cl.line)
+        gui.DrawLine({16, 688}, {602, 688}, cl.line)
 
-        gui.Text(26, 756, 'Автоматический перенос длинного текста в игровом чате', font[3])
-        imgui.SetCursorPos(imgui.ImVec2(561, 752))
+        gui.Text(26, 698, 'Автоматический перенос длинного текста в игровом чате', font[3])
+        imgui.SetCursorPos(imgui.ImVec2(561, 694))
         if gui.Switch(u8'##Автоматический перенос длинного текста в игровом чате', setting.wrap_text_chat.func) then
           setting.wrap_text_chat.func = not setting.wrap_text_chat.func
           save()
         end
         
         if setting.wrap_text_chat.func then
-          gui.Text(26, 783, 'Переносить текст после достижения', font[3])
+          gui.Text(26, 725, 'Переносить текст после достижения', font[3])
           local bool_set_wrap = setting.wrap_text_chat.num_char
-          setting.wrap_text_chat.num_char = gui.InputText({274, 783}, 30, setting.wrap_text_chat.num_char, u8'Количество символов переносимого текста', 4, u8'Число', 'num')
+          setting.wrap_text_chat.num_char = gui.InputText({274, 725}, 30, setting.wrap_text_chat.num_char, u8'Количество символов переносимого текста', 4, u8'Число', 'num')
           if setting.wrap_text_chat.num_char ~= bool_set_wrap then
             if setting.wrap_text_chat.num_char == '' then
               setting.wrap_text_chat.num_char = '128'
             end
             save()
           end
-          gui.Text(320, 783, 'символов', font[3])
+          gui.Text(320, 725, 'символов', font[3])
         else
           imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.50, 0.50, 0.50, 0.50))
-          gui.Text(26, 783, 'Переносить текст после достижения', font[3])
-          gui.Text(320, 783, 'символов', font[3])
-          gui.InputFalse(setting.wrap_text_chat.num_char, 274, 783, 30)
+          gui.Text(26, 725, 'Переносить текст после достижения', font[3])
+          gui.Text(320, 725, 'символов', font[3])
+          gui.InputFalse(setting.wrap_text_chat.num_char, 274, 725, 30)
           imgui.PopStyleColor(1)
         end
 
@@ -8380,8 +8362,8 @@ function hall.settings()
 		if setting.chat_filters.arms_race == nil then setting.chat_filters.arms_race = false end
 		if setting.chat_filters.car_quality == nil then setting.chat_filters.car_quality = false end
 
-		imgui.SetCursorPos(imgui.ImVec2(0, 819))
-		imgui.Dummy(imgui.ImVec2(0, 24))
+		imgui.SetCursorPos(imgui.ImVec2(0, 761))
+		imgui.Dummy(imgui.ImVec2(0, 10))
 	elseif tab_settings == 3 then
 		if setting.org <= 4 then
 			gui.Text(25, 12, 'Разное', bold_font[1])
@@ -15113,7 +15095,7 @@ function wave_ui.draw(height)
 		dl:AddRectFilled(point(260, 192 + offset), point(722, 232 + offset), light and color(0.2, 0.16, 0.3, 0.12) or color(1, 1, 1, 0.17), 20, 15)
 		imgui.PopClipRect()
 	end
-	local title = track and ((track.artist or '') .. ' — ' .. (track.name or ''))
+	local title = track and ((track.artist or '') .. ' - ' .. (track.name or ''))
 		or (ym_wave_failed and 'Не удалось загрузить волну. Нажмите «Обновить».' or 'Подбираем музыку для вас...')
 	if play.switching and playlist_playing == ym_wave then title = 'Загрузка трека...' end
 	if seekable and (seek_hovered or seeking) then
@@ -15290,6 +15272,7 @@ function hall.music()
 			local id = table_tab[i][3]
 			imgui.SetCursorPos(imgui.ImVec2(6, 11 + y_posM))
 			if imgui.InvisibleButton(u8'##Переход к вкладке в музыке' .. i, imgui.ImVec2(131, 27)) then
+				if id == 5 and tab_music ~= 5 then ym_chart_failed = false end
 				tab_music = id
 			end
 			if imgui.IsItemHovered() and tab_music ~= id then
@@ -15342,7 +15325,7 @@ function hall.music()
 	if setting.music_source ~= 'yandex' then
 		for i = 5, 4, -1 do table.remove(tabs, i) end
 	end
-	if setting.music_source == 'sefon' then
+	if setting.music_source ~= 'hitmoz' then
 		for i = #tabs, 1, -1 do
 			if tabs[i][3] == 6 or tabs[i][3] == 7 then table.remove(tabs, i) end
 		end
@@ -16211,15 +16194,8 @@ function hall.music()
 			if #ym_chart == 0 and not ym_chart_busy and not ym_chart_failed then
 				ym_chart_load()
 			end
-			if gui.Button(u8'Обновить##чарт', {720, 8}, {100, 26}) then
-				ym_chart = {}
-				ym_chart_failed = false
-				ym_chart_load()
-			end
-			gui.DrawLine({160, 40}, {829, 40}, cl.line)
-
-			imgui.SetCursorPos(imgui.ImVec2(144, 44))
-			imgui.BeginChild(u8'Треки чарта', imgui.ImVec2(694, height - 44), false, imgui.WindowFlags.NoMove + imgui.WindowFlags.NoScrollWithMouse)
+			imgui.SetCursorPos(imgui.ImVec2(144, 8))
+			imgui.BeginChild(u8'Треки чарта', imgui.ImVec2(694, height - 8), false, imgui.WindowFlags.NoMove + imgui.WindowFlags.NoScrollWithMouse)
 			imgui.Scroller(u8'Треки чарта', img_step[1][0], img_duration[1][0], imgui.HoveredFlags.AllowWhenBlockedByActiveItem)
 			local y_tr = 0
 			for m = 1, #ym_chart do
@@ -16320,7 +16296,7 @@ function hall.music()
 			end
 			if #ym_chart == 0 then
 				imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.50, 0.50, 0.50, 0.50))
-				gui.Text(250, 20, 'Загрузка...', font[3])
+				gui.Text(250, 20, ym_chart_failed and 'Не удалось загрузить чарт.' or 'Загрузка...', font[3])
 				imgui.PopStyleColor(1)
 			end
 			playlist_add_popup()
@@ -17385,11 +17361,15 @@ function sh_browser_input.release_controls()
     end
 end
 
+function sh_browser_input.content_top(state)
+    return state.status.fullscreen and 32 or 78
+end
+
 function sh_browser_input.disable(state)
     if state.web_mouse_down and state.overlay_rect and state.started then
         local x, y = getCursorPos()
         local rect = state.overlay_rect
-        sh_browser_manager.pointer('mouseReleased', x - rect.x, y - rect.y - 78, 0, false)
+        sh_browser_manager.pointer('mouseReleased', x - rect.x, y - rect.y - sh_browser_input.content_top(state), 0, false)
     end
     sh_browser_input.enabled = false
     sh_browser_input.close_pressed = false
@@ -17438,7 +17418,7 @@ function sh_browser_input.drag_to(state, x, y)
     if x == state.web_drag_x and y == state.web_drag_y then return end
     state.web_drag_x, state.web_drag_y = x, y
     local rect = state.overlay_rect
-    sh_browser_manager.pointer('mouseMoved', x - rect.x, y - rect.y - 78, 0, true)
+    sh_browser_manager.pointer('mouseMoved', x - rect.x, y - rect.y - sh_browser_input.content_top(state), 0, true)
 end
 function sh_browser_input.close_hit(rect, x, y)
     return rect and x >= rect.x + rect.w - 35 and x < rect.x + rect.w
@@ -17467,37 +17447,39 @@ end,function(self)
     imgui.Begin('##SHBrowserChrome',nil,flags)
     local dl=imgui.GetWindowDrawList()
     dl:AddRectFilled(imgui.ImVec2(r.x,r.y),imgui.ImVec2(r.x+r.w,r.y+32),0xFF302A25,6)
-    dl:AddText(imgui.ImVec2(r.x+12,r.y+8),0xFFF0E8E0,u8(cursor_active and 'Браузер — Esc: вернуть управление игре' or ('Браузер — курсор: ' .. sh_browser_input.key_label())))
+    dl:AddText(imgui.ImVec2(r.x+12,r.y+8),0xFFF0E8E0,u8(cursor_active and (bs.status.fullscreen and 'Браузер — Esc: выйти из полноэкранного режима' or 'Браузер — Esc: вернуть управление игре') or ('Браузер — курсор: ' .. sh_browser_input.key_label())))
     dl:AddText(imgui.ImVec2(r.x+r.w-25,r.y+8),0xFFFFFFFF,'X')
-    dl:AddRectFilled(imgui.ImVec2(r.x,r.y+32),imgui.ImVec2(r.x+r.w,r.y+78),0xFF252321)
-    local function button(x,w,label,enabled)
-        dl:AddRectFilled(imgui.ImVec2(r.x+x,r.y+40),imgui.ImVec2(r.x+x+w,r.y+70),0xFF403A35,5)
-        dl:AddText(imgui.ImVec2(r.x+x+10,r.y+47),enabled and 0xFFF5F0EB or 0xFF807870,label)
-    end
-    button(8,34,'<',bs.status.can_back==true)
-    button(48,34,'>',bs.status.can_forward==true)
-    button(88,34,'',true)
-    dl:AddCircle(imgui.ImVec2(r.x+105,r.y+55),7,0xFFF5F0EB,20,1.5)
-    dl:AddTriangleFilled(imgui.ImVec2(r.x+108,r.y+45),imgui.ImVec2(r.x+114,r.y+49),imgui.ImVec2(r.x+107,r.y+51),0xFFF5F0EB)
-    button(r.w-92,84,u8'Перейти',true)
-    dl:AddRectFilled(imgui.ImVec2(r.x+130,r.y+40),imgui.ImVec2(r.x+r.w-100,r.y+70),0xFF4A413A,8)
-    if bs.address_edit then
-        if bs.address_focus then
-            ffi.fill(sh_browser_address_buf,2048)
-            local value=tostring(bs.address_text or ''):sub(1,2047);ffi.copy(sh_browser_address_buf,value,#value)
-            imgui.SetKeyboardFocusHere();bs.address_focus=false
+    if not bs.status.fullscreen then
+        dl:AddRectFilled(imgui.ImVec2(r.x,r.y+32),imgui.ImVec2(r.x+r.w,r.y+78),0xFF252321)
+        local function button(x,w,label,enabled)
+            dl:AddRectFilled(imgui.ImVec2(r.x+x,r.y+40),imgui.ImVec2(r.x+x+w,r.y+70),0xFF403A35,5)
+            dl:AddText(imgui.ImVec2(r.x+x+10,r.y+47),enabled and 0xFFF5F0EB or 0xFF807870,label)
         end
-        imgui.SetCursorPos(imgui.ImVec2(136,41))
-        imgui.SetNextItemWidth(math.max(80,r.w-242))
-        if imgui.InputText('##SHBrowserAddress',sh_browser_address_buf,2048,imgui.InputTextFlags.EnterReturnsTrue+imgui.InputTextFlags.AutoSelectAll) then
-            sh_browser_manager.submit_address(ffi.string(sh_browser_address_buf))
+        button(8,34,'<',bs.status.can_back==true)
+        button(48,34,'>',bs.status.can_forward==true)
+        button(88,34,'',true)
+        dl:AddCircle(imgui.ImVec2(r.x+105,r.y+55),7,0xFFF5F0EB,20,1.5)
+        dl:AddTriangleFilled(imgui.ImVec2(r.x+108,r.y+45),imgui.ImVec2(r.x+114,r.y+49),imgui.ImVec2(r.x+107,r.y+51),0xFFF5F0EB)
+        button(r.w-92,84,u8'Перейти',true)
+        dl:AddRectFilled(imgui.ImVec2(r.x+130,r.y+40),imgui.ImVec2(r.x+r.w-100,r.y+70),0xFF4A413A,8)
+        if bs.address_edit then
+            if bs.address_focus then
+                ffi.fill(sh_browser_address_buf,2048)
+                local value=tostring(bs.address_text or ''):sub(1,2047);ffi.copy(sh_browser_address_buf,value,#value)
+                imgui.SetKeyboardFocusHere();bs.address_focus=false
+            end
+            imgui.SetCursorPos(imgui.ImVec2(136,41))
+            imgui.SetNextItemWidth(math.max(80,r.w-242))
+            if imgui.InputText('##SHBrowserAddress',sh_browser_address_buf,2048,imgui.InputTextFlags.EnterReturnsTrue+imgui.InputTextFlags.AutoSelectAll) then
+                sh_browser_manager.submit_address(ffi.string(sh_browser_address_buf))
+            end
+            bs.address_text=ffi.string(sh_browser_address_buf)
+        else
+            local url=bs.status.url or u8'Адрес сайта или поисковый запрос'
+            dl:PushClipRect(imgui.ImVec2(r.x+138,r.y+40),imgui.ImVec2(r.x+r.w-108,r.y+70),true)
+            dl:AddText(imgui.ImVec2(r.x+138,r.y+47),0xFFE8E0D8,url)
+            dl:PopClipRect()
         end
-        bs.address_text=ffi.string(sh_browser_address_buf)
-    else
-        local url=bs.status.url or u8'Адрес сайта или поисковый запрос'
-        dl:PushClipRect(imgui.ImVec2(r.x+138,r.y+40),imgui.ImVec2(r.x+r.w-108,r.y+70),true)
-        dl:AddText(imgui.ImVec2(r.x+138,r.y+47),0xFFE8E0D8,url)
-        dl:PopClipRect()
     end
     dl:AddRectFilled(imgui.ImVec2(r.x,r.y+r.h-12),imgui.ImVec2(r.x+r.w,r.y+r.h),0xFF504236,4)
     dl:AddText(imgui.ImVec2(r.x+r.w-35,r.y+r.h-16),0xFFFFFFFF,'///')
@@ -17518,7 +17500,7 @@ function sh_browser_tick()
         if bit.band(sh_browser_user32.GetAsyncKeyState(1), 0x8000) == 0 then
             state.web_mouse_down = false
             local rect = state.overlay_rect
-            sh_browser_manager.pointer('mouseReleased', x - rect.x, y - rect.y - 78, 0, false)
+            sh_browser_manager.pointer('mouseReleased', x - rect.x, y - rect.y - sh_browser_input.content_top(state), 0, false)
         end
     end
     local ok, err = pcall(sh_browser_manager.poll, visible)
@@ -17567,19 +17549,24 @@ end
 local sh_browser_bootstrap = {
     url = 'https://raw.githubusercontent.com/kysteno4ek/StateHelper/beta/Browser/',
     installed = {
-        {'StateHelperBrowser.exe', 66048, '07b68b7713dfea13d9eccb8e34910f4ceb4afbc667808328ce13f689c3f5bc1e'},
-        {'browser.lua', 34468, '7a8f4d0b679660d0fd832d31435f6b2d38deb07475a7be1366676c4215158949'},
+        {'StateHelperBrowser.exe', 77312, '032a96d5a66411a699e3719d9b1701ea3f387434a441f84a7b5cdcbb84af33ba', 66048, '07b68b7713dfea13d9eccb8e34910f4ceb4afbc667808328ce13f689c3f5bc1e'},
+        {'browser.lua', 34560, '1000be1cb0d6f3e29f5727ed70e79a048db2845054a27f314188c5ac777ccab6', 34468, '7a8f4d0b679660d0fd832d31435f6b2d38deb07475a7be1366676c4215158949'},
     },
 }
 
-sh_browser_bootstrap.verify = sh_resource.verify_sha256
+function sh_browser_bootstrap.verify_entry(data, entry)
+    if entry[4] and data and #data == entry[4] then
+        return sh_resource.verify_sha256(data, entry[4], entry[5])
+    end
+    return sh_resource.verify_sha256(data, entry[2], entry[3])
+end
 
 function sh_browser_bootstrap.file_ready(path, entry)
     local file = io.open(path, 'rb')
     if not file then return false end
-    local data = file:read(entry[2] + 1)
+    local data = file:read(math.max(entry[2], entry[4] or 0) + 1)
     file:close()
-    local ok, valid = pcall(sh_browser_bootstrap.verify, data, entry[2], entry[3])
+    local ok, valid = pcall(sh_browser_bootstrap.verify_entry, data, entry)
     return ok and valid
 end
 
@@ -17593,7 +17580,7 @@ function sh_browser_bootstrap.start()
 
     lua_thread.create(function()
         for _, entry in ipairs(setup.installed) do
-            local name, size, digest = unpack(entry)
+            local name = entry[1]
             local path = root .. '/' .. name
             local installed = setup.file_ready(path, entry)
             local reason
@@ -17610,7 +17597,7 @@ function sh_browser_bootstrap.start()
                         pending = false
                     end
                 end, function(data)
-                    return pending and setup.verify(data, size, digest)
+                    return pending and setup.verify_entry(data, entry)
                         and (name ~= 'browser.lua' or loadstring(data, '@browser.lua') ~= nil)
                 end)
                 if pending and (not ok or not id or id == 0) then
@@ -18002,7 +17989,7 @@ function hall.browser_settings()
         if gui.BeginReveal(progress, top, height) then
             local y = top - height * (1 - progress)
             gui.DrawBox({16, y}, {586, height}, cl.tab, cl.line, 7, 15)
-            local activation = 'Текущая активация'
+            local activation = 'Текущая активация курсора'
             gui.Text(26, y + 16, activation, font[3])
             imgui.PushFont(font[3])
             local label_width = imgui.CalcTextSize(u8(activation)).x
@@ -22173,7 +22160,7 @@ win.dep_fmt = imgui.OnFrame(
 		gui.Text(16, y + 2, 'Пример:', bold_font[1])
 		imgui.PushFont(bold_font[1])
 		imgui.SetCursorPos(imgui.ImVec2(90, y + 2))
-		imgui.Text(dep_text or '')
+		imgui.Text(u8'/d На связь.')
 		imgui.PopFont()
 		imgui.End()
 	end
@@ -28210,7 +28197,11 @@ function onWindowMessage(msg, wparam, lparam)
     if key_down and wparam == 0x1B and sh_browser_input.enabled and sh_browser_input.available(browser_state) then
         sh_browser_input.swallow_key = wparam
         consumeWindowMessage(true, true, true)
-        sh_browser_input.disable(browser_state)
+        if browser_state.status.fullscreen then
+            if bit.band(lparam, 0x40000000) == 0 then sh_browser_manager.pointer('exitFullscreen', 0, 0, 0, false) end
+        else
+            sh_browser_input.disable(browser_state)
+        end
         return
     end
     if sh_browser_input.enabled and sh_browser_input.available(browser_state) and browser_state.web_keyboard
@@ -28243,7 +28234,7 @@ function onWindowMessage(msg, wparam, lparam)
         if r and (msg==0x200 or msg==0x201 or msg==0x202 or msg==0x203 or msg==0x20A) then
             local x,y=getCursorPos()
             local inside=x>=r.x and x<r.x+r.w and y>=r.y and y<r.y+r.h
-            local page=inside and y>=r.y+78 and y<r.y+r.h-12
+            local page=inside and y>=r.y+sh_browser_input.content_top(state) and y<r.y+r.h-12
             local captured=state.web_mouse_down==true
             if (msg == 0x201 or msg == 0x203) and not captured and sh_browser_input.close_hit(r, x, y) then
                 sh_browser_input.close_pressed = true
@@ -28268,7 +28259,7 @@ function onWindowMessage(msg, wparam, lparam)
                     sh_browser_input.drag_to(state, x, y)
                     state.web_mouse_down = false
                 end
-                sh_browser_manager.pointer(action, x - r.x, y - r.y - 78, msg == 0x20A and -delta or 0, state.web_mouse_down == true)
+                sh_browser_manager.pointer(action, x - r.x, y - r.y - sh_browser_input.content_top(state), msg == 0x20A and -delta or 0, state.web_mouse_down == true)
             end
             if msg~=0x200 and (inside or (msg==0x202 and captured)) then consumeWindowMessage(true,false);return end
         end
@@ -28516,8 +28507,10 @@ function time()
 			if setting.show_dialog_auto then
 				sampSendDialogResponse(27337, 1, 5, nil)
 			end
-			if setting.auto_cmd_doc and thread:status() == 'dead' then
-				send_chat_rp = true
+			local now = getGameTimer()
+			if setting.auto_cmd_doc and thread:status() == 'dead'
+				and (not sh_document_cef_at or now - sh_document_cef_at > 1500) then
+				send_chat_rp = now + 750
 			end
 			confirm_action_dialog = false
 		end
@@ -31211,6 +31204,7 @@ function apply_settings(name_file, description_file, array_arg)
   print('[SH] No valid settings or backup: ' .. name_file)
   return array_arg
  end
+ saved.auto_close_doc = nil
  local encoding_updated = false
  if type(saved.gun) == 'table' then
   for _, weapon in ipairs(saved.gun) do
