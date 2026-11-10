@@ -187,8 +187,8 @@ return function(env)
   end
   if state.input_wait_at and now-state.input_wait_at>=4 then input_failed() end
   local context=type(env.game_context)=='function' and env.game_context() or {blocked=false,width=1280,height=800}
+  if state.status.fullscreen or context.input_blocked then state.address_edit=false end
   if context.input_blocked then
-   state.address_edit=false
    if state.interactive and not state.input_suspended then command('game_input') end
    state.input_suspended=true
   else state.input_suspended=false end
@@ -201,7 +201,7 @@ return function(env)
     local lx,ly=x-rect.x,y-rect.y
     if lx>=0 and lx<rect.w and ly>=0 and ly<rect.h then
      if ly<32 and lx>=rect.w-35 then close('close_button');return
-     elseif ly>=32 and ly<78 then
+     elseif not state.status.fullscreen and ly>=32 and ly<78 then
       if lx>=8 and lx<42 and state.status.can_back then state.address_edit=false;command('back')
       elseif lx>=48 and lx<82 and state.status.can_forward then state.address_edit=false;command('forward')
       elseif lx>=88 and lx<122 then state.address_edit=false;command('reload')
