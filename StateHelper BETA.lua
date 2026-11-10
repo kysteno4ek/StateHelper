@@ -277,8 +277,7 @@ end
 -- Validate staged assets before replacing an existing usable resource.
 sh_resource = {sequence = 0}
 pcall(ffi.cdef, 'int __stdcall MoveFileExA(const char*, const char*, unsigned long);')
-function sh_resource.verify_sha256(data, size, digest_hex)
-    if type(data) ~= 'string' or #data ~= size then return false end
+function sh_resource.sha256(data)
     ffi.cdef([[
         long __stdcall BCryptOpenAlgorithmProvider(void**, const wchar_t*, const wchar_t*, unsigned long);
         long __stdcall BCryptHash(void*, const void*, unsigned long, const void*, unsigned long, void*, unsigned long);
@@ -287,13 +286,18 @@ function sh_resource.verify_sha256(data, size, digest_hex)
     local api = ffi.load('bcrypt')
     local provider = ffi.new('void*[1]')
     local algorithm = ffi.new('wchar_t[7]', {83, 72, 65, 50, 53, 54, 0}) -- SHA256
-    if api.BCryptOpenAlgorithmProvider(provider, algorithm, nil, 0) ~= 0 then return false end
+    if api.BCryptOpenAlgorithmProvider(provider, algorithm, nil, 0) ~= 0 then return nil end
     local digest = ffi.new('unsigned char[32]')
     local status = api.BCryptHash(provider[0], nil, 0, data, #data, digest, 32)
     api.BCryptCloseAlgorithmProvider(provider[0], 0)
-    if status ~= 0 then return false end
+    if status ~= 0 then return nil end
     local hex = ffi.string(digest, 32):gsub('.', function(byte) return ('%02x'):format(byte:byte()) end)
-    return hex == digest_hex
+    return hex
+end
+
+function sh_resource.verify_sha256(data, size, digest_hex)
+    if type(data) ~= 'string' or #data ~= size then return false end
+    return type(digest_hex) == 'string' and sh_resource.sha256(data) == digest_hex
 end
 
 function sh_resource.valid(data, extension)
@@ -3915,6 +3919,7 @@ end
 	sampRegisterChatCommand('sh', function()
 		open_main()
 	end)
+	sh_usage_start()
 	while true do wait(0)
 		debug_frame()
 		cover_flush()
@@ -5789,14 +5794,7 @@ local ym_device_id = (function()
 	return table.concat(t)
 end)()
 
-local function ym_https_request(method, url, args, resolve, reject)
-	local host, path = url:match('^https://([%w.%-]+)(/[^#]*)$')
-	if not host or path:find('[%z\1-\32\127-\255\\]')
-		or not (host:match('%.yandex%.net$') or host:match('%.yandex%.ru$')) then
-		if reject then reject('Unsupported Yandex HTTPS URL') end
-		return
-	end
-	if host ~= 'api.music.yandex.net' then args.headers.Authorization = nil end
+local function sh_winhttps_request(method, host, path, args, resolve, reject)
 	local worker = effil.thread(function(method, host, path, args)
 		local ffi = require 'ffi'
 		ffi.cdef[[
@@ -5855,7 +5853,180 @@ local function ym_https_request(method, url, args, resolve, reject)
 		if session ~= nil then api.WinHttpCloseHandle(session) end
 		return ok, result
 	end)(method, host, path, args)
-	table.insert(http_pending, {runner = worker, resolve = resolve, reject = reject, url = url})
+	table.insert(http_pending, {runner = worker, resolve = resolve, reject = reject, url = 'https://' .. host .. path})
+end
+
+local function ym_https_request(method, url, args, resolve, reject)
+	local host, path = url:match('^https://([%w.%-]+)(/[^#]*)$')
+	if not host or path:find('[%z\1-\32\127-\255\\]')
+		or not (host:match('%.yandex%.net$') or host:match('%.yandex%.ru$')) then
+		if reject then reject('Unsupported Yandex HTTPS URL') end
+		return
+	end
+	if host ~= 'api.music.yandex.net' then args.headers.Authorization = nil end
+	sh_winhttps_request(method, host, path, args, resolve, reject)
+end
+
+function sh_usage_start()
+	local path = sh_audit.private_root .. '/usage-id.txt'
+	local function read_id(source)
+		local file = io.open(source, 'rb')
+		if not file then return end
+		local saved = file:read(64)
+		file:close()
+		local mode, id = (saved or ''):match('^(%a+) ([0-9a-f]*)\n$')
+		if id and #id == 32 and (mode == 'on' or mode == 'off' or mode == 'auto') then
+			return id
+		end
+	end
+
+	local id = read_id(path)
+	local next_send, in_flight, enrolling = 0, false, false
+
+	local function hardware_id()
+		ffi.cdef [[
+			int __stdcall GetVolumeInformationA(const char*, char*, unsigned long, unsigned long*,
+				unsigned long*, unsigned long*, char*, unsigned long);
+		]]
+		local drive = os.getenv('SystemDrive')
+		if not drive or not drive:match('^%a:$') then return nil end
+		local serial = ffi.new('unsigned long[1]')
+		if ffi.load('kernel32').GetVolumeInformationA(drive .. '/', nil, 0, serial, nil, nil, nil, 0) == 0 or serial[0] == 0 then
+			return nil
+		end
+		local hash = sh_resource.sha256(('StateHelper usage HWID v1:%08X'):format(tonumber(serial[0])))
+		return hash and hash:sub(1, 32)
+	end
+
+	local function create_id()
+		ffi.cdef 'long __stdcall BCryptGenRandom(void*, unsigned char*, unsigned long, unsigned long);'
+		local buffer = ffi.new('unsigned char[16]')
+		assert(ffi.load('bcrypt').BCryptGenRandom(nil, buffer, 16, 2) == 0)
+		local bytes = ffi.string(buffer, 16)
+		local hex = {}
+		for i = 1, 16 do hex[i] = ('%02x'):format(bytes:byte(i)) end
+		return table.concat(hex)
+	end
+
+	if not id then
+		local ok, result = pcall(function()
+			local install_id = read_id(dir .. '/State Helper/usage-consent.txt')
+			if not install_id then
+				local hardware_ok, hardware = pcall(hardware_id)
+				install_id = (hardware_ok and hardware) or create_id()
+			end
+			assert(sh_audit.ensure_private_storage())
+			assert(write_file(path, 'auto ' .. install_id .. '\n'))
+			return install_id
+		end)
+		if not ok then
+			print('[SH Usage] Could not save installation ID.')
+			return
+		end
+		id = result
+	end
+
+	local secret_path = sh_audit.private_root .. '/usage-key.txt'
+	local secret = read_id(secret_path)
+	if not secret then
+		local ok, result = pcall(create_id)
+		if not ok or not write_file(secret_path, 'auto ' .. result .. '\n') then
+			print('[SH Usage] Could not save installation credential.')
+			return
+		end
+		secret = result
+	end
+
+	local servers = {}
+	for name, addresses in pairs(ips or {}) do
+		for _, address in ipairs(addresses) do servers[address:lower()] = name end
+	end
+
+	local function current_server()
+		local ip, port = sampGetCurrentServerAddress()
+		local address = type(ip) == 'string' and (ip:lower() .. ':' .. tostring(port))
+		if address and servers[address] then return servers[address] end
+		local ok, title = pcall(sampGetCurrentServerName)
+		if not ok or type(title) ~= 'string' then return '-' end
+		title = title:lower():gsub('[%-_]', ' '):gsub('%s+', ' ')
+		local best = '-'
+		for name in pairs(ips or {}) do
+			local words = name == 'VC' and 'vice city' or name:gsub('(%l)(%u)', '%1 %2'):lower()
+			if (best == '-' or #name > #best)
+				and (title:find('%f[%w]' .. words .. '%f[%W]') or title:find('%f[%w]' .. name:lower() .. '%f[%W]')) then
+				best = name
+			end
+		end
+		return best
+	end
+
+	local function snapshot()
+		local org = not setting.first_start and tonumber(setting.org) or 0
+		if org < 1 or org > 15 or org ~= math.floor(org) then org = 0 end
+		return ('%d %s %d'):format(os.time(), current_server(), org)
+	end
+
+	local queue, queue_path = {}, sh_audit.private_root .. '/usage-launches'
+	local launch = {data = snapshot()}
+	local queue_ok = pcall(function()
+		if not doesDirectoryExist(queue_path) then lfs.mkdir(queue_path) end
+		for name in lfs.dir(queue_path) do
+			if name:match('^%d+%-[0-9a-f]+%.txt$') then
+				local filename = queue_path .. '/' .. name
+				local file = io.open(filename, 'rb')
+				if file then
+					local data = file:read(64) or ''
+					file:close()
+					local timestamp = tonumber(data:match('^(%d+) [A-Za-z%-]+ %d+$'))
+					if timestamp and timestamp >= os.time() - 7 * 86400 then
+						queue[#queue + 1] = {path = filename, data = data}
+					else
+						os.remove(filename)
+					end
+				end
+			end
+		end
+		local filename = queue_path .. '/' .. os.time() .. '-' .. create_id() .. '.txt'
+		if write_file(filename, launch.data) then launch.path = filename end
+	end)
+	if not queue_ok or not launch.path then print('[SH Usage] Could not persist queued launch.') end
+	queue[#queue + 1] = launch
+	table.sort(queue, function(a, b) return a.data < b.data end)
+	local auth = id .. ' ' .. secret
+
+	lua_thread.create(function()
+		while true do
+			if not in_flight and os.time() >= next_send and sampIsLocalPlayerSpawned() then
+				local pending = queue[1]
+				local endpoint = enrolling and 'register' or (pending and 'launch' or 'heartbeat')
+				local data = endpoint == 'register' and auth or (auth .. ' ' .. (pending and pending.data or snapshot()))
+				in_flight = true
+				local function finish(response)
+					in_flight = false
+					local status = response and response.status_code
+					next_send = os.time() + 60
+					if status == 401 and endpoint ~= 'register' then
+						enrolling, next_send = true, 0
+					elseif status == 204 and endpoint == 'register' then
+						enrolling, next_send = false, 0
+					elseif pending and endpoint == 'launch' and (status == 204 or status == 422) then
+						if pending.path then os.remove(pending.path) end
+						table.remove(queue, 1)
+						next_send = #queue > 0 and 0 or os.time() + 300
+					elseif status == 204 then
+						next_send = os.time() + 300
+					elseif status == 403 then
+						next_send = os.time() + 300
+					end
+				end
+				local ok = pcall(sh_winhttps_request, 'POST', '92.246.137.6', '/statehelper-usage/' .. endpoint, {
+					headers = {['Content-Type'] = 'text/plain'}, data = data, timeout = 5
+				}, finish, function() finish() end)
+				if not ok then finish() end
+			end
+			wait(5000)
+		end
+	end)
 end
 
 function ym_request(url, resolve, reject)
@@ -17549,7 +17720,7 @@ end
 local sh_browser_bootstrap = {
     url = 'https://raw.githubusercontent.com/kysteno4ek/StateHelper/beta/Browser/',
     installed = {
-        {'StateHelperBrowser.exe', 91648, '81a187364942879941c64c04f2a10d9179ceddb5044401844074c0667b2d1126'},
+        {'StateHelperBrowser.exe', 91648, '81a187364942879941c64c04f2a10d9179ceddb5044401844074c0667b2d1126', 77312, '032a96d5a66411a699e3719d9b1701ea3f387434a441f84a7b5cdcbb84af33ba'},
         {'browser.lua', 34560, '1000be1cb0d6f3e29f5727ed70e79a048db2845054a27f314188c5ac777ccab6', 34468, '7a8f4d0b679660d0fd832d31435f6b2d38deb07475a7be1366676c4215158949'},
     },
 }
