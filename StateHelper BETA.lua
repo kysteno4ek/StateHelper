@@ -17549,7 +17549,7 @@ end
 local sh_browser_bootstrap = {
     url = 'https://raw.githubusercontent.com/kysteno4ek/StateHelper/beta/Browser/',
     installed = {
-        {'StateHelperBrowser.exe', 77312, '032a96d5a66411a699e3719d9b1701ea3f387434a441f84a7b5cdcbb84af33ba', 66048, '07b68b7713dfea13d9eccb8e34910f4ceb4afbc667808328ce13f689c3f5bc1e'},
+        {'StateHelperBrowser.exe', 91648, '81a187364942879941c64c04f2a10d9179ceddb5044401844074c0667b2d1126'},
         {'browser.lua', 34560, '1000be1cb0d6f3e29f5727ed70e79a048db2845054a27f314188c5ac777ccab6', 34468, '7a8f4d0b679660d0fd832d31435f6b2d38deb07475a7be1366676c4215158949'},
     },
 }
