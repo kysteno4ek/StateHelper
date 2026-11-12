@@ -3,7 +3,7 @@ local math = math
 script_name('State Helper')
 script_authors('Kane')
 script_description('Script for employees of state organizations on the Arizona Role Playing Game')
-script_version('3.5.2')
+script_version('3.5.3')
 script_properties('work-in-pause')
 
 local ffi = require 'ffi'
@@ -1062,11 +1062,17 @@ setting = {
 	window_alpha = 1.0,
 	winter_enabled = false,
 	winter_intro_done = false,
+	winter_visual_version = 2,
 	winter_snow = 45,
-	winter_speed = 0.255,
+	winter_speed = 0.9,
 	winter_show_snow = true,
 	winter_show_garland = true,
-	winter_show_icicles = false,
+	winter_show_icicles = true,
+	winter_frost = true,
+	winter_wind = 45,
+	winter_glow = 65,
+	winter_garland_style = 'amber',
+	winter_snow_front = false,
 	cmd_open_win = '',
 	tab = {'settings', 'cmd', 'shpora', 'dep', 'sob', 'reminder', 'stat', 'music', 'rp_zona', 'help', 'actions'},
 	browser_before_actions = false,
@@ -3268,11 +3274,35 @@ function main()
 		setting.winter_enabled = false
 		settingsUpdated = true
 	end
+	--> Зимнее оформление: миграция на новую версию визуала (v2)
+	if setting.winter_visual_version ~= 2 then
+		setting.winter_visual_version = 2
+		local wspeed = tonumber(setting.winter_speed)
+		if wspeed == nil or wspeed <= 0.30 then setting.winter_speed = 0.9 end
+		local wsnow = tonumber(setting.winter_snow)
+		if wsnow ~= nil and wsnow > 100 then setting.winter_snow = 100 end
+		if setting.winter_frost == nil then setting.winter_frost = true end
+		if setting.winter_wind == nil then setting.winter_wind = 45 end
+		if setting.winter_glow == nil then setting.winter_glow = 65 end
+		if setting.winter_garland_style ~= 'ice' and setting.winter_garland_style ~= 'amber' and setting.winter_garland_style ~= 'noel' then
+			setting.winter_garland_style = 'amber'
+		end
+		setting.winter_show_icicles = true
+		settingsUpdated = true
+	end
 	if setting.winter_snow == nil then setting.winter_snow = 45 settingsUpdated = true end
-	if setting.winter_speed == nil then setting.winter_speed = 0.255 settingsUpdated = true end
+	if setting.winter_speed == nil then setting.winter_speed = 0.9 settingsUpdated = true end
 	if setting.winter_show_snow == nil then setting.winter_show_snow = true settingsUpdated = true end
 	if setting.winter_show_garland == nil then setting.winter_show_garland = true settingsUpdated = true end
-	setting.winter_show_icicles = false
+	if setting.winter_show_icicles == nil then setting.winter_show_icicles = true settingsUpdated = true end
+	if setting.winter_frost == nil then setting.winter_frost = true settingsUpdated = true end
+	if setting.winter_wind == nil then setting.winter_wind = 45 settingsUpdated = true end
+	if setting.winter_glow == nil then setting.winter_glow = 65 settingsUpdated = true end
+	if setting.winter_garland_style ~= 'ice' and setting.winter_garland_style ~= 'amber' and setting.winter_garland_style ~= 'noel' then
+		setting.winter_garland_style = 'amber'
+		settingsUpdated = true
+	end
+	if setting.winter_snow_front == nil then setting.winter_snow_front = false settingsUpdated = true end
 	if not setting.dep_default_command_added then
 		if setting.command_tabs[3] == '' then setting.command_tabs[3] = 'dep' end
 		setting.dep_default_command_added = true
@@ -4146,32 +4176,88 @@ end
 end
 
 --> ===================== ЗИМНЕЕ ОФОРМЛЕНИЕ =====================
---> Только отрисовка через ImDrawList: логика хелпера не затронута.
---> Любая ошибка внутри оформления перехватывается и просто отключает его.
---> Чтобы выключить совсем: winter.enabled = false
+--> «Crystal Nocturne»: кристаллический снег, янтарная гирлянда, морозная кромка.
+--> Вся отрисовка идёт через ImDrawList и не влияет на логику хелпера.
+--> Любая ошибка внутри оформления перехватывается и гасит только его.
 winter = {}
 do
 	local W = winter
 	W.enabled = false
 	W.active = false
-	W.ox, W.oy, W.w, W.h, W.top, W.fr = 0, 0, 848, 448, 0, -1
-	local floor, sin, cos, min, max, pi = math.floor, math.sin, math.cos, math.min, math.max, math.pi
+	W.ox, W.oy, W.w, W.h, W.fr = 0, 0, 848, 448, -1
+
+	local floor, sin, cos, min, max, abs = math.floor, math.sin, math.cos, math.min, math.max, math.abs
+	local pi = math.pi
 	local dl, ox, oy, alpha, light = nil, 0, 0, 1, false
 	local errs = 0
-	local A, B, C = imgui.ImVec2(0, 0), imgui.ImVec2(0, 0), imgui.ImVec2(0, 0)
-	local PA = ffi.new('ImVec2[40]')
+	local A, B = imgui.ImVec2(0, 0), imgui.ImVec2(0, 0)
+	local PA = ffi.new('ImVec2[64]')
 	local pn = 0
+	local TT = 0
 
-	--> Палитры под светлую и тёмную тему
-	local PD = {snow = {0.96, 0.98, 1.00}, shade = {0.66, 0.76, 0.91}, rim = {0.52, 0.66, 0.88}, flake = {0.94, 0.97, 1.00}, wire = {0.34, 0.56, 0.40}, spark = {1.00, 1.00, 1.00}, glint = {0.62, 0.78, 1.00}, pine1 = {0.08, 0.38, 0.22}, pine2 = {0.14, 0.55, 0.31}, pine3 = {0.30, 0.76, 0.46}}
-	local PL = {snow = {1.00, 1.00, 1.00}, shade = {0.78, 0.86, 0.96}, rim = {0.46, 0.60, 0.82}, flake = {0.50, 0.68, 0.94}, wire = {0.16, 0.40, 0.24}, spark = {0.36, 0.56, 0.95}, glint = {0.40, 0.58, 0.90}, pine1 = {0.05, 0.30, 0.17}, pine2 = {0.10, 0.45, 0.25}, pine3 = {0.20, 0.62, 0.36}}
+	--> ---------- Палитры ----------
+	local PD = {
+		snow  = {0.98, 0.99, 1.00},
+		flake = {0.98, 0.99, 1.00},
+		dust  = {0.84, 0.92, 1.00},
+		ice   = {0.66, 0.84, 1.00},
+		frost = {0.72, 0.87, 1.00},
+		lip   = {0.84, 0.93, 1.00},
+		wire  = {0.56, 0.70, 0.88},
+		bokeh = {0.56, 0.75, 1.00},
+		veil  = {0.12, 0.32, 0.60},
+		glow  = {0.36, 0.30, 0.58}
+	}
+	local PL = {
+		snow  = {1.00, 1.00, 1.00},
+		flake = {0.36, 0.56, 0.92},
+		dust  = {0.34, 0.54, 0.86},
+		ice   = {0.28, 0.49, 0.82},
+		frost = {0.36, 0.55, 0.86},
+		lip   = {0.42, 0.61, 0.90},
+		wire  = {0.34, 0.46, 0.64},
+		bokeh = {0.38, 0.60, 0.92},
+		veil  = {0.53, 0.72, 0.96},
+		glow  = {0.76, 0.70, 0.96}
+	}
 	local P = PD
-	local RED, RED2, GRN, GRN2, GRN3 = {0.86, 0.15, 0.20}, {0.62, 0.08, 0.14}, {0.13, 0.56, 0.31}, {0.07, 0.38, 0.21}, {0.22, 0.70, 0.40}
-	local GOLD, GOLD2, ORG, BRN, COAL = {1.00, 0.80, 0.26}, {0.82, 0.56, 0.12}, {0.98, 0.55, 0.12}, {0.46, 0.29, 0.15}, {0.13, 0.14, 0.18}
-	local BLU, PNK, LGRN = {0.30, 0.60, 0.95}, {0.95, 0.42, 0.64}, {0.25, 0.85, 0.45}
-	local LIGHTS = {RED, GOLD, LGRN, BLU, PNK}
+	local STYLES = {
+		ice   = {{0.76, 0.91, 1.00}, {0.92, 0.98, 1.00}, {0.56, 0.80, 1.00}, {1.00, 0.90, 0.70}},
+		amber = {{1.00, 0.80, 0.44}, {1.00, 0.90, 0.68}, {1.00, 0.66, 0.30}, {1.00, 0.56, 0.34}},
+		noel  = {{1.00, 0.34, 0.40}, {0.38, 0.88, 0.56}, {1.00, 0.80, 0.38}, {0.60, 0.78, 1.00}}
+	}
+	--> насыщенные варианты для светлой темы: пастель на белом не читается
+	local STYLES_L = {
+		ice   = {{0.38, 0.60, 0.90}, {0.54, 0.74, 0.98}, {0.24, 0.46, 0.78}, {0.86, 0.56, 0.12}},
+		amber = {{0.92, 0.56, 0.08}, {1.00, 0.72, 0.18}, {0.82, 0.40, 0.06}, {0.90, 0.28, 0.10}},
+		noel  = {{0.86, 0.16, 0.24}, {0.14, 0.62, 0.30}, {0.92, 0.56, 0.08}, {0.24, 0.46, 0.82}}
+	}
 
-	--> Цвет в ImU32 с учётом прозрачности окна (чтобы оформление гасло вместе с окном)
+	--> ---------- Настройки ----------
+	local cfg = {snow = true, garland = true, frost = true, icicles = true, front = false, density = 45, speed = 0.9, wind = 45, glow = 65, style = 'amber'}
+
+	local function clamp(v, a, b)
+		if v < a then return a elseif v > b then return b end
+		return v
+	end
+
+	local function load_cfg()
+		local s = setting
+		cfg.snow    = not (s and s.winter_show_snow == false)
+		cfg.garland = not (s and s.winter_show_garland == false)
+		cfg.frost   = not (s and s.winter_frost == false)
+		cfg.icicles = not (s and s.winter_show_icicles == false)
+		cfg.front   = (s and s.winter_snow_front == true)
+		cfg.density = clamp(tonumber(s and s.winter_snow) or 45, 0, 100)
+		cfg.speed   = clamp(tonumber(s and s.winter_speed) or 0.9, 0.15, 2.5)
+		cfg.wind    = clamp(tonumber(s and s.winter_wind) or 45, 0, 100)
+		cfg.glow    = clamp(tonumber(s and s.winter_glow) or 65, 0, 100)
+		local st = s and s.winter_garland_style
+		if st ~= 'ice' and st ~= 'noel' then st = 'amber' end
+		cfg.style = st
+	end
+
+	--> ---------- Цвет ----------
 	local function pk(r, g, b, a)
 		a = (a or 1) * alpha
 		if a <= 0.004 then return 0 end
@@ -4180,553 +4266,645 @@ do
 	end
 	local function cc(t, a) return pk(t[1], t[2], t[3], a) end
 
-	--> Примитивы (координаты задаются относительно окна)
+	--> ---------- Примитивы (координаты относительно окна) ----------
 	local function fcircle(x, y, r, c, seg)
 		A.x, A.y = ox + x, oy + y
-		dl:AddCircleFilled(A, r, c, seg or 12)
-	end
-	local function ring(x, y, r, c, th, seg)
-		A.x, A.y = ox + x, oy + y
-		dl:AddCircle(A, r, c, seg or 12, th or 1)
+		dl:AddCircleFilled(A, r, c, seg or 10)
 	end
 	local function line(x1, y1, x2, y2, c, th)
 		A.x, A.y = ox + x1, oy + y1
 		B.x, B.y = ox + x2, oy + y2
 		dl:AddLine(A, B, c, th or 1)
 	end
-	local function frect(x1, y1, x2, y2, c, rd)
-		A.x, A.y = ox + x1, oy + y1
-		B.x, B.y = ox + x2, oy + y2
-		dl:AddRectFilled(A, B, c, rd or 0)
-	end
-	local function ftri(x1, y1, x2, y2, x3, y3, c)
-		A.x, A.y = ox + x1, oy + y1
-		B.x, B.y = ox + x2, oy + y2
-		C.x, C.y = ox + x3, oy + y3
-		dl:AddTriangleFilled(A, B, C, c)
-	end
 	local function pp(x, y)
 		PA[pn].x, PA[pn].y = ox + x, oy + y
 		pn = pn + 1
 	end
 	local function pfill(c)
-		dl:AddConvexPolyFilled(PA, pn, c)
+		if pn >= 3 then dl:AddConvexPolyFilled(PA, pn, c) end
 		pn = 0
 	end
-	--> Эллипс (выпуклый многоугольник)
-	local function blob(cx, cy, rx, ry, c)
+	local function pstroke(c, th)
+		if pn >= 2 then dl:AddPolyline(PA, pn, c, 0, th or 1) end
 		pn = 0
-		for k = 0, 11 do
-			local a = pi * 2 * k / 12
-			pp(cx + rx * cos(a), cy + ry * sin(a))
-		end
-		pfill(c)
-	end
-	--> Блик-искорка (мерцает)
-	local function sparkle(x, y, r, ph, col)
-		local T = os.clock()
-		local v = sin(T * 2.4 + ph)
-		if v < 0.1 then return end
-		v = v * v
-		local c = cc(col or P.spark, 0.9 * v)
-		local rr = r * (0.55 + 0.45 * v)
-		line(x - rr, y, x + rr, y, c, 1)
-		line(x, y - rr, x, y + rr, c, 1)
-		fcircle(x, y, 0.8, c, 6)
 	end
 
-	--> ================= СНЕГОПАД =================
+	--> ---------- Время ----------
+	local use_imgui_time = (type(imgui.GetTime) == 'function')
+	local function time_now()
+		if use_imgui_time then
+			local ok, t = pcall(imgui.GetTime)
+			if ok and type(t) == 'number' then return t end
+			use_imgui_time = false
+		end
+		return os.clock()
+	end
+
 	local function hash(n)
 		local v = sin(n * 12.9898 + 78.233) * 43758.5453
 		return v - floor(v)
 	end
-	local NF = 72
+
+	local function fail(e)
+		pn = 0
+		errs = errs + 1
+		if errs <= 3 then print('[Winter] ошибка оформления: ' .. tostring(e)) end
+	end
+
+	--> ---------- Снежинки ----------
+	--> слои: 1 - пыль, 2 - малая звезда, 3 - большая звезда, 4 - размытая дальняя, 5 - крупный ближний план
+	local NF = 320
 	local FL = {}
 	do
 		for i = 1, NF do
 			local q = hash(i * 3.1)
-			local k = 1
-			if q > 0.90 then k = 3 elseif q > 0.52 then k = 2 end
-			local r
-			if k == 1 then r = 0.9 + hash(i * 5.7) * 0.5
-			elseif k == 2 then r = 1.5 + hash(i * 5.7) * 0.9
-			else r = 3.6 + hash(i * 5.7) * 2.0 end
+			local k
+			if q > 0.975 then k = 5
+			elseif q > 0.93 then k = 4
+			elseif q > 0.59 then k = 3
+			elseif q > 0.29 then k = 2
+			else k = 1 end
+			local r, v, am, a, pat
+			if k == 1 then
+				r = 0.40 + hash(i * 5.7) * 0.55
+				v = 5 + hash(i * 4.1) * 5
+				am = 2.5 + hash(i * 6.3) * 4.5
+				a = 0.09 + hash(i * 9.1) * 0.10
+				pat = 1
+			elseif k == 2 then
+				r = 1.60 + hash(i * 5.7) * 1.30
+				v = 11 + hash(i * 4.1) * 9
+				am = 4 + hash(i * 6.3) * 6
+				a = 0.30 + hash(i * 9.1) * 0.18
+				pat = 1 + floor(hash(i * 11.3) * 2)
+			elseif k == 3 then
+				r = 3.4 + hash(i * 5.7) * 3.3
+				v = 18 + hash(i * 4.1) * 12
+				am = 7 + hash(i * 6.3) * 7
+				a = 0.40 + hash(i * 9.1) * 0.22
+				pat = (r > 5.1) and 3 or 2
+			elseif k == 4 then
+				r = 5.0 + hash(i * 5.7) * 3.0
+				v = 12 + hash(i * 4.1) * 10
+				am = 10 + hash(i * 6.3) * 8
+				a = 0.045 + hash(i * 9.1) * 0.030
+				pat = 1
+			else
+				--> редкие крупные снежинки ближнего плана
+				r = 7.0 + hash(i * 5.7) * 2.6
+				v = 20 + hash(i * 4.1) * 10
+				am = 8 + hash(i * 6.3) * 7
+				a = 0.58 + hash(i * 9.1) * 0.14
+				pat = 3
+			end
 			FL[i] = {
-				x = hash(i * 1.7), y = hash(i * 2.3), k = k, r = r,
-				v = (k == 3) and (9 + hash(i * 4.1) * 9) or (15 + hash(i * 4.1) * 24),
-				am = 4 + hash(i * 6.3) * 12, fq = 0.5 + hash(i * 7.9) * 1.1,
-				ph = hash(i * 8.3) * 6.28, a = 0.5 + hash(i * 9.1) * 0.4
+				x = hash(i * 1.7), y = hash(i * 2.3), k = k, r = r, v = v, am = am,
+				fq = 0.35 + hash(i * 7.9) * 0.75,
+				ph = hash(i * 8.3) * 6.28,
+				a = a, pat = pat
 			}
 		end
 	end
 
-	--> Рисует снегопад (экранные координаты clip: x0, y0, x1, y1). Позиции снежинок зависят только от времени.
-	local function field(x0, y0, x1, y1, clip)
-		local Wd, Hd = W.w, W.h
-		local T = os.clock()
-		local fc = P.flake
-		if clip then
-			A.x, A.y, B.x, B.y = x0, y0, x1, y1
-			dl:PushClipRect(A, B, true)
-		end
-		local ok, e = pcall(function()
-			-- количество и скорость из настроек оформления (сами настройки не меняем)
-			local snow_n = NF
-			local snow_spd = 1.0
-			if setting then
-				if setting.winter_show_snow == false then
-					snow_n = 0
-				else
-					-- как в первых зимних версиях: плотный снегопад; ползунок масштабирует 0..NF
-					local want = tonumber(setting.winter_snow)
-					if want == nil then
-						snow_n = NF
-					else
-						snow_n = math.max(0, math.min(NF, math.floor(want * NF / 100 + 0.5)))
-						-- если в конфиге абсолютное число (старый формат ~45) — уважаем
-						if want <= NF and want > 1 and want == math.floor(want) then
-							snow_n = math.max(0, math.min(NF, math.floor(want)))
-						end
-					end
-				end
-				snow_spd = math.max(0.2, math.min(2.5, tonumber(setting.winter_speed) or 1.0))
+	--> Шестилучевой кристалл
+	local function crystal(x, y, r, col, rot, wd)
+		wd = wd or 0.5
+		for j = 0, 2 do
+			local an = rot + j * pi / 3
+			local dx, dy = cos(an) * r, sin(an) * r
+			line(x - dx, y - dy, x + dx, y + dy, col, wd)
+			local ex, ey = cos(an + pi / 2) * r * 0.34, sin(an + pi / 2) * r * 0.34
+			for sg = -1, 1, 2 do
+				local mx, my = x + dx * 0.62 * sg, y + dy * 0.62 * sg
+				line(mx - ex, my - ey, mx + ex, my + ey, col, wd * 0.9)
 			end
-			for i = 1, snow_n do
-				local f = FL[i]
-				local ly = ((f.y * (Hd + 24) + T * f.v * snow_spd) % (Hd + 24)) - 16
-				local fade = min(1, (ly - 4 - W.top) / 24, (Hd - 4 - ly) / 24)
-				if fade > 0 then
-					local px = W.ox + 10 + f.x * (Wd - 20) + sin(T * f.fq + f.ph) * f.am
-					local py = W.oy + ly
-					local r = f.r
-					if px + r * 2 >= x0 and px - r * 2 <= x1 and py + r * 2 >= y0 and py - r * 2 <= y1 then
-						A.x, A.y = px, py
-						-- отрисовка как в первых зимних версиях StateHelper
-						if f.k == 1 then
-							dl:AddCircleFilled(A, r, cc(fc, f.a * fade * 0.85), 6)
-						elseif f.k == 2 then
-							dl:AddCircleFilled(A, r * 2.1, cc(fc, 0.12 * fade), 10)
-							dl:AddCircleFilled(A, r, cc(fc, f.a * fade), 8)
-						else
-							local a0 = T * 0.35 + f.ph
-							local c = cc(fc, 0.85 * fade)
-							for j = 0, 2 do
-								local an = a0 + j * pi / 3
-								local dx, dy = cos(an) * r, sin(an) * r
-								A.x, A.y = px - dx, py - dy
-								B.x, B.y = px + dx, py + dy
-								dl:AddLine(A, B, c, 1)
-								local ex, ey = cos(an + pi / 2) * r * 0.32, sin(an + pi / 2) * r * 0.32
-								for sg = -1, 1, 2 do
-									local mx, my = px + dx * 0.6 * sg, py + dy * 0.6 * sg
-									A.x, A.y = mx - ex, my - ey
-									B.x, B.y = mx + ex, my + ey
-									dl:AddLine(A, B, c, 1)
-								end
-							end
-						end
+		end
+		fcircle(x, y, max(0.25, r * 0.16), col, 6)
+	end
+
+	--> Детализированная снежинка для снегопада: 6 симметричных лучей с веточками
+	local function snow_star(x, y, r, a, rot, pat, seed)
+		local c = cc(P.flake, a)
+		local cb = cc(P.flake, a * 0.64)
+		local cw = 0.42 + r * 0.050
+		local u1, u2, u3 = 0.48, 0.70, 0.85
+		for j = 0, 2 do
+			local an = rot + j * pi / 3
+			local dx, dy = cos(an) * r, sin(an) * r
+			line(x - dx, y - dy, x + dx, y + dy, c, cw)
+			local ca, sa = cos(an + 1.05), sin(an + 1.05)
+			local c2, s2 = cos(an - 1.05), sin(an - 1.05)
+			local br = r * (0.24 + 0.07 * hash(seed + j * 1.7))
+			--> веточки на обоих концах луча
+			for sg = -1, 1, 2 do
+				local bx, by = x + dx * u1 * sg, y + dy * u1 * sg
+				local l = br * 1.55
+				line(bx, by, bx + ca * l * sg, by + sa * l * sg, cb, cw * 0.85)
+				line(bx, by, bx + c2 * l * sg, by + s2 * l * sg, cb, cw * 0.85)
+				if pat >= 2 then
+					bx, by = x + dx * u2 * sg, y + dy * u2 * sg
+					l = br * 0.95
+					line(bx, by, bx + ca * l * sg, by + sa * l * sg, cb, cw * 0.72)
+					line(bx, by, bx + c2 * l * sg, by + s2 * l * sg, cb, cw * 0.72)
+				end
+				if pat >= 3 then
+					bx, by = x + dx * u3 * sg, y + dy * u3 * sg
+					l = br * 0.52
+					line(bx, by, bx + ca * l * sg, by + sa * l * sg, cb, cw * 0.60)
+					line(bx, by, bx + c2 * l * sg, by + s2 * l * sg, cb, cw * 0.60)
+				end
+			end
+		end
+		--> кристаллическое ядро
+		if r >= 3.8 then
+			local hr = r * 0.20
+			local ch = cc(P.flake, a * 0.48)
+			for h = 0, 5 do
+				local a1 = rot + h * pi / 3
+				local a2 = a1 + pi / 3
+				line(x + cos(a1) * hr, y + sin(a1) * hr,
+					x + cos(a2) * hr, y + sin(a2) * hr, ch, cw * 0.55)
+			end
+		end
+		fcircle(x, y, max(0.30, r * 0.13), c, 6)
+		if r > 4.2 then
+			for j = 0, 2 do
+				local an = rot + j * pi / 3
+				local tx, ty = cos(an) * r * 1.02, sin(an) * r * 1.02
+				fcircle(x + tx, y + ty, 0.40, cc(P.flake, a * 0.55), 5)
+				fcircle(x - tx, y - ty, 0.40, cc(P.flake, a * 0.55), 5)
+			end
+		end
+	end
+
+	--> Мерцающая искра
+	local function sparkle(x, y, r, ph, col)
+		local v = sin(TT * 2.1 + ph)
+		if v < 0.15 then return end
+		v = v * v
+		local c = cc(col or P.flake, 0.85 * v)
+		local rr = r * (0.55 + 0.45 * v)
+		line(x - rr, y, x + rr, y, c, 0.5)
+		line(x, y - rr, x, y + rr, c, 0.5)
+	end
+
+	--> Проверка попадания в скруглённое окно
+	local function inside_window(x, y, m)
+		m = m or 1
+		local w, h = W.w, W.h
+		if x < 6 + m or y < 6 + m or x > w - 6 - m or y > h - 6 - m then return false end
+		local rr = 10
+		local cr = rr - m
+		if cr < 0 then cr = 0 end
+		local cx, cy
+		if x < 6 + rr and y < 6 + rr then
+			cx, cy = 6 + rr, 6 + rr
+		elseif x > w - 6 - rr and y < 6 + rr then
+			cx, cy = w - 6 - rr, 6 + rr
+		elseif x < 6 + rr and y > h - 6 - rr then
+			cx, cy = 6 + rr, h - 6 - rr
+		elseif x > w - 6 - rr and y > h - 6 - rr then
+			cx, cy = w - 6 - rr, h - 6 - rr
+		else
+			return true
+		end
+		return (x - cx) * (x - cx) + (y - cy) * (y - cy) <= cr * cr
+	end
+
+	--> ---------- Базовый снегопад (под карточками) ----------
+	local function field()
+		if not cfg.snow then return end
+		local w, h = W.w, W.h
+		local area = clamp((w * h) / (848 * 448), 0.16, 1.0)
+		local n = floor(cfg.density / 100 * NF * area + 0.5)
+		if n <= 0 then return end
+		--> на светлой теме снег должен быть заметнее
+		local sm = light and 1.22 or 1.0
+		local wd = w - 22
+		local hh = h + 30
+		local windx = (2.4 + 9 * cfg.wind / 100) * cfg.speed
+		local function pos(f)
+			local x = 11 + ((f.x * wd + TT * windx + sin(TT * 0.31 * f.fq + f.ph) * f.am * 2
+				+ sin(TT * 1.10 * f.fq + f.ph * 1.7) * f.am * 0.35) % wd)
+			local y = ((f.y * hh + TT * f.v * cfg.speed) % hh) - 15
+			return x, y
+		end
+		--> дальний план: мягкое боке
+		for i = 1, n do
+			local f = FL[i]
+			if f.k == 4 then
+				local x, y = pos(f)
+				if inside_window(x, y, f.r * 0.95) then
+					--> расфокусированная дальняя снежинка: мягкие толстые лучи вместо кружка
+					local rot = TT * (0.05 + 0.06 * hash(i * 3.7)) + f.ph
+					local c = cc(P.ice, f.a * sm)
+					for j = 0, 2 do
+						local an = rot + j * pi / 3
+						local dx, dy = cos(an) * f.r, sin(an) * f.r
+						line(x - dx, y - dy, x + dx, y + dy, c, 1.5)
+					end
+					fcircle(x, y, 0.7, cc(P.flake, min(1, f.a * 1.2 * sm)), 6)
+				end
+			end
+		end
+		--> ближняя пыль
+		for i = 1, n do
+			local f = FL[i]
+			if f.k == 1 then
+				local x, y = pos(f)
+				if inside_window(x, y, 1) then
+					if hash(i * 13.7) > 0.72 then
+						--> вытянутая крупинка, сносимая ветром
+						local lg = 1.1 + hash(i * 15.1) * 1.1
+						local sl = windx * 0.02
+						line(x - sl * lg, y - lg, x + sl * lg, y + lg, cc(P.dust, f.a * sm), 0.45)
+					else
+						fcircle(x, y, f.r, cc(P.dust, f.a * sm), 6)
 					end
 				end
+			end
+		end
+		--> звёзды-снежинки
+		for i = 1, n do
+			local f = FL[i]
+			if f.k >= 2 and f.k ~= 4 then
+				local x, y = pos(f)
+				if inside_window(x, y, f.r * 0.95) then
+					local tw = 0.86 + 0.14 * sin(TT * 1.6 + f.ph + i * 0.7)
+					local rot = TT * (0.10 + 0.12 * hash(i * 3.7)) + f.ph
+					snow_star(x, y, f.r, f.a * tw * sm, rot, f.pat, i)
+					if f.k == 5 then
+						sparkle(x, y, f.r * 0.52, f.ph, P.flake)
+					end
+				end
+			end
+		end
+	end
+
+	--> ---------- Снежная шапка на верхней кромке ----------
+	local function snow_cap(w, y0)
+		for i = 0, 15 do
+			local x = 12 + hash(i * 3.3) * (w - 24)
+			local ln = 6 + hash(i * 4.9) * 15
+			if x + ln > w - 8 then ln = w - 8 - x end
+			if ln > 1.5 then
+				local hh = 0.5 + hash(i * 6.3) * 1.1
+				pp(x, 4.5 + y0)
+				pp(x + ln, 4.5 + y0)
+				pp(x + ln * 0.62, 4.5 + y0 + hh)
+				pp(x + ln * 0.22, 4.5 + y0 + hh * 0.7)
+				pfill(cc(P.flake, 0.15 + hash(i * 8.1) * 0.10))
+			end
+		end
+		line(10, 6.0 + y0, w - 10, 6.0 + y0, cc(P.ice, 0.05), 1.2)
+	end
+
+	--> ---------- Сосульки ----------
+	local function icicles(w, y0)
+		local cx = w * 0.5
+		for i = 0, 13 do
+			local x = 14 + hash(i * 5.7) * (w - 28)
+			if abs(x - cx) > 132 then
+				local ln = 2.2 + hash(i * 7.1) * 5.5
+				pp(x - 0.75, 5.0 + y0)
+				pp(x + 0.75, 5.0 + y0)
+				pp(x, 5.0 + y0 + ln)
+				pfill(cc(P.flake, 0.22))
+				line(x, 5.2 + y0, x, 4.8 + y0 + ln * 0.85, cc(P.ice, 0.16), 0.4)
+			end
+		end
+	end
+
+	--> ---------- Морозный папоротник ----------
+	local function fern(x, y, ang, ln, depth, col)
+		local x2, y2 = x + cos(ang) * ln, y + sin(ang) * ln
+		line(x, y, x2, y2, col, 0.5)
+		local t = 0.34
+		while t < 0.75 do
+			local bx, by = x + cos(ang) * ln * t, y + sin(ang) * ln * t
+			local sl = ln * 0.30 * (1.15 - t)
+			line(bx, by, bx + cos(ang + 1.12) * sl, by + sin(ang + 1.12) * sl, col, 0.45)
+			line(bx, by, bx + cos(ang - 1.08) * sl * 0.85, by + sin(ang - 1.08) * sl * 0.85, col, 0.45)
+			t = t + 0.19
+		end
+		if depth > 1 then
+			fern(x2, y2, ang - 0.55, ln * 0.55, depth - 1, col)
+			fern(x2, y2, ang + 0.48, ln * 0.48, depth - 1, col)
+		else
+			fcircle(x2, y2, 0.4, col, 6)
+		end
+	end
+
+	local function frost_rim(w, y0)
+		local mul = light and 1.45 or 1.0
+		local c0 = pk(P.frost[1], P.frost[2], P.frost[3], 0.13 * mul)
+		--> морозные усики по верхней кромке
+		for i = 0, 25 do
+			local x = 8 + hash(i * 2.7) * (w - 16)
+			if abs(x - w * 0.5) > 160 then
+				local ln = 2.0 + hash(i * 3.9) * 2.8
+				local a = (0.05 + hash(i * 5.1) * 0.075) * mul
+				local c = pk(P.frost[1], P.frost[2], P.frost[3], a)
+				line(x, 4.8 + y0, x + sin(hash(i * 6.1) * 2.4 - 1.2) * ln * 0.7, 4.8 + y0 + ln, c, 0.5)
+				if i % 4 == 0 then
+					line(x, 4.8 + y0, x - 1.4, 4.8 + y0 + ln * 0.6, c, 0.45)
+					line(x, 4.8 + y0, x + 1.6, 4.8 + y0 + ln * 0.52, c, 0.45)
+				end
+			end
+		end
+		--> филигрань в углах
+		for _, sgn in ipairs({1, -1}) do
+			local cx = sgn == 1 and 10 or (w - 10)
+			for j = 0, 2 do
+				local a0 = 0.24 + j * 0.30
+				local ln = 6 + hash(j * 3.3 + cx) * 5
+				local x1 = cx + sgn * cos(a0) * ln
+				local y1 = 4.8 + y0 + sin(a0) * ln
+				line(cx, 4.8 + y0, x1, y1, c0, 0.5)
+			end
+			if w >= 560 then
+				fern(cx, 5.4 + y0, sgn == 1 and 0.16 or (pi - 0.16), 9 + hash(cx * 4.1) * 6, 2,
+					pk(P.frost[1], P.frost[2], P.frost[3], 0.10 * mul))
+			end
+		end
+	end
+
+	--> ---------- Гирлянда ----------
+	local function garland(a, b, y0, seed)
+		local total = b - a
+		if total < 40 then return end
+		local n = max(1, floor(total / 168 + 0.5))
+		local L = total / n
+		local cols = (light and STYLES_L[cfg.style] or STYLES[cfg.style]) or STYLES.amber
+		local ncol = #cols
+		local glow = cfg.glow / 100
+		--> на светлой теме лампочки делаем чуть крупнее и плотнее
+		local la = light and 1.35 or 1.0
+		local bs = light and 1.30 or 1.0
+		for s = 0, n - 1 do
+			local x0 = a + s * L
+			local sag = 4.2 + hash(seed + s * 2.1) * 1.8
+			--> провод
+			pn = 0
+			for k = 0, 12 do
+				local u = k / 12
+				pp(x0 + L * u, y0 + sag * 4 * u * (1 - u))
+			end
+			pstroke(pk(P.wire[1], P.wire[2], P.wire[3], 0.02 + 0.06 * glow), 2.0)
+			pn = 0
+			for k = 0, 12 do
+				local u = k / 12
+				pp(x0 + L * u, y0 + sag * 4 * u * (1 - u))
+			end
+			pstroke(cc(P.wire, 0.42), 0.55)
+			--> лампочки
+			local cnt = max(2, floor(L / 14 + 0.5))
+			for j = 0, cnt - 1 do
+				local u = (j + 0.5) / cnt
+				local bx = x0 + L * u
+				local by = y0 + sag * 4 * u * (1 - u)
+				local ph = hash(seed + s * 7.7 + j * 3.3) * 6.28
+				local tw = 0.62 + 0.38 * sin(TT * (1.05 + 0.35 * hash(j * 2.1 + seed)) + ph)
+				local drop = 1.1 + 0.4 * hash(j * 4.9 + seed)
+				line(bx, by, bx, by + drop, cc(P.wire, 0.30), 0.45)
+				local cy = by + drop + 0.9
+				local col = cols[((j + s + seed) % ncol) + 1]
+				fcircle(bx, cy, 3.4 * bs, cc(col, min(1, 0.075 * glow * tw * la)), 10)
+				fcircle(bx, cy, 2.0 * bs, cc(col, min(1, 0.20 * glow * tw * la)), 10)
+				fcircle(bx, cy, 1.15 * bs, cc(col, min(1, (0.30 * tw + 0.60 * glow * tw) * la)), 8)
+				fcircle(bx, cy, 0.95 * bs, pk(min(1, col[1] + 0.28), min(1, col[2] + 0.28), min(1, col[3] + 0.28), 0.72 + 0.28 * tw), 8)
+				fcircle(bx - 0.26, cy - 0.26, 0.34, pk(1, 1, 1, 0.55 + 0.40 * tw), 6)
+				--> кристальная подвеска
+				if (j + s) % 6 == 2 then
+					local dy = cy + 2.1
+					pp(bx, dy)
+					pp(bx - 1.15, dy + 1.9)
+					pp(bx, dy + 3.7)
+					pp(bx + 1.15, dy + 1.9)
+					pfill(cc(P.ice, 0.20 + 0.14 * tw))
+				end
+			end
+			--> центральный кристалл провиса
+			local cx2 = x0 + L * 0.5
+			local cy2 = y0 + sag + 1.0
+			local tw2 = 0.6 + 0.4 * sin(TT * 1.3 + seed * 2 + s)
+			line(cx2, cy2 - 1.0, cx2, cy2 + 2.2, cc(P.wire, 0.30), 0.45)
+			pp(cx2, cy2 + 1.6)
+			pp(cx2 - 1.25, cy2 + 3.9)
+			pp(cx2, cy2 + 7.2)
+			pp(cx2 + 1.25, cy2 + 3.9)
+			pfill(cc(P.ice, 0.22 + 0.18 * tw2))
+			line(cx2, cy2 + 2.6, cx2, cy2 + 5.9, pk(1, 1, 1, 0.30 + 0.20 * tw2), 0.45)
+		end
+		--> якоря
+		crystal(a, y0 + 0.4, 1.9, cc(P.ice, light and 0.42 or 0.30), 0.3, 0.45)
+		crystal(b, y0 + 0.4, 1.9, cc(P.ice, light and 0.42 or 0.30), 0.3, 0.45)
+	end
+
+	--> ---------- Снег в шапке ----------
+	local function header_snow(w, y0, tw)
+		local cnt = floor(cfg.density * 0.55 + 0.5)
+		if cnt <= 0 then return end
+		local cx = w * 0.5
+		local span = w - 20
+		for i = 1, cnt do
+			local q = hash(i * 4.3)
+			local big = q > 0.68
+			local r, a
+			if big then
+				r = 1.1 + hash(i * 5.3) * 1.0
+				a = 0.22 + hash(i * 6.7) * 0.14
+			else
+				r = 0.40 + hash(i * 5.3) * 0.45
+				a = 0.16 + hash(i * 6.7) * 0.11
+			end
+			local x = 10 + ((hash(i * 2.9) * span + TT * (1.6 + 3.4 * hash(i * 7.7)) * cfg.speed) % span)
+			local y = 6.5 + y0 + ((hash(i * 3.7) * 26 + TT * (3.2 + 4.6 * hash(i * 8.9)) * cfg.speed) % 26)
+			local skip = false
+			if tw > 0 and x > cx - tw * 0.5 - 8 and x < cx + tw * 0.5 + 8 and y < 33 then skip = true end
+			if x < 40 and y > 13 and y < 34 then skip = true end
+			if not skip then
+				if big then
+					line(x - r, y, x + r, y, cc(P.flake, a * 0.9), 0.45)
+					line(x, y - r, x, y + r, cc(P.flake, a * 0.9), 0.45)
+					fcircle(x, y, 0.45, cc(P.flake, a), 6)
+				else
+					fcircle(x, y, r, cc(P.flake, a), 6)
+				end
+			end
+		end
+	end
+
+	--> ---------- Искры в шапке ----------
+	local function header_sparkles(w, y0, tw)
+		local cx = w * 0.5
+		for i = 0, 13 do
+			local x = 26 + hash(i * 7.3) * (w - 52)
+			if not (tw > 0 and x > cx - tw * 0.5 - 10 and x < cx + tw * 0.5 + 10) then
+				local y = 8 + y0 + hash(i * 9.1) * 8
+				local v = sin(TT * 2.0 + i * 1.7)
+				if v > 0.25 then
+					v = v * v
+					local r = (0.7 + hash(i * 3.7) * 1.2) * (0.5 + 0.5 * v)
+					local c = pk(1, 1, 1, 0.30 * v)
+					line(x - r, y, x + r, y, c, 0.5)
+					line(x, y - r, x, y + r, c, 0.5)
+				end
+			end
+		end
+	end
+
+	--> ---------- Шапка окна ----------
+	local function header_front(w, h, tw, opts)
+		local y0 = 0
+		local mini = false
+		local no_garland = false
+		if opts then
+			y0 = opts.top or 0
+			mini = opts.mini == true
+			no_garland = opts.no_garland == true
+		end
+		local tb = min(h, 40)
+		if mini then tb = min(h, (y0 or 0) + 34) end
+		A.x, A.y = ox + 4, oy + 2 + y0
+		B.x, B.y = ox + w - 4, oy + tb + y0
+		dl:PushClipRect(A, B, true)
+		local ok, e = pcall(function()
+			local cx = w * 0.5
+			local tl, tr
+			if tw and tw > 0 then
+				tl, tr = cx - tw * 0.5 - 26, cx + tw * 0.5 + 26
+			else
+				tl, tr = cx - 22, cx + 22
+			end
+			--> прохладная дымка шапки (плавный градиент без вертикальных швов)
+			local vtop = light and 0.18 or 0.12
+			A.x, A.y = ox + 10, oy + 5 + y0
+			B.x, B.y = ox + w - 10, oy + 19 + y0
+			dl:AddRectFilledMultiColor(A, B,
+				pk(P.veil[1], P.veil[2], P.veil[3], vtop),
+				pk(P.veil[1], P.veil[2], P.veil[3], vtop),
+				pk(P.veil[1], P.veil[2], P.veil[3], 0.03),
+				pk(P.veil[1], P.veil[2], P.veil[3], 0.03))
+			A.x, A.y = ox + 10, oy + 19 + y0
+			B.x, B.y = ox + w - 10, oy + 38 + y0
+			dl:AddRectFilledMultiColor(A, B,
+				pk(P.veil[1], P.veil[2], P.veil[3], 0.03),
+				pk(P.veil[1], P.veil[2], P.veil[3], 0.03), 0, 0)
+			--> стеклянная кромка
+			line(8, 4.8 + y0, w - 8, 4.8 + y0, pk(1, 1, 1, light and 0.34 or 0.10), 0.6)
+			line(8, 37.4 + y0, w - 8, 37.4 + y0, pk(1, 1, 1, light and 0.10 or 0.045), 0.5)
+			if cfg.frost and not mini then
+				snow_cap(w, y0)
+				frost_rim(w, y0)
+			end
+			if cfg.icicles then icicles(w, y0) end
+			if cfg.snow then header_snow(w, y0, tw or 0) end
+			if cfg.garland and not no_garland then
+				garland(16, tl, 5.2 + y0, 3)
+				garland(tr, w - 16, 5.2 + y0, 11)
+				--> кристаллы у заголовка
+				local bob = sin(TT * 1.3) * 0.35
+				if tl - 9 > 16 then
+					crystal(tl - 9, 18 + y0 + bob, 4.6, cc(P.ice, 0.72), TT * 0.18, 0.70)
+					sparkle(tl - 3, 13 + y0, 2.2, 1.1)
+				end
+				if tr + 9 < w - 16 then
+					crystal(tr + 9, 18 + y0 - bob, 4.6, cc(P.ice, 0.72), -TT * 0.18 + 0.7, 0.70)
+					sparkle(tr + 3, 13 + y0, 1.9, 2.3)
+				end
+			end
+			header_sparkles(w, y0, tw or 0)
+		end)
+		dl:PopClipRect()
+		if not ok then fail(e) end
+	end
+
+	--> ---------- Подвал ----------
+	local function footer_front(w, h)
+		if not cfg.frost then return end
+		local y = h - 38.6
+		line(10, y, w - 10, y, cc(P.frost, light and 0.22 or 0.10), 0.55)
+		for i = 0, 7 do
+			local x = 30 + hash(i * 6.1) * (w - 60)
+			local ln = 0.6 + hash(i * 7.3) * 1.2
+			pp(x - 0.55, y + 0.1)
+			pp(x + 0.55, y + 0.1)
+			pp(x, y + 0.1 + ln)
+			pfill(cc(P.flake, 0.14))
+		end
+		crystal(9, y + 3, 1.9, cc(P.ice, 0.24), 0.4, 0.45)
+		crystal(w - 9, y + 3, 1.9, cc(P.ice, 0.24), 0.4, 0.45)
+	end
+
+	--> ---------- Снежная кромка карточки ----------
+	local lip_parts = {0.30, 0.17, 0.08}
+	local lip_sides = {1, -1}
+	local function card_lip(px, py, sw, sh)
+		if not cfg.frost then return end
+		if sw < 180 or sh < 28 then return end
+		local sx, sy = ox, oy
+		ox, oy = 0, 0
+		A.x, A.y = px, py - 2
+		B.x, B.y = px + sw, py + 14
+		dl:PushClipRect(A, B, true)
+		local ok, e = pcall(function()
+			local a0 = light and 0.26 or 0.15
+			local seg = 16
+			local inner = sw - 20
+			for s = 0, seg - 1 do
+				local t0 = s / seg
+				local t1 = (s + 1) / seg
+				local k = sin(pi * (t0 + t1) * 0.5)
+				line(px + 10 + inner * t0, py + 0.7, px + 10 + inner * t1, py + 0.7,
+					pk(P.lip[1], P.lip[2], P.lip[3], a0 * k), 0.6)
+			end
+			--> осевшая снежная пыль
+			for k = 1, 3 do
+				local aa = a0 * lip_parts[k]
+				if aa > 0.006 then
+					local yy = py + 0.7 + k * 1.15
+					line(px + 24, yy, px + sw - 24, yy, pk(P.lip[1], P.lip[2], P.lip[3], aa), 0.6)
+				end
+			end
+			--> морозные усики по углам
+			for _, sg in ipairs(lip_sides) do
+				local cx = sg == 1 and (px + 13) or (px + sw - 13)
+				for j = 0, 2 do
+					local ln = 1.8 + hash(sg * 3.1 + j * 2.9 + py) * 2.4
+					line(cx, py + 0.7, cx + sg * ln * 0.72, py + 0.7 + ln,
+						pk(P.lip[1], P.lip[2], P.lip[3], a0 * 0.75), 0.5)
+				end
+			end
+			--> редкие снежинки на кромке
+			for i = 1, 2 do
+				local xx = px + 24 + hash(px * 0.7 + i * 3.7) * (sw - 48)
+				local rr = 0.8 + hash(i * 5.1 + py) * 0.7
+				fcircle(xx, py + 0.9, rr, cc(P.lip, a0 * 0.9), 6)
 			end
 		end)
-		if clip then dl:PopClipRect() end
-		if not ok then error(e, 0) end
+		dl:PopClipRect()
+		ox, oy = sx, sy
+		if not ok then fail(e) end
 	end
 
-	--> ================= ХВОЯ, БАНТЫ, ГИРЛЯНДЫ =================
-	--> Высота провисания гирлянды в точке x (n провисающих дуг между x0 и x1)
-	local function gy(x, x0, x1, n, y0, sag)
-		local L = (x1 - x0) / n
-		local d = x - x0
-		local k = min(n - 1, max(0, floor(d / L)))
-		local u = (d - k * L) / L
-		return y0 + sag * 4 * u * (1 - u)
-	end
-	--> Хвойная ветвь: ствол и пушистая хвоя
-	local function bough(x0, x1, y0, n, sag, seed)
-		local c1, c2, c3 = cc(P.pine1, 1), cc(P.pine2, 1), cc(P.pine3, 1)
-		local px, py
-		local st = max(2, floor((x1 - x0) / 9))
-		for k = 0, st do
-			local x = x0 + (x1 - x0) * k / st
-			local yy = gy(x, x0, x1, n, y0, sag)
-			if px then line(px, py, x, yy, c1, 2.6) end
-			px, py = x, yy
-		end
-		local m = max(2, floor((x1 - x0) / 3.4))
-		for k = 0, m do
-			local x = x0 + (x1 - x0) * k / m
-			local yy = gy(x, x0, x1, n, y0, sag)
-			local h = hash(k * 1.37 + seed)
-			local len = 3.2 + h * 2.4
-			local a = (k % 2 == 0) and (0.35 + h * 0.55) or (-0.35 - h * 0.55)
-			local dx, dy = sin(a) * len, cos(a) * len
-			line(x, yy, x + dx, yy + dy, (k % 3 == 0) and c3 or c2, 1.5)
-			if k % 4 == 1 then line(x, yy, x - dx * 0.8, yy + dy * 0.9, c2, 1.5) end
-		end
-	end
-	--> Хвойная гирлянда с ягодами, золотыми шариками и красными бантами в узлах
-
-	local function frost_corners(w, h)
-		local T = os.clock()
-		for i = 1, 18 do
-			local r = 6 + hash(i * 4.2) * 18
-			local ang = -0.2 + hash(i * 2.1) * 1.4
-			local px = 6 + cos(ang) * r * 0.15 + hash(i) * 8
-			local py = 6 + sin(ang) * r * 0.15 + hash(i * 3) * 6
-			fcircle(px, py, 0.8 + hash(i * 5) * 1.2, pk(0.85, 0.93, 1.00, 0.18 + 0.12 * sin(T + i)), 6)
-			fcircle(w - px, py, 0.8 + hash(i * 6) * 1.2, pk(0.85, 0.93, 1.00, 0.16 + 0.12 * sin(T + i * 1.3)), 6)
-		end
-	end
-
-		--> Тонкая гирлянда только из провода и огоньков (без хвои)
-	local function garland(x0, x1, y0, n, sag, seed)
-		local T = os.clock()
-		local cnt = max(8, floor((x1 - x0) / 15))
-		local wc = cc(P.wire, 0.80)
-		local drop = max(sag or 2.6, 2.2)
-		-- тонкий свисающий провод
-		local px, py
-		for k = 0, cnt do
-			local x = x0 + (x1 - x0) * k / cnt
-			local yy = gy(x, x0, x1, n, y0, drop)
-			if px then line(px, py, x, yy, wc, 1.2) end
-			px, py = x, yy
-		end
-		-- огоньки свисают с провода
-		for k = 0, cnt do
-			local x = x0 + (x1 - x0) * k / cnt
-			local yy = gy(x, x0, x1, n, y0, drop)
-			local swing = sin(T * 2.0 + k * 1.1 + seed) * 0.7
-			local col = LIGHTS[(k + seed) % #LIGHTS + 1]
-			local tw = 0.50 + 0.50 * (0.5 + 0.5 * sin(T * 3.4 + k * 1.8 + seed))
-			local hang = 2.0 + (k % 3) * 0.35
-			local bx, by = x + swing, yy + hang
-			line(x, yy, bx, by - 0.8, wc, 0.95)
-			fcircle(bx, by, 2.5, cc(col, 0.14 * tw), 12)
-			fcircle(bx, by, 1.55, cc(col, 0.32 * tw), 10)
-			fcircle(bx, by, 0.95, cc(col, 0.95 * tw), 8)
-			fcircle(bx - 0.35, by - 0.35, 0.42, pk(1, 1, 1, 0.88 * tw), 5)
-		end
-	end
-local function bulbs(a, b, x0, x1, y0, n, sag, seed)
-		local T = os.clock()
-		local cnt = max(1, floor((b - a) / 14))
-		local wc = cc(P.wire, 0.95)
-		for k = 0, cnt do
-			local x = a + (b - a) * k / cnt
-			local swing = sin(T * 2.2 + k * 1.1 + seed) * 0.8
-			local yy = gy(x, x0, x1, n, y0, sag) + 2.6
-			local col = LIGHTS[(k + seed) % #LIGHTS + 1]
-			local tw = 0.55 + 0.45 * (0.5 + 0.5 * sin(T * 3.4 + k * 1.7 + seed))
-			line(x, yy, x + swing, yy + 2.0, wc, 1.1)
-			local bx, by = x + swing, yy + 3.6
-			fcircle(bx, by, 5.2, cc(col, 0.10 * tw), 14)
-			fcircle(bx, by, 3.4, cc(col, 0.22 * tw), 12)
-			fcircle(bx, by, 1.85, cc(col, 0.95 * tw), 10)
-			fcircle(bx - 0.55, by - 0.55, 0.55, pk(1, 1, 1, 0.9 * tw), 5)
-		end
-	end
-	--> Ёлочный шар на ниточке, чуть покачивается
-	local function hang(x, y0, len, col, ph)
-		local T = os.clock()
-		local bx = x + sin(T * 1.5 + ph) * 1.5
-		local by = y0 + len
-		line(x, y0, bx, by - 3.4, cc(GOLD2, 0.95), 1)
-		frect(bx - 1.5, by - 4.0, bx + 1.5, by - 2.6, cc(GOLD, 1), 0.6)
-		fcircle(bx, by, 3.9, cc(col, 1), 12)
-		line(bx - 3.6, by + 0.4, bx + 3.6, by + 0.4, cc(GOLD, 0.9), 1)
-		fcircle(bx - 1.3, by - 1.3, 1.0, pk(1, 1, 1, 0.75), 6)
-	end
-	--> Пятиконечная звезда
-	local function star5(cx, cy, R, c)
-		local ox1, oy1, ix1, iy1
-		local pts = {}
-		for i = 0, 4 do
-			local ao = -pi / 2 + i * 2 * pi / 5
-			local ai = ao + pi / 5
-			pts[i * 2 + 1] = {cx + cos(ao) * R, cy + sin(ao) * R}
-			pts[i * 2 + 2] = {cx + cos(ai) * R * 0.42, cy + sin(ai) * R * 0.42}
-		end
-		for i = 1, 10 do
-			local a, b = pts[i], pts[i % 10 + 1]
-			ftri(cx, cy, a[1], a[2], b[1], b[2], c)
-		end
-	end
-	--> Маленькая снежинка-кристалл (иконка)
-	local function crystal(cx, cy, s, c, th)
-		for j = 0, 2 do
-			local an = pi / 6 + j * pi / 3
-			local dx, dy = cos(an) * s, sin(an) * s
-			line(cx - dx, cy - dy, cx + dx, cy + dy, c, th or 1.2)
-			local ex, ey = cos(an + pi / 2) * s * 0.28, sin(an + pi / 2) * s * 0.28
-			for sg = -1, 1, 2 do
-				local mx, my = cx + dx * 0.62 * sg, cy + dy * 0.62 * sg
-				line(mx - ex, my - ey, mx + ex, my + ey, c, th or 1.2)
-			end
-		end
-		fcircle(cx, cy, s * 0.14 + 0.4, c, 6)
-	end
-
-	--> ================= ИКОНКИ ВКЛАДОК (всё нарисовано) =================
-	local ICON = {}
-	--> Снежный ком с мягкой тенью справа-снизу
-	local function ball(x, y, r, seg)
-		fcircle(x, y, r, cc(P.shade, 1), seg)
-		fcircle(x - r * 0.10, y - r * 0.10, r * 0.88, cc(P.snow, 1), seg)
-		ring(x, y, r, cc(P.rim, 0.95), 1, seg)
-	end
-	--> Снеговик: шарф, шляпа, морковный нос, щёчки, улыбка из угольков
-	ICON.snowman = function(cx, cy, s)
-		local BR = cc(BRN, 1)
-		line(cx - 0.45 * s, cy + 0.35 * s, cx - 0.98 * s, cy + 0.02 * s, BR, 1.2)
-		line(cx - 0.80 * s, cy + 0.10 * s, cx - 0.92 * s, cy - 0.12 * s, BR, 1)
-		line(cx + 0.45 * s, cy + 0.35 * s, cx + 0.98 * s, cy + 0.06 * s, BR, 1.2)
-		line(cx + 0.82 * s, cy + 0.12 * s, cx + 0.94 * s, cy - 0.10 * s, BR, 1)
-		ball(cx, cy + 0.50 * s, 0.50 * s, 20)
-		ball(cx, cy - 0.36 * s, 0.34 * s, 16)
-		frect(cx - 0.42 * s, cy - 0.68 * s, cx + 0.42 * s, cy - 0.59 * s, cc(COAL, 1), 1)
-		frect(cx - 0.26 * s, cy - 1.06 * s, cx + 0.26 * s, cy - 0.65 * s, cc(COAL, 1), 1.5)
-		frect(cx - 0.26 * s, cy - 0.80 * s, cx + 0.26 * s, cy - 0.71 * s, cc(RED, 1), 0)
-		fcircle(cx - 0.12 * s, cy - 0.43 * s, 0.05 * s + 0.35, cc(COAL, 1), 6)
-		fcircle(cx + 0.12 * s, cy - 0.43 * s, 0.05 * s + 0.35, cc(COAL, 1), 6)
-		fcircle(cx - 0.22 * s, cy - 0.30 * s, 0.06 * s + 0.2, cc(PNK, 0.6), 6)
-		fcircle(cx + 0.22 * s, cy - 0.30 * s, 0.06 * s + 0.2, cc(PNK, 0.6), 6)
-		ftri(cx, cy - 0.36 * s, cx + 0.42 * s, cy - 0.30 * s, cx, cy - 0.26 * s, cc(ORG, 1))
-		for k = -1, 1 do
-			fcircle(cx + k * 0.09 * s, cy - 0.20 * s + (k * k) * 0.025 * s, 0.025 * s + 0.3, cc(COAL, 1), 4)
-		end
-		frect(cx - 0.31 * s, cy - 0.07 * s, cx + 0.31 * s, cy + 0.06 * s, cc(RED, 1), 2)
-		frect(cx + 0.13 * s, cy + 0.04 * s, cx + 0.28 * s, cy + 0.34 * s, cc(RED, 1), 1.5)
-		line(cx + 0.13 * s, cy + 0.14 * s, cx + 0.28 * s, cy + 0.14 * s, pk(1, 1, 1, 0.8), 1)
-		line(cx + 0.13 * s, cy + 0.24 * s, cx + 0.28 * s, cy + 0.24 * s, pk(1, 1, 1, 0.8), 1)
-		fcircle(cx, cy + 0.28 * s, 0.05 * s + 0.4, cc(COAL, 1), 6)
-		fcircle(cx, cy + 0.50 * s, 0.05 * s + 0.4, cc(COAL, 1), 6)
-		fcircle(cx, cy + 0.72 * s, 0.05 * s + 0.4, cc(COAL, 1), 6)
-	end
-	--> Ёлка с гирляндой, шарами и звездой
-	ICON.tree = function(cx, cy, s)
-		frect(cx - 0.12 * s, cy + 0.72 * s, cx + 0.12 * s, cy + 0.98 * s, cc(BRN, 1), 0)
-		ftri(cx, cy - 0.12 * s, cx - 0.98 * s, cy + 0.80 * s, cx + 0.98 * s, cy + 0.80 * s, cc(GRN2, 1))
-		ftri(cx, cy - 0.52 * s, cx - 0.76 * s, cy + 0.36 * s, cx + 0.76 * s, cy + 0.36 * s, cc(GRN, 1))
-		ftri(cx, cy - 0.90 * s, cx - 0.54 * s, cy - 0.10 * s, cx + 0.54 * s, cy - 0.10 * s, cc(GRN3, 1))
-		local G = cc(GOLD, 0.95)
-		line(cx - 0.70 * s, cy + 0.52 * s, cx + 0.62 * s, cy + 0.34 * s, G, 1)
-		line(cx - 0.50 * s, cy + 0.14 * s, cx + 0.44 * s, cy - 0.04 * s, G, 1)
-		line(cx - 0.30 * s, cy - 0.28 * s, cx + 0.24 * s, cy - 0.40 * s, G, 1)
-		fcircle(cx - 0.28 * s, cy + 0.58 * s, 0.10 * s + 0.3, cc(RED, 1), 8)
-		fcircle(cx + 0.34 * s, cy + 0.20 * s, 0.10 * s + 0.3, cc(GOLD, 1), 8)
-		fcircle(cx - 0.06 * s, cy + 0.14 * s, 0.09 * s + 0.3, cc(BLU, 1), 8)
-		fcircle(cx + 0.30 * s, cy + 0.62 * s, 0.09 * s + 0.3, cc(PNK, 1), 8)
-		fcircle(cx - 0.62 * s, cy + 0.72 * s, 0.08 * s + 0.3, cc(GOLD, 1), 8)
-		fcircle(cx + 0.04 * s, cy - 0.30 * s, 0.07 * s + 0.3, cc(RED, 1), 8)
-		fcircle(cx + 0.64 * s, cy + 0.70 * s, 0.08 * s + 0.3, cc(BLU, 1), 8)
-		fcircle(cx, cy - 0.98 * s, 0.34 * s + 0.6, cc(GOLD, 0.22), 10)
-		star5(cx, cy - 0.98 * s, 0.26 * s + 0.5, cc(GOLD, 1))
-	end
-	--> Подарок с крестом из ленты и пышным бантом
-	ICON.gift = function(cx, cy, s)
-		frect(cx - 0.72 * s, cy - 0.04 * s, cx + 0.72 * s, cy + 0.88 * s, cc(RED, 1), 1.5)
-		frect(cx - 0.72 * s, cy - 0.04 * s, cx - 0.52 * s, cy + 0.88 * s, pk(1, 1, 1, 0.14), 1.5)
-		frect(cx - 0.84 * s, cy - 0.40 * s, cx + 0.84 * s, cy - 0.02 * s, cc({0.95, 0.27, 0.30}, 1), 1.5)
-		frect(cx - 0.72 * s, cy - 0.02 * s, cx + 0.72 * s, cy + 0.08 * s, pk(0, 0, 0, 0.18), 0)
-		frect(cx - 0.13 * s, cy - 0.40 * s, cx + 0.13 * s, cy + 0.88 * s, cc(GOLD, 1), 0)
-		frect(cx - 0.72 * s, cy + 0.34 * s, cx + 0.72 * s, cy + 0.50 * s, cc(GOLD, 1), 0)
-		ring(cx - 0.27 * s, cy - 0.56 * s, 0.22 * s, cc(GOLD, 1), 1.4, 10)
-		ring(cx + 0.27 * s, cy - 0.56 * s, 0.22 * s, cc(GOLD, 1), 1.4, 10)
-		fcircle(cx, cy - 0.42 * s, 0.11 * s + 0.3, cc(GOLD2, 1), 8)
-	end
-	--> Колпак Деда Мороза
-	ICON.hat = function(cx, cy, s)
-		local WH, R = cc(P.snow, 1), cc(P.rim, 0.95)
-		pn = 0
-		pp(cx - 0.72 * s, cy + 0.42 * s)
-		pp(cx - 0.40 * s, cy - 0.10 * s)
-		pp(cx - 0.05 * s, cy - 0.50 * s)
-		pp(cx + 0.20 * s, cy - 0.58 * s)
-		pp(cx + 0.52 * s, cy - 0.15 * s)
-		pp(cx + 0.72 * s, cy + 0.42 * s)
-		pfill(cc(RED, 1))
-		ftri(cx + 0.20 * s, cy - 0.58 * s, cx + 0.62 * s, cy - 0.30 * s, cx + 0.52 * s, cy - 0.15 * s, cc(RED2, 1))
-		frect(cx - 0.86 * s, cy + 0.30 * s, cx + 0.84 * s, cy + 0.66 * s, WH, 0.18 * s)
-		A.x, A.y = ox + cx - 0.86 * s, oy + cy + 0.30 * s
-		B.x, B.y = ox + cx + 0.84 * s, oy + cy + 0.66 * s
-		dl:AddRect(A, B, R, 0.18 * s, nil, 1)
-		fcircle(cx + 0.30 * s, cy - 0.66 * s, 0.22 * s, WH, 12)
-		ring(cx + 0.30 * s, cy - 0.66 * s, 0.22 * s, R, 1, 12)
-	end
-	--> Леденец-трость
-	ICON.candy = function(cx, cy, s)
-		local pts, n = {}, 0
-		for k = 0, 4 do n = n + 1; pts[n] = {cx + 0.22 * s, cy + 0.92 * s - k * (1.2 * s / 4)} end
-		for k = 1, 5 do
-			local a = -pi * k / 5
-			n = n + 1
-			pts[n] = {cx - 0.10 * s + 0.32 * s * cos(a), cy - 0.28 * s + 0.32 * s * sin(a)}
-		end
-		n = n + 1; pts[n] = {cx - 0.42 * s, cy - 0.02 * s}
-		local th = 0.40 * s
-		local WH, R, RD = cc(P.snow, 1), cc(P.rim, 0.95), cc(RED, 1)
-		for i = 1, n - 1 do line(pts[i][1], pts[i][2], pts[i + 1][1], pts[i + 1][2], R, th + 2) end
-		for i = 1, n do fcircle(pts[i][1], pts[i][2], th * 0.5 + 1, R, 8) end
-		for i = 1, n - 1 do
-			if i % 2 == 1 then
-				line(pts[i][1], pts[i][2], pts[i + 1][1], pts[i + 1][2], WH, th)
-				fcircle(pts[i][1], pts[i][2], th * 0.5, WH, 8)
-				fcircle(pts[i + 1][1], pts[i + 1][2], th * 0.5, WH, 8)
-			end
-		end
-		for i = 1, n - 1 do
-			if i % 2 == 0 then line(pts[i][1], pts[i][2], pts[i + 1][1], pts[i + 1][2], RD, th) end
-		end
-	end
-	--> Колокольчик
-	ICON.bell = function(cx, cy, s)
-		local g, g2 = cc(GOLD, 1), cc(GOLD2, 1)
-		ring(cx, cy - 0.74 * s, 0.13 * s, g2, 1.2, 8)
-		pn = 0
-		pp(cx - 0.52 * s, cy + 0.22 * s)
-		pp(cx - 0.46 * s, cy - 0.22 * s)
-		pp(cx - 0.28 * s, cy - 0.52 * s)
-		pp(cx, cy - 0.64 * s)
-		pp(cx + 0.28 * s, cy - 0.52 * s)
-		pp(cx + 0.46 * s, cy - 0.22 * s)
-		pp(cx + 0.52 * s, cy + 0.22 * s)
-		pfill(g)
-		pn = 0
-		pp(cx - 0.86 * s, cy + 0.54 * s)
-		pp(cx - 0.52 * s, cy + 0.20 * s)
-		pp(cx + 0.52 * s, cy + 0.20 * s)
-		pp(cx + 0.86 * s, cy + 0.54 * s)
-		pfill(g)
-		frect(cx - 0.88 * s, cy + 0.50 * s, cx + 0.88 * s, cy + 0.60 * s, g2, 1)
-		fcircle(cx, cy + 0.72 * s, 0.15 * s + 0.2, g2, 8)
-		line(cx - 0.30 * s, cy - 0.34 * s, cx - 0.36 * s, cy + 0.10 * s, pk(1, 1, 0.85, 0.75), 1.2)
-		ftri(cx, cy - 0.46 * s, cx - 0.42 * s, cy - 0.70 * s, cx - 0.42 * s, cy - 0.28 * s, cc(RED, 1))
-		ftri(cx, cy - 0.46 * s, cx + 0.42 * s, cy - 0.70 * s, cx + 0.42 * s, cy - 0.28 * s, cc(RED, 1))
-		fcircle(cx, cy - 0.46 * s, 0.10 * s + 0.3, cc(RED2, 1), 8)
-	end
-	--> Снежинка
-	ICON.flake = function(cx, cy, s)
-		crystal(cx, cy, s, cc(light and {0.30, 0.52, 0.88} or P.flake, 1), 1.3)
-	end
-	--> Ёлочный шар
-	ICON.bauble = function(cx, cy, s)
-		frect(cx - 0.17 * s, cy - 0.72 * s, cx + 0.17 * s, cy - 0.50 * s, cc(GOLD, 1), 1)
-		ring(cx, cy - 0.82 * s, 0.14 * s, cc(GOLD2, 1), 1.2, 8)
-		fcircle(cx, cy + 0.14 * s, 0.62 * s, cc(RED, 1), 22)
-		line(cx - 0.55 * s, cy + 0.14 * s, cx + 0.55 * s, cy + 0.14 * s, cc(GOLD, 1), 1.4)
-		fcircle(cx - 0.28 * s, cy + 0.40 * s, 0.07 * s + 0.3, cc(GOLD, 1), 6)
-		fcircle(cx, cy + 0.48 * s, 0.07 * s + 0.3, cc(GOLD, 1), 6)
-		fcircle(cx + 0.28 * s, cy + 0.40 * s, 0.07 * s + 0.3, cc(GOLD, 1), 6)
-		blob(cx - 0.26 * s, cy - 0.14 * s, 0.15 * s, 0.09 * s, pk(1, 1, 1, 0.75))
-	end
-	--> Венок
-	ICON.wreath = function(cx, cy, s)
-		for k = 0, 15 do
-			local a = k * pi * 2 / 16
-			local g = (k % 2 == 0) and GRN or GRN3
-			fcircle(cx + cos(a) * 0.66 * s, cy + sin(a) * 0.66 * s, 0.24 * s + 0.2, cc(g, 1), 8)
-		end
-		for k = 0, 15 do
-			local a = k * pi * 2 / 16 + 0.2
-			fcircle(cx + cos(a) * 0.66 * s, cy + sin(a) * 0.66 * s, 0.16 * s, cc(GRN2, 1), 6)
-		end
-		fcircle(cx - 0.50 * s, cy - 0.42 * s, 0.10 * s + 0.3, cc(RED, 1), 6)
-		fcircle(cx - 0.40 * s, cy - 0.54 * s, 0.09 * s + 0.3, cc(RED, 1), 6)
-		fcircle(cx + 0.48 * s, cy - 0.40 * s, 0.10 * s + 0.3, cc(RED, 1), 6)
-		ftri(cx, cy + 0.66 * s, cx - 0.46 * s, cy + 0.38 * s, cx - 0.40 * s, cy + 0.98 * s, cc(RED, 1))
-		ftri(cx, cy + 0.66 * s, cx + 0.46 * s, cy + 0.38 * s, cx + 0.40 * s, cy + 0.98 * s, cc(RED, 1))
-		fcircle(cx, cy + 0.66 * s, 0.12 * s + 0.3, cc(RED2, 1), 8)
-	end
-	--> Варежка
-	ICON.mitten = function(cx, cy, s)
-		local WH, R = cc(P.snow, 1), cc(P.rim, 0.95)
-		frect(cx - 0.50 * s, cy - 0.62 * s, cx + 0.44 * s, cy + 0.42 * s, cc(RED, 1), 0.42 * s)
-		blob(cx - 0.56 * s, cy - 0.02 * s, 0.26 * s, 0.34 * s, cc(RED, 1))
-		frect(cx - 0.56 * s, cy + 0.30 * s, cx + 0.50 * s, cy + 0.76 * s, WH, 0.16 * s)
-		A.x, A.y = ox + cx - 0.56 * s, oy + cy + 0.30 * s
-		B.x, B.y = ox + cx + 0.50 * s, oy + cy + 0.76 * s
-		dl:AddRect(A, B, R, 0.16 * s, nil, 1)
-		local c = cc(P.snow, 1)
-		line(cx - 0.02 * s, cy - 0.40 * s, cx - 0.02 * s, cy + 0.04 * s, c, 1.1)
-		line(cx - 0.24 * s, cy - 0.18 * s, cx + 0.20 * s, cy - 0.18 * s, c, 1.1)
-		line(cx - 0.18 * s, cy - 0.34 * s, cx + 0.14 * s, cy - 0.02 * s, c, 1)
-		line(cx + 0.14 * s, cy - 0.34 * s, cx - 0.18 * s, cy - 0.02 * s, c, 1)
-	end
-	--> Звезда
-	ICON.star = function(cx, cy, s)
-		star5(cx, cy + 0.06 * s, s * 1.0 + 1.0, cc(GOLD2, 1))
-		star5(cx, cy + 0.06 * s, s * 0.92, cc(GOLD, 1))
-		fcircle(cx - 0.12 * s, cy - 0.16 * s, 0.10 * s + 0.3, pk(1, 1, 0.9, 0.85), 6)
-	end
-
-	--> Лист падуба (ромб с жилкой)
-	local function leaf(cx, cy, len, wid, a, c, vc)
-		local ca, sa = cos(a), sin(a)
-		local mx, my = cx + ca * len * 0.5, cy + sa * len * 0.5
-		local tx, ty = cx + ca * len, cy + sa * len
-		local px, py = -sa * wid * 0.5, ca * wid * 0.5
-		ftri(cx, cy, mx + px, my + py, tx, ty, c)
-		ftri(cx, cy, mx - px, my - py, tx, ty, c)
-		line(cx, cy, tx, ty, vc, 1)
-	end
-	--> Падуб: листья и красные ягоды
-	ICON.holly = function(cx, cy, s)
-		local g, g2, v = cc(GRN, 1), cc(GRN2, 1), cc(GRN3, 0.9)
-		leaf(cx, cy, 1.05 * s, 0.62 * s, pi * 1.18, g2, v)
-		leaf(cx, cy, 1.05 * s, 0.62 * s, pi * 1.82, g2, v)
-		leaf(cx, cy, 0.90 * s, 0.58 * s, pi * 0.62, g, v)
-		leaf(cx, cy, 0.90 * s, 0.58 * s, pi * 0.38, g, v)
-		leaf(cx, cy, 1.00 * s, 0.60 * s, pi * 1.50, g, v)
-		fcircle(cx - 0.20 * s, cy + 0.04 * s, 0.22 * s + 0.2, cc(RED, 1), 8)
-		fcircle(cx + 0.22 * s, cy + 0.00 * s, 0.22 * s + 0.2, cc(RED, 1), 8)
-		fcircle(cx + 0.02 * s, cy + 0.26 * s, 0.22 * s + 0.2, cc(RED2, 1), 8)
-		fcircle(cx - 0.26 * s, cy - 0.02 * s, 0.07 * s + 0.2, pk(1, 1, 1, 0.8), 4)
-		fcircle(cx + 0.16 * s, cy - 0.06 * s, 0.07 * s + 0.2, pk(1, 1, 1, 0.8), 4)
-	end
-	W.icons = ICON
-	--> Иконка по названию вкладки / окна
-	local TABICON = {
-		settings = 'snowman', cmd = 'tree', shpora = 'gift', dep = 'hat', sob = 'candy', reminder = 'bell',
-		stat = 'flake', music = 'bauble', rp_zona = 'wreath', actions = 'mitten', help = 'star',
-		smart_su = 'mitten', smart_ticket = 'candy', shpora_win = 'wreath', reminder_win = 'bell', fast = 'flake'
-	}
-	--> Иконки по бокам заголовка окна и ёлочные шары на ниточках за ними (xmin..xmax - допустимая область)
-	local function title(kind, cx, cy, tw, xmin, xmax)
-		local ic = ICON[TABICON[kind] or 'flake']
-		local bob = sin(os.clock() * 1.7) * 0.6
-		local isz, hsz = light and 6.4 or 8, light and 5.2 or 7
-		if tw <= 0 then
-			ic(cx, cy + bob, isz)
-			if cx - 34 > xmin then hang(cx - 34, 4, hsz, RED, 0.0) end
-			if cx + 34 < xmax then hang(cx + 34, 4, hsz, BLU, 1.7) end
-			return
-		end
-		local off = tw * 0.5 + 18
-		ic(cx - off, cy + bob, isz)
-		if TABICON[kind] == 'flake' then ICON.star(cx + off, cy - bob, isz) else ICON.flake(cx + off, cy - bob, isz) end
-		sparkle(cx - off + 12, cy - 9, 3.0, 1.0)
-		sparkle(cx + off - 11, cy + 8, 2.6, 2.2)
-		local lx, rx = cx - off - 20, cx + off + 20
-		if lx > xmin then hang(lx, 4, hsz, RED, 0.0) end
-		if rx < xmax then hang(rx, 4, hsz, BLU, 1.7) end
-	end
-
-	local function fail(e)
-		errs = errs + 1
-		if errs <= 3 then print('[Winter] ошибка оформления: ' .. tostring(e)) end
-	end
-	--> Устанавливает контекст рисования текущего окна
+	--> ---------- Контекст ----------
 	local function setup(opts)
+		pn = 0
 		dl = imgui.GetWindowDrawList()
 		local wp = imgui.GetWindowPos()
 		ox, oy = wp.x, wp.y
 		alpha = imgui.GetStyle().Alpha
 		local dark
-		if opts and opts.dark then dark = true else dark = not (setting and setting.cl == 'White') end
+		if opts and opts.dark ~= nil then
+			dark = opts.dark and true or false
+		else
+			dark = not (setting and setting.cl == 'White')
+		end
 		light = not dark
 		P = light and PL or PD
+		load_cfg()
+		TT = time_now()
 	end
 
 	--> ================= ПУБЛИЧНЫЕ ФУНКЦИИ =================
@@ -4740,14 +4918,26 @@ local function bulbs(a, b, x0, x1, y0, n, sag, seed)
 		local ok, e = pcall(function()
 			setup(opts)
 			W.ox, W.oy, W.w, W.h = ox, oy, w, h
-			W.top = (opts and opts.top) or 0
 			W.fr = imgui.GetFrameCount()
-			field(ox, oy + W.top, ox + w, oy + h, W.top > 0)
+			if not cfg.front then field() end
 			W.active = true
 		end)
 		if not ok then fail(e) end
 	end
+
 	function W.finish()
+		if W.active and W.enabled then
+			local ok, e = pcall(function()
+				setup()
+				if cfg.front then
+					--> снег поверх всего интерфейса
+					local fg = imgui.GetForegroundDrawList
+					dl = (type(fg) == 'function') and fg() or imgui.GetWindowDrawList()
+					field()
+				end
+			end)
+			if not ok then fail(e) end
+		end
 		W.active = false
 	end
 
@@ -4756,95 +4946,63 @@ local function bulbs(a, b, x0, x1, y0, n, sag, seed)
 		if not (W.enabled and W.active) then return end
 		if W.fr ~= imgui.GetFrameCount() then W.active = false return end
 		sw, sh = tonumber(sw), tonumber(sh)
-		if not (sw and sh and sw >= 180 and sh >= 28) then return end
+		px, py = tonumber(px), tonumber(py)
+		if not (sw and sh and px and py) then return end
 		local ok, e = pcall(function()
 			dl = imgui.GetWindowDrawList()
 			alpha = imgui.GetStyle().Alpha
-			field(px, py, px + sw, py + sh, true)
+			TT = time_now()
+			card_lip(px, py, sw, sh)
 		end)
 		if not ok then fail(e) end
 	end
 
-	--> Главное окно: шапка, подвал, иконка вкладки. tw - ширина заголовка в пикселях.
+	--> Главное окно: шапка, подвал. tw - ширина заголовка в пикселях.
 	function W.main_front(tab, tw)
 		if not (W.enabled and W.active) then return end
 		local ok, e = pcall(function()
 			setup()
-			field(ox + 6, oy + 4, ox + 842, oy + 36, true)
-			field(ox + 8, oy + 412, ox + 840, oy + 442, true)
-			frost_corners(848, 448)
-			local show_g = not setting or setting.winter_show_garland ~= false
-			A.x, A.y = ox + 8, oy + 3
-			B.x, B.y = ox + 840, oy + 36
-			dl:PushClipRect(A, B, true)
-			if show_g then
-				garland(20, 828, 5, 7, 2.4, 3)
-			end
-			title(tab, 424, 18, tw or 0, 300, 548)
-			if show_g then
-				ICON.holly(22, 16, light and 4.6 or 6.2)
-				sparkle(34, 10, 2.0, 0.4)
-				ICON.holly(826, 16, light and 4.4 or 6.0)
-				sparkle(814, 10, 1.8, 0.3)
-			end
-			dl:PopClipRect()
+			header_front(848, 448, tonumber(tw) or 0)
+			footer_front(848, 448)
 		end)
 		if not ok then fail(e) end
 	end
+
 	--> Главное окно при первом запуске (шапки и подвала нет)
 	function W.main_first()
 		if not (W.enabled and W.active) then return end
 		local ok, e = pcall(function()
 			setup()
-			frost_corners(848, 448)
-			if not setting or setting.winter_show_garland ~= false then
-				A.x, A.y = ox + 8, oy + 3
-				B.x, B.y = ox + 840, oy + 36
-				dl:PushClipRect(A, B, true)
-				garland(20, 828, 5, 7, 2.4, 5)
-				dl:PopClipRect()
-			end
+			header_front(848, 448, 0)
 		end)
 		if not ok then fail(e) end
 	end
-	--> Шапка обычного окна: tw - ширина заголовка (0 если заголовка нет), kind - ключ иконки.
+
+	--> Шапка обычного окна: tw - ширина заголовка (0 если заголовка нет)
 	function W.small_front(kind, w, h, tw, cy)
 		if not (W.enabled and W.active) then return end
 		local ok, e = pcall(function()
 			setup()
-			local n = max(2, floor(w / 135))
-			field(ox + 4, oy + 4, ox + w - 4, oy + 38, true)
-			frost_corners(w, min(h, 80))
-			local show_g = not setting or setting.winter_show_garland ~= false
-			if show_g then
-				A.x, A.y = ox + 8, oy + 3
-				B.x, B.y = ox + w - 8, oy + 36
-				dl:PushClipRect(A, B, true)
-				garland(16, w - 16, 5, n + 1, 2.2, 7)
-				dl:PopClipRect()
-			end
-			title(kind, w * 0.5, cy or 22, tw or 0, 50, w - 50)
+			header_front(w, h, tonumber(tw) or 0)
 		end)
 		if not ok then fail(e) end
 	end
-	--> Окна без шапки (плеер, быстрое меню, подсказка): хвойная гирлянда по верхней кромке
+
+	--> Окна без шапки (плеер, быстрое меню, подсказка)
 	function W.mini_front(w, h, opts)
 		if not (W.enabled and W.active) then return end
 		local ok, e = pcall(function()
 			setup(opts)
-			if opts and opts.no_garland then return end
-			if setting and setting.winter_show_garland == false then return end
-			local top = ((opts and opts.top) or 0) + 2.6
-			local n = max(2, floor(w / 120))
-			A.x, A.y = ox + 6, oy + 2
-			B.x, B.y = ox + w - 6, oy + math.min(h - 4, top + 28)
-			dl:PushClipRect(A, B, true)
-			garland(14, w - 14, top, n, 2.0, 9)
-			dl:PopClipRect()
+			header_front(w, h, 0, {
+				top = ((opts and opts.top) or 0) + 2.6,
+				mini = true,
+				no_garland = (opts and opts.no_garland) == true
+			})
 		end)
 		if not ok then fail(e) end
 	end
-	--> Звезда над значком активной вкладки (вызывается внутри дочернего окна значка)
+
+	--> Звезда над значком активной вкладки
 	function W.tab_cap(gw, active, anb)
 		if not (W.enabled and W.active and active) then return end
 		if anb and anb ~= 7 then return end
@@ -4854,15 +5012,22 @@ local function bulbs(a, b, x0, x1, y0, n, sag, seed)
 			local wp = imgui.GetWindowPos()
 			ox, oy = wp.x, wp.y
 			alpha = imgui.GetStyle().Alpha
+			TT = time_now()
 			local cx = 4 + (gw or 17) * 0.5
-			local sc = 1 + 0.12 * sin(os.clock() * 3)
-			star5(cx, 3.8, 2.9 * sc, cc(GOLD2, 1))
-			star5(cx, 3.8, 2.35 * sc, cc(GOLD, 1))
-			fcircle(cx, 3.8, 5.5 * sc, pk(1.00, 0.85, 0.30, 0.12), 10)
-			sparkle(cx - 6, 2.5, 1.6, 0.5)
-			sparkle(cx + 6, 2.5, 1.6, 0.5)
-			sparkle(cx + 6.5, 2.6, 2.4, 0.9, GOLD)
-			sparkle(cx - 6.5, 5.2, 2.0, 2.4, GOLD)
+			local sc = 1 + 0.10 * sin(TT * 2.6)
+			fcircle(cx, 3.6, 6.0 * sc, cc(P.ice, 0.10), 12)
+			pp(cx, 3.6 - 3.2 * sc)
+			pp(cx + 1.05 * sc, 3.6)
+			pp(cx, 3.6 + 3.2 * sc)
+			pp(cx - 1.05 * sc, 3.6)
+			pfill(pk(1.00, 0.86, 0.42, 0.95))
+			pp(cx, 3.6 - 2.0 * sc)
+			pp(cx + 0.60 * sc, 3.6)
+			pp(cx, 3.6 + 2.0 * sc)
+			pp(cx - 0.60 * sc, 3.6)
+			pfill(pk(1.00, 0.97, 0.82, 1.0))
+			sparkle(cx - 5.5, 2.2, 1.5, 0.5)
+			sparkle(cx + 5.5, 2.4, 1.3, 1.8)
 		end)
 		dl, ox, oy = sdl, sox, soy
 		if not ok then fail(e) end
@@ -5662,34 +5827,269 @@ function music_match(hay, needle) --> Поиск без учёта регистра (кириллица и лати
 	return lower(hay):find(lower(needle), 1, true) ~= nil
 end
 
+function hitmo_text(value)
+	if type(value) ~= 'string' or value == '' then return '' end
+	local ok, decoded = pcall(function() return u8:decode(value) end)
+	return ok and decoded or value
+end
+
+function hitmo_time(seconds)
+	seconds = tonumber(seconds)
+	if not seconds or seconds <= 0 then return '' end
+	seconds = math.floor(seconds)
+	return string.format('%02d:%02d', math.floor(seconds / 60), seconds % 60)
+end
+
+function hitmo_urlencode(value, plus)
+	value = tostring(value or '')
+	local out = {}
+	for i = 1, #value do
+		local byte = value:byte(i)
+		local char = value:sub(i, i)
+		if (byte >= 48 and byte <= 57) or (byte >= 65 and byte <= 90) or (byte >= 97 and byte <= 122)
+			or char == '-' or char == '.' or char == '_' or char == '~' then
+			out[#out + 1] = char
+		elseif char == ' ' then
+			out[#out + 1] = plus and '+' or '%20'
+		else
+			out[#out + 1] = string.format('%%%02X', byte)
+		end
+	end
+	return table.concat(out)
+end
+
+function hitmo_unescape_js(value)
+	local out = {}
+	local i, len = 1, #value
+	while i <= len do
+		local c = value:sub(i, i)
+		if c == '\\' and i < len then
+			local next_char = value:sub(i + 1, i + 1)
+			if next_char == '"' or next_char == '\\' then
+				out[#out + 1] = next_char
+				i = i + 2
+			else
+				out[#out + 1] = c
+				i = i + 1
+			end
+		else
+			out[#out + 1] = c
+			i = i + 1
+		end
+	end
+	return table.concat(out)
+end
+
+function hitmo_extract_array(text, start)
+	local depth, i, len = 1, start, #text
+	local in_string = false
+	while i <= len and depth > 0 do
+		local c = text:sub(i, i)
+		if c == '\\' then
+			if text:sub(i + 1, i + 1) == '"' then in_string = not in_string end
+			i = i + 2
+		else
+			if c == '"' then
+				in_string = not in_string
+			elseif not in_string then
+				if c == '[' then depth = depth + 1
+				elseif c == ']' then depth = depth - 1 end
+			end
+			i = i + 1
+		end
+	end
+	if depth ~= 0 then return nil end
+	return text:sub(start, i - 2)
+end
+
+function hitmo_parse_new(html)
+	if type(html) ~= 'string' or html == '' then return nil end
+	local chunks = {}
+	for chunk in html:gmatch('self%.__next_f%.push%(%[1,"(.-)"%]%)%s*</script>') do
+		chunks[#chunks + 1] = chunk
+	end
+	if #chunks == 0 then return nil end
+	local payload = table.concat(chunks)
+	local list_marker = '\\"list\\":{'
+	local items_marker = '\\"items\\":['
+	local list_pos = payload:find(list_marker, 1, true)
+	if not list_pos then return nil end
+	local items_pos = payload:find(items_marker, list_pos, true)
+	if not items_pos then return nil end
+	local raw = hitmo_extract_array(payload, items_pos + #items_marker)
+	if not raw then return nil end
+	local ok, items = pcall(json.decode, '[' .. hitmo_unescape_js(raw) .. ']')
+	if not ok or type(items) ~= 'table' then return nil end
+	local result = {}
+	for i = 1, #items do
+		local item = items[i]
+		if type(item) == 'table' then
+			local link = type(item.play) == 'string' and item.play or ''
+			if link == '' and type(item.download) == 'string' then link = item.download end
+			local image = ''
+			if type(item.imageInfo) == 'table' and type(item.imageInfo.imageUrl) == 'string' then
+				image = item.imageInfo.imageUrl
+			elseif type(item.artistCollection) == 'table' and type(item.artistCollection.imageInfo) == 'table' and type(item.artistCollection.imageInfo.imageUrl) == 'string' then
+				image = item.artistCollection.imageInfo.imageUrl
+			end
+			result[#result + 1] = {
+				link = link,
+				artist = hitmo_text(item.artist),
+				name = hitmo_text(item.title),
+				time = hitmo_time(item.duration),
+				image = image
+			}
+		end
+	end
+	return result
+end
+
+function hitmo_parse_old(html, page)
+	if type(html) ~= 'string' or html == '' then return nil end
+	local text = hitmo_text(html)
+	if text:find('По вашему запросу ничего не найдено', 1, true) then return {} end
+	if page == 1 then
+		local pages = {['1'] = true}
+		if text:find('/search/start/48', 1, true) then pages['48'] = true end
+		if text:find('/search/start/96', 1, true) then pages['96'] = true end
+		if text:find('/search/start/144', 1, true) then pages['144'] = true end
+		local count = 0
+		for _ in pairs(pages) do count = count + 1 end
+		qua_page = count
+	end
+	local links, artists, names, times, images = {}, {}, {}, {}, {}
+	for href in text:gmatch('href="(.-)" class=') do
+		if href:find('/get/music/', 1, true) then
+			local link = href
+			if link:sub(1, 1) == '/' then link = 'https://' .. site_link .. link end
+			local track = link:match('(.+)%.mp3')
+			if track then links[#links + 1] = track .. '.mp3' end
+		end
+	end
+	if #links == 0 then return nil end
+	for value in text:gmatch('"track%_%_title"%>(.-)%</div') do
+		local name = value:gsub('^%s*(.-)%s*$', '%1')
+		names[#names + 1] = name ~= '' and name or 'Неизвестно'
+	end
+	for value in text:gmatch('"track%_%_desc"%>(.-)%</div') do
+		local artist = value:gsub('^%s*(.-)%s*$', '%1')
+		artists[#artists + 1] = artist ~= '' and artist or 'Неизвестно'
+	end
+	for value in text:gmatch('"track%_%_fulltime"%>(.-)%</div') do
+		local duration = value:match('(.+)')
+		if duration then times[#times + 1] = duration end
+	end
+	for value in text:gmatch('"track%_%_img" style="background%-image: url%(\'(.-)\'%)%;"%>%</div%>') do
+		if value ~= '' then images[#images + 1] = value end
+	end
+	local result = {}
+	local count = math.max(#links, #artists, #names, #times, #images)
+	for i = 1, count do
+		result[i] = {
+			link = links[i] or '',
+			artist = artists[i] or '',
+			name = names[i] or '',
+			time = times[i] or '',
+			image = images[i] or ''
+		}
+	end
+	return result
+end
+
 function find_track_link(search_text, page) --> Поиск песни в интернете
 	mus.search_token = (mus.search_token or 0) + 1
 	local search_token = mus.search_token
+	page = page or 1
 	debug_log('search hitmotop q=%s page=%s', tostring(search_text), tostring(page))
-	local tracks_repsone = {
-		link = {},
-		artist = {},
-		name = {},
-		time = {},
-		image = {}
-	}
-	local page_ssl = ''
-	local all_page_num = 1
-	local page_table = {'1'}
 	current_page = page
-	local function remove_duplicates(array)
-		local seen = {}
-		local result = {}
 
-		for _, value in ipairs(array) do
-			if not seen[value] then
-				table.insert(result, value)
-				seen[value] = true
-			end
-		end
+	local query = mus.search or search_text or ''
+	local encoded = hitmo_urlencode(query, true)
+	local path_query = hitmo_urlencode(query, false)
+	local finished = false
+	local pending = 0
+	local grace_started = false
 
-		return result
+	local function finish_with(list, source)
+		if finished or search_token ~= mus.search_token then return end
+		finished = true
+		tracks = list
+		debug_log('search hitmotop source=%s tracks=%d', tostring(source), #list)
 	end
+
+	local function finish_empty()
+		if finished or search_token ~= mus.search_token then return end
+		finished = true
+		tracks = {{link = '', artist = 'Ошибка404', name = '', time = '', image = ''}}
+		debug_log('search hitmotop empty')
+	end
+
+	local function empty_source(source)
+		if finished or search_token ~= mus.search_token then return end
+		pending = pending - 1
+		debug_log('search hitmotop %s empty pending=%d', tostring(source), pending)
+		if pending <= 0 then
+			finish_empty()
+			return
+		end
+		if not grace_started then
+			grace_started = true
+			lua_thread.create(function()
+				wait(4000)
+				if not finished and search_token == mus.search_token then finish_empty() end
+			end)
+		end
+	end
+
+	local function fail_source(source, err)
+		if finished or search_token ~= mus.search_token then return end
+		pending = pending - 1
+		debug_log('search hitmotop %s fail: %s', tostring(source), tostring(err))
+		if pending <= 0 then finish_empty() end
+	end
+
+	local function accept_source(source, list)
+		if finished or search_token ~= mus.search_token then return end
+		if type(list) ~= 'table' then
+			debug_log('search hitmotop %s parse failed', tostring(source))
+			empty_source(source)
+			return
+		end
+		if #list == 0 then
+			empty_source(source)
+			return
+		end
+		finish_with(list, source)
+	end
+
+	local headers = {
+		['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+		['Accept-Language'] = 'ru-RU,ru;q=0.9'
+	}
+	if page == 1 then
+		pending = 2
+		asyncHttpRequest('GET', 'https://music.hitmo.net/search/' .. path_query .. '?type=tracks', {
+			headers = headers,
+			timeout = 15
+		},
+			function(response)
+				if search_token ~= mus.search_token or finished then return end
+				local status = response and tonumber(response.status_code)
+				if status == 404 then
+					empty_source('new')
+				elseif status == 200 and response.text then
+					accept_source('new', hitmo_parse_new(response.text))
+				else
+					fail_source('new', status or 'no response')
+				end
+			end,
+			function(err)
+				fail_source('new', err)
+			end)
+	else
+		pending = 1
+	end
+	local page_ssl = ''
 	if page == 2 then
 		page_ssl = '/start/48'
 	elseif page == 3 then
@@ -5697,84 +6097,27 @@ function find_track_link(search_text, page) --> Поиск песни в интернете
 	elseif page == 4 then
 		page_ssl = '/start/144'
 	end
-	
-	asyncHttpRequest('GET', 'https://' .. site_link .. '/search' .. page_ssl .. '?q=' .. urlencode(mus.search), {
-		headers = {
-			['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
-			['Accept-Language'] = 'ru-RU,ru;q=0.9',
-			['Referer'] = 'https://' .. site_link .. '/'
-		},
-		timeout = 15
+	local old_headers = {
+		['User-Agent'] = headers['User-Agent'],
+		['Accept-Language'] = headers['Accept-Language'],
+		['Referer'] = 'https://' .. site_link .. '/'
+	}
+	asyncHttpRequest('GET', 'https://' .. site_link .. '/search' .. page_ssl .. '?q=' .. encoded, {
+		headers = old_headers,
+		timeout = page == 1 and 8 or 15
 	},
 		function(response)
-			if search_token ~= mus.search_token then return end
-			if page == 1 then
-				for link in string.gmatch(u8:decode(response.text), '/search/start/48') do
-					table.insert(page_table, '48')
-				end
-				for link in string.gmatch(u8:decode(response.text), '/search/start/96') do
-					table.insert(page_table, '96')
-				end
-				for link in string.gmatch(u8:decode(response.text), '/search/start/144') do
-					table.insert(page_table, '144')
-				end
-				local new_arr = remove_duplicates(page_table)
-				qua_page = #new_arr
+			if search_token ~= mus.search_token or finished then return end
+			local status = response and tonumber(response.status_code)
+			if status == 200 and response.text then
+				accept_source('old', hitmo_parse_old(response.text, page))
+			else
+				fail_source('old', status or 'no response')
 			end
-			for link in string.gmatch(u8:decode(response.text), 'По вашему запросу ничего не найдено') do
-				tracks_repsone.link[1] = 'Ошибка404'
-				tracks_repsone.artist[1] = 'Ошибка404'
-			end
-			for link in string.gmatch(u8:decode(response.text), 'href="(.-)" class=') do
-				if link:find('/get/music/') then
-					if link:sub(1, 1) == '/' then
-						link = 'https://' .. site_link .. link
-					end
-					track = link:match('(.+).mp3')
-					table.insert(tracks_repsone.link, track .. '.mp3')
-				end
-			end
-			for link in string.gmatch(u8:decode(response.text), '"track%_%_title"%>(.-)%</div') do
-				local nametrack = link:match('(.+)')
-				nametrack = nametrack and nametrack:gsub('^%s*(.-)%s*$', '%1') or 'Неизвестно'
-				table.insert(tracks_repsone.name, nametrack)
-			end
-
-			for link in string.gmatch(u8:decode(response.text), '"track%_%_desc"%>(.-)%</div') do
-				local artist = link:match('(.+)')
-				artist = artist and artist:gsub('^%s*(.-)%s*$', '%1') or 'Неизвестно'
-				table.insert(tracks_repsone.artist, artist)
-			end
-			for link in string.gmatch(u8:decode(response.text), '"track%_%_fulltime"%>(.-)%</div') do
-				if link:find('(.+)') then
-					table.insert(tracks_repsone.time, link:match('(.+)'))
-				end
-			end
-			for link in string.gmatch(u8:decode(response.text), '"track%_%_img" style="background%-image: url%(\'(.-)\'%)%;"%>%</div%>') do
-				if link:find('(.+)') then
-					table.insert(tracks_repsone.image, link:match('(.+)'))
-				end
-			end
-			
-			local track_list = {}
-			local count = math.max(#tracks_repsone.link, #tracks_repsone.artist, #tracks_repsone.name, #tracks_repsone.time, #tracks_repsone.image)
-
-			for i = 1, count do
-				track_list[i] = {
-					link = tracks_repsone.link[i] or '',
-					artist = tracks_repsone.artist[i] or '',
-					name = tracks_repsone.name[i] or '',
-					time = tracks_repsone.time[i] or '',
-					image = tracks_repsone.image[i] or ''
-				}
-			end
-			
-			tracks = track_list
-			debug_log('search hitmotop tracks=%d', #track_list)
 		end,
 		function(err)
-		print(err)
-	end)
+			fail_source('old', err)
+		end)
 end
 
 -- Яндекс Музыка: вход по Device Flow, поиск и подписанные ссылки на mp3
@@ -7585,6 +7928,45 @@ function gui.EndReveal()
 end
 
 local winter_settings_anim = nil
+local winter_save_pending = false
+local winter_style_list = {
+	{'ice', 'Хрусталь', {0.62, 0.85, 1.00}},
+	{'amber', 'Янтарь', {1.00, 0.74, 0.32}},
+	{'noel', 'Праздник', {1.00, 0.40, 0.46}}
+}
+local function winter_style_chip(id, x, y, w, h, title, dot, active)
+	imgui.SetCursorPos(imgui.ImVec2(x, y))
+	local p = imgui.GetCursorScreenPos()
+	local clicked = imgui.InvisibleButton(id, imgui.ImVec2(w, h))
+	local hovered = imgui.IsItemHovered()
+	local dl = imgui.GetWindowDrawList()
+	local bg
+	if active then
+		bg = cl.def
+	elseif hovered then
+		bg = imgui.GetStyle().Colors[imgui.Col.FrameBgHovered]
+	else
+		bg = imgui.GetStyle().Colors[imgui.Col.FrameBg]
+	end
+	dl:AddRectFilled(p, imgui.ImVec2(p.x + w, p.y + h), imgui.GetColorU32Vec4(bg), 6, 15)
+	dl:AddRect(imgui.ImVec2(p.x + 0.5, p.y + 0.5), imgui.ImVec2(p.x + w - 0.5, p.y + h - 0.5), imgui.GetColorU32Vec4(cl.line), 6, 15, 1)
+	imgui.PushFont(font[2])
+	local ts = imgui.CalcTextSize(u8(title))
+	imgui.PopFont()
+	local group = 7 + 8 + ts.x
+	local gx = x + (w - group) * 0.5
+	local cy = p.y + h * 0.5
+	dl:AddCircleFilled(imgui.ImVec2(p.x + (w - group) * 0.5 + 3, cy), 3.6, imgui.GetColorU32Vec4(imgui.ImVec4(dot[1], dot[2], dot[3], 1.00)), 12)
+	dl:AddCircleFilled(imgui.ImVec2(p.x + (w - group) * 0.5 + 2.2, cy - 0.9), 1.1, imgui.GetColorU32Vec4(imgui.ImVec4(1.00, 1.00, 1.00, 0.55)), 8)
+	if active then
+		imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(1.00, 1.00, 1.00, 1.00))
+	end
+	gui.Text(gx + 15, y + (h - ts.y) * 0.5, title, font[2])
+	if active then
+		imgui.PopStyleColor(1)
+	end
+	return clicked
+end
 local members_settings_anim = nil
 function hall.settings()
 	gui.Draw({4, 39}, {220, 369}, cl.tab, 0, 15)
@@ -10809,8 +11191,7 @@ function hall.settings()
 		local winter_on = (setting.winter_enabled == true)
 		if winter_settings_anim == nil then winter_settings_anim = winter_on and 1 or 0 end
 		winter_settings_anim = math.max(0, math.min(1, winter_settings_anim + (winter_on and 1 or -1) * anim * 6))
-		local snow_progress = gui.RevealProgress('winter_snow_settings', setting.winter_show_snow ~= false)
-		local winter_details_height = (28 + 32 * snow_progress) * winter_settings_anim
+		local winter_details_height = 160 * winter_settings_anim
 		new_draw(315, 35 + winter_details_height)
 		gui.Text(26, 324, 'Зимнее оформление', font[3])
 		imgui.SetCursorPos(imgui.ImVec2(561, 319))
@@ -10822,39 +11203,113 @@ function hall.settings()
 		if winter_details_height > 0 then
 			imgui.SetCursorPos(imgui.ImVec2(16, 344))
 			imgui.BeginChild('##winter_settings_details', imgui.ImVec2(586, winter_details_height), false, imgui.WindowFlags.NoScrollbar + imgui.WindowFlags.NoScrollWithMouse)
-			local slide_y = -12 * (1 - winter_settings_anim)
-			gui.Text(10, 4 + slide_y, 'Снег', font[3])
-			imgui.SetCursorPos(imgui.ImVec2(54, slide_y))
-			if gui.Switch(u8'##w_snow_on', setting.winter_show_snow ~= false) then
+			local slide_y = -14 * (1 - winter_settings_anim)
+			local y1, y2, y3, y4, y5 = slide_y, 34 + slide_y, 66 + slide_y, 98 + slide_y, 130 + slide_y
+
+			--> Строка 1: быстрые переключатели
+			gui.Text(10, y1 + 4, 'Снег', font[3])
+			imgui.SetCursorPos(imgui.ImVec2(52, y1))
+			if gui.Switch(u8'##winter_snow_on', setting.winter_show_snow ~= false) then
 				setting.winter_show_snow = not (setting.winter_show_snow ~= false)
 				save(true)
 			end
-			gui.Text(104, 4 + slide_y, 'Гирлянда', font[3])
-			imgui.SetCursorPos(imgui.ImVec2(184, slide_y))
-			if gui.Switch(u8'##w_gar_on', setting.winter_show_garland ~= false) then
+			gui.Text(150, y1 + 4, 'Гирлянда', font[3])
+			imgui.SetCursorPos(imgui.ImVec2(216, y1))
+			if gui.Switch(u8'##winter_garland_on', setting.winter_show_garland ~= false) then
 				setting.winter_show_garland = not (setting.winter_show_garland ~= false)
 				save(true)
 			end
+			gui.Text(330, y1 + 4, 'Мороз', font[3])
+			imgui.SetCursorPos(imgui.ImVec2(384, y1))
+			if gui.Switch(u8'##winter_frost_on', setting.winter_frost ~= false) then
+				setting.winter_frost = not (setting.winter_frost ~= false)
+				save(true)
+			end
+			gui.Text(446, y1 + 4, 'Сосульки', font[3])
+			imgui.SetCursorPos(imgui.ImVec2(516, y1))
+			if gui.Switch(u8'##winter_icicles_on', setting.winter_show_icicles ~= false) then
+				setting.winter_show_icicles = not (setting.winter_show_icicles ~= false)
+				save(true)
+			end
 
-			if gui.BeginReveal(snow_progress, 28 + slide_y, 32, 586) then
-				gui.Text(10, 36 + slide_y, 'Кол-во', font[3])
-				local ns = gui.SliderBar('##winter_snow', tonumber(setting.winter_snow) or 45, 10, 120, 160, {69, 30 + slide_y})
-				if ns and math.floor(ns + 0.5) ~= math.floor((setting.winter_snow or 45) + 0.5) then
-					setting.winter_snow = math.floor(ns + 0.5)
-					save(true)
-				end
-				gui.Text(244, 36 + slide_y, tostring(math.floor(setting.winter_snow or 45)), font[3])
-				gui.Text(284, 36 + slide_y, 'Скорость', font[3])
-				local sp = gui.SliderBar('##winter_spd', (tonumber(setting.winter_speed) or 0.85) * 100, 30, 200, 160, {359, 30 + slide_y})
-				if sp then
-					local nv = math.floor(sp + 0.5) / 100
-					if math.abs(nv - (setting.winter_speed or 0.85)) > 0.005 then
-						setting.winter_speed = nv
+			--> Строка 2: стиль гирлянды
+			gui.Text(10, y2 + 9, 'Стиль', font[3])
+			local cur_style = setting.winter_garland_style
+			if cur_style ~= 'ice' and cur_style ~= 'amber' and cur_style ~= 'noel' then cur_style = 'amber' end
+			for i = 1, #winter_style_list do
+				local st = winter_style_list[i]
+				if winter_style_chip(u8('##winter_style_' .. st[1]), 64 + (i - 1) * 160, y2 + 2, 150, 26, st[2], st[3], cur_style == st[1]) then
+					if cur_style ~= st[1] then
+						setting.winter_garland_style = st[1]
 						save(true)
 					end
 				end
-				gui.Text(534, 36 + slide_y, string.format('x%.2f', setting.winter_speed or 0.85), font[3])
-				gui.EndReveal()
+			end
+
+			--> Строка 3: плотность и скорость
+			gui.Text(10, y3 + 6, 'Плотность', font[3])
+			local winter_ns = gui.SliderBar('##winter_density', tonumber(setting.winter_snow) or 45, 0, 100, 160, {69, y3})
+			if winter_ns then
+				local nv = math.floor(winter_ns + 0.5)
+				if nv ~= math.floor((tonumber(setting.winter_snow) or 45) + 0.5) then
+					setting.winter_snow = nv
+					winter_save_pending = true
+				end
+			end
+			gui.Text(244, y3 + 6, tostring(math.floor(tonumber(setting.winter_snow) or 45)), font[3])
+			gui.Text(284, y3 + 6, 'Скорость', font[3])
+			local winter_sp = gui.SliderBar('##winter_speed', (tonumber(setting.winter_speed) or 0.9) * 100, 20, 200, 160, {350, y3})
+			if winter_sp then
+				local nv = math.floor(winter_sp + 0.5) / 100
+				if math.abs(nv - (tonumber(setting.winter_speed) or 0.9)) > 0.004 then
+					setting.winter_speed = nv
+					winter_save_pending = true
+				end
+			end
+			gui.Text(520, y3 + 6, string.format('x%.2f', tonumber(setting.winter_speed) or 0.9), font[3])
+
+			--> Строка 4: ветер и свечение
+			gui.Text(10, y4 + 6, 'Ветер', font[3])
+			local winter_wd = gui.SliderBar('##winter_wind', tonumber(setting.winter_wind) or 45, 0, 100, 160, {69, y4})
+			if winter_wd then
+				local nv = math.floor(winter_wd + 0.5)
+				if nv ~= math.floor((tonumber(setting.winter_wind) or 45) + 0.5) then
+					setting.winter_wind = nv
+					winter_save_pending = true
+				end
+			end
+			gui.Text(244, y4 + 6, string.format('%d%%', math.floor(tonumber(setting.winter_wind) or 45)), font[3])
+			gui.Text(284, y4 + 6, 'Свечение', font[3])
+			local winter_gl = gui.SliderBar('##winter_glow', tonumber(setting.winter_glow) or 65, 0, 100, 160, {350, y4})
+			if winter_gl then
+				local nv = math.floor(winter_gl + 0.5)
+				if nv ~= math.floor((tonumber(setting.winter_glow) or 65) + 0.5) then
+					setting.winter_glow = nv
+					winter_save_pending = true
+				end
+			end
+			gui.Text(520, y4 + 6, string.format('%d%%', math.floor(tonumber(setting.winter_glow) or 65)), font[3])
+
+			--> Строка 5: слой снега
+			gui.Text(10, y5 + 9, 'Слой', font[3])
+			local winter_front = (setting.winter_snow_front == true)
+			if winter_style_chip(u8'##winter_layer_back', 64, y5 + 2, 150, 26, 'Позади меню', {0.62, 0.85, 1.00}, not winter_front) then
+				if winter_front then
+					setting.winter_snow_front = false
+					save(true)
+				end
+			end
+			if winter_style_chip(u8'##winter_layer_front', 224, y5 + 2, 150, 26, 'Поверх меню', {1.00, 0.86, 0.50}, winter_front) then
+				if not winter_front then
+					setting.winter_snow_front = true
+					save(true)
+				end
+			end
+
+			--> Сохраняем один раз, когда отпустили ползунок
+			if winter_save_pending and not imgui.IsAnyItemActive() then
+				winter_save_pending = false
+				save(true)
 			end
 			imgui.EndChild()
 		end
@@ -23370,6 +23825,23 @@ local function fast_fit(raw, max_w, used_font, short)
 	return u8(value)
 end
 
+local function fast_draw_label(dl, label, x, y, width, color, elapsed)
+	local size = imgui.CalcTextSize(label)
+	local overflow = size.x - width
+	if not elapsed or overflow <= 0 then
+		dl:AddText(imgui.ImVec2(x - size.x / 2, y), color, label)
+		return size.x
+	end
+	local duration = overflow / 48
+	local phase = elapsed % (duration + 1.65)
+	local offset = math.min(overflow, math.max(0, phase - 0.55) * 48)
+	local left = x - width / 2
+	dl:PushClipRect(imgui.ImVec2(left, y), imgui.ImVec2(left + width, y + size.y + 2), true)
+	dl:AddText(imgui.ImVec2(left - offset, y), color, label)
+	dl:PopClipRect()
+	return width
+end
+
 local function fast_annulus(dl, cx, cy, r0, r1, a0, a1, col)
 	local segs = math.max(8, math.floor((a1 - a0) * 16))
 	dl:PathClear()
@@ -23421,6 +23893,7 @@ win.fast = imgui.OnFrame(
 			FAST_UI.closing = nil
 			FAST_UI.pending = nil
 			fast_was_open = true
+			FAST_UI.label_hover = nil
 			fast_level = nil
 			fast_page = 0
 			fast_pop = 0
@@ -23454,6 +23927,12 @@ win.fast = imgui.OnFrame(
 		local now = os.clock()
 		local dt = math.min(0.05, now - (fast_clock or now))
 		fast_clock = now
+		local hovered_label = FAST_UI.label_hover
+		if not hovered_label or hovered_label.slot ~= hover or hovered_label.page ~= fast_page or hovered_label.level ~= fast_level then
+			hovered_label = {slot = hover, page = fast_page, level = fast_level, started = now}
+			FAST_UI.label_hover = hovered_label
+		end
+		local label_elapsed = now - hovered_label.started
 		fast_pop = math.min(1, (fast_pop or 0) + dt * 6.5)
 		local pop = fast_pop * fast_pop * (3 - 2 * fast_pop)
 		local wheel = radius * (0.92 + 0.08 * pop)
@@ -23523,7 +24002,9 @@ win.fast = imgui.OnFrame(
 			local py = cy + math.sin(mid) * rr
 			local max_w = math.max(64, math.min(150, 2 * math.sin(math.max(span, 0.45) * 0.42) * rr))
 			local used_font = selected and bold_font[1] or font[3]
-			local label = fast_fit(entry.name, max_w, used_font, true)
+			local active_label = i == hover
+			local label = active_label and u8((fast_text(entry.name):gsub('%s+', ' '))) or fast_fit(entry.name, max_w, used_font, true)
+			if active_label and entry.kind == 'dir' then max_w = max_w - 12 end
 			local text_col = blocked and tint(cl.text, 0.52) or (selected and white or cl.text)
 			local icon_col = blocked and tint(cl.text, 0.52) or (selected and white or tint(cl.text, 0.92))
 			local glyph = FAST_UI.glyph(entry)
@@ -23533,14 +24014,12 @@ win.fast = imgui.OnFrame(
 			dl:AddText(imgui.ImVec2(px - gs.x / 2, icy - gs.y / 2), fast_u32(icon_col), glyph)
 			imgui.PopFont()
 			imgui.PushFont(used_font)
-			local size = imgui.CalcTextSize(label)
-			local lx = px - size.x / 2
 			local ly = py + 9
-			dl:AddText(imgui.ImVec2(lx, ly), fast_u32(text_col), label)
+			local label_width = fast_draw_label(dl, label, px, ly, max_w, fast_u32(text_col), active_label and label_elapsed)
 			imgui.PopFont()
 			if entry.kind == 'dir' then
 				imgui.PushFont(fa_font[2])
-				dl:AddText(imgui.ImVec2(lx + size.x + 3, ly + 1), fast_u32(tint(text_col, 0.75)), fa.ANGLE_RIGHT)
+				dl:AddText(imgui.ImVec2(px + label_width / 2 + 3, ly + 1), fast_u32(tint(text_col, 0.75)), fa.ANGLE_RIGHT)
 				imgui.PopFont()
 			end
 		end
@@ -23584,9 +24063,9 @@ win.fast = imgui.OnFrame(
 			subtitle = 'назад'
 		end
 		imgui.PushFont(bold_font[1])
-		local title_u = fast_fit(u8(title), hub * 1.7, bold_font[1])
-		local title_size = imgui.CalcTextSize(title_u)
-		dl:AddText(imgui.ImVec2(cx - title_size.x / 2, cy - (subtitle ~= '' and title_size.y or title_size.y / 2)), fast_u32(cl.text), title_u)
+		local title_u = hover > 0 and u8((title:gsub('%s+', ' '))) or fast_fit(u8(title), hub * 1.7, bold_font[1])
+		local title_height = imgui.CalcTextSize(title_u).y
+		fast_draw_label(dl, title_u, cx, cy - (subtitle ~= '' and title_height or title_height / 2), hub * 1.7, fast_u32(cl.text), hover > 0 and label_elapsed)
 		imgui.PopFont()
 		if subtitle ~= '' then
 			imgui.PushFont(font[2])
@@ -23614,21 +24093,24 @@ win.fast = imgui.OnFrame(
 		local rmb = imgui.IsMouseClicked(1) and not fast_skip_rmb
 		if not imgui.IsMouseDown(0) then fast_skip_lmb = false end
 		if not imgui.IsMouseDown(1) then fast_skip_rmb = false end
-		local function go_back()
-			if fast_level ~= nil then
+		local function go_back(previous_page)
+			if previous_page and (fast_page or 0) > 0 then
+				fast_page = fast_page - 1
+			elseif fast_level ~= nil then
 				fast_level = nil
 				fast_page = 0
-				fast_pop = 0
-				fast_weights = {}
 			else
 				FAST_UI.closing = os.clock()
+				return
 			end
+			fast_pop = 0
+			fast_weights = {}
 		end
 		if close_win.fast then
 			FAST_UI.closing = os.clock()
 			close_win.fast = false
 		elseif rmb then
-			go_back()
+			go_back(true)
 		elseif lmb then
 			if hover == 0 then
 				if fast_level ~= nil then go_back() end
