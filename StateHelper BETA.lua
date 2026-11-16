@@ -3,7 +3,7 @@ local math = math
 script_name('State Helper')
 script_authors('Kane')
 script_description('Script for employees of state organizations on the Arizona Role Playing Game')
-script_version('3.5.3')
+script_version('3.5.4')
 script_properties('work-in-pause')
 
 local ffi = require 'ffi'
@@ -19,6 +19,9 @@ ffi.cdef [[
 	
 	BOOL __stdcall ShowWindow(HWND hWnd, int  nCmdShow);
 	HWND __stdcall GetActiveWindow();
+	unsigned long __stdcall GetWindowThreadProcessId(HWND, unsigned long*);
+	unsigned long __stdcall GetCurrentProcessId(void);
+	BOOL __stdcall PostMessageA(HWND, unsigned int, uintptr_t, intptr_t);
 	
 	
 	int __stdcall MessageBoxA(
@@ -111,6 +114,16 @@ local rkeys = require 'rkeys'
 local effil = require 'effil'
 local bass = require 'bass'
 local imgui = require 'mimgui'
+--> json-файлы часто сохраняют с BOM (utf-8-sig), поэтому срезаем его перед разбором
+do
+	local json_decode_raw = decodeJson
+	if type(json_decode_raw) == 'function' then
+		function decodeJson(str)
+			if type(str) == 'string' and str:sub(1, 3) == '\239\187\191' then str = str:sub(4) end
+			return json_decode_raw(str)
+		end
+	end
+end
 --> [SH-Guard] Track inverse operations, including FFI exports, in each draw callback.
 do
  local g = {active = false, busy = false, ops = {}, raw = {}, errors = {}}
@@ -126,7 +139,8 @@ do
   local orig = imgui[name]
   if not callable(orig) then return end
   g.raw[name] = orig
-  imgui[name] = function(...)
+  -- This wrapper intentionally shadows a library method.
+  rawset(imgui, name, function(...)
    if not g.active or g.busy then return orig(...) end
    g.busy = true
    local result = {pcall(orig, ...)}
@@ -134,7 +148,7 @@ do
    if not result[1] then error(result[2], 0) end
    after(result[2], ...)
    return unpack(result, 2, #result)
-  end
+  end)
  end
  local function pair(open, close, kind, conditional, counted)
   local undo = imgui[close]
@@ -320,32 +334,64 @@ function sh_resource.valid(data, extension)
 	end
 	return false
 end
-function sh_resource.download(url, path, callback, validate)
+function sh_resource.fetch(url, path, max_size, timeout, complete, progress)
 	sh_resource.sequence = sh_resource.sequence + 1
-	local temporary = path .. '.download-' .. os.time() .. '-' .. sh_resource.sequence
+	local staged = path .. '.download-' .. os.time() .. '-' .. sh_resource.sequence
 	local finished = false
-	return downloadUrlToFile(url, temporary, function(id, status, p1, p2)
+	local function finish(id, data, reason, p1, p2)
 		if finished then return end
-		local terminal = status == dlstatus.STATUSEX_ENDDOWNLOAD or status == dlstatus.STATUS_DOWNLOAD_ERROR
-		if status == dlstatus.STATUS_ENDDOWNLOADDATA or terminal then
-			local file = io.open(temporary, 'rb')
-			local data = file and file:read(32 * 1024 * 1024 + 1)
+		finished = true
+		local ok, problem = pcall(complete, id, data, staged, reason, p1, p2)
+		os.remove(staged)
+		if not ok then print('[SH Download] Completion failed: ' .. tostring(problem)) end
+	end
+	local ok, id = pcall(downloadUrlToFile, url, staged, function(id, status, p1, p2)
+		if finished then
+			if status == dlstatus.STATUS_ENDDOWNLOADDATA or status == dlstatus.STATUSEX_ENDDOWNLOAD
+				or status == dlstatus.STATUS_DOWNLOAD_ERROR then os.remove(staged) end
+			return
+		end
+		if status == dlstatus.STATUS_DOWNLOAD_ERROR then
+			finish(id, nil, 'download error', p1, p2)
+		elseif status == dlstatus.STATUS_ENDDOWNLOADDATA or status == dlstatus.STATUSEX_ENDDOWNLOAD then
+			local file = io.open(staged, 'rb')
+			local data = file and file:read(max_size + 1)
 			if file then file:close() end
-			local extension = path:match('%.([A-Za-z]+)$')
-			local checked, valid = pcall(validate or sh_resource.valid, data, extension and extension:lower())
-			if checked and valid and ffi.load('kernel32').MoveFileExA(temporary, path, 9) ~= 0 then
-				finished = true
-				if callback then callback(id, dlstatus.STATUS_ENDDOWNLOADDATA, p1, p2) end
-			elseif terminal then
-				finished = true
-				os.remove(temporary)
-				print('[SH Resource] Could not validate or install: ' .. path)
-				if callback then callback(id, dlstatus.STATUS_DOWNLOAD_ERROR, p1, p2) end
+			if data and #data > 0 and #data <= max_size then
+				finish(id, data, nil, p1, p2)
+			elseif status == dlstatus.STATUSEX_ENDDOWNLOAD then
+				finish(id, nil, 'file missing, empty or too large', p1, p2)
 			end
-		elseif callback then
-			callback(id, status, p1, p2)
+		elseif progress then
+			progress(id, status, p1, p2)
 		end
 	end)
+	if not ok or not id or id == 0 then
+		finish(nil, nil, ok and 'download did not start' or tostring(id))
+	elseif not finished then
+		lua_thread.create(function()
+			wait(timeout)
+			finish(id, nil, 'timeout')
+		end)
+	end
+	return ok and id or nil
+end
+
+function sh_resource.download(url, path, callback, validate)
+	return sh_resource.fetch(url, path, 32 * 1024 * 1024, 30000, function(id, data, staged, reason, p1, p2)
+		local extension = path:match('%.([A-Za-z]+)$')
+		local valid = false
+		if data then
+			local checked, result = pcall(validate or sh_resource.valid, data, extension and extension:lower())
+			valid = checked and result
+		end
+		if valid and ffi.load('kernel32').MoveFileExA(staged, path, 9) ~= 0 then
+			if callback then callback(id, dlstatus.STATUS_ENDDOWNLOADDATA, p1, p2) end
+		else
+			print('[SH Resource] Could not validate or install: ' .. path .. ': ' .. tostring(reason or 'invalid file or write failed'))
+			if callback then callback(id, dlstatus.STATUS_DOWNLOAD_ERROR, p1, p2) end
+		end
+	end, callback)
 end
 
 --> Скачивание шрифтов
@@ -407,20 +453,11 @@ function sh_resource.download_fonts()
 						print('[SH Font] Could not download ' .. name .. ' after ' .. attempts .. ' attempts.')
 					end
 				end
-				local ok, id = pcall(sh_resource.download, url, path, function(_, status)
-					if status == dlstatus.STATUS_ENDDOWNLOADDATA or status == dlstatus.STATUSEX_ENDDOWNLOAD
-						or status == dlstatus.STATUS_DOWNLOAD_ERROR then complete() end
+				sh_resource.download(url, path, function(_, status)
+					if status == dlstatus.STATUS_ENDDOWNLOADDATA or status == dlstatus.STATUS_DOWNLOAD_ERROR then complete() end
 				end, function(data)
-					return not finished and sh_resource.verify_sha256(data, entry[1], entry[2])
+					return sh_resource.verify_sha256(data, entry[1], entry[2])
 				end)
-				if not ok or not id or id == 0 then
-					complete()
-				elseif not finished then
-					lua_thread.create(function()
-						wait(30000)
-						complete()
-					end)
-				end
 			end
 			sh_resource.font_pending[name] = true
 			attempt()
@@ -559,7 +596,18 @@ local smartSuState = {
 	}
 }
 local smartTicketState = {
-
+	targetId = new.int(0),
+	searchQuery = '',
+	reasons = {},
+	chapterStates = {},
+	selected = {},
+	totalMoney = 0,
+	anim = {
+		win_x = new.float(sx + 400),
+		win_y = new.float(sy / 2),
+		is_opening = false,
+		is_closing = false
+	}
 }
 local poltarget = nil
 local auto_z_state = {
@@ -996,10 +1044,9 @@ gun_orig = {
 	}
 }
 anti_spam_gun = {-1, false, 0}
-update_request = 0
 up_child_sub = 0
 cmd_del_i = 0
-num_give_gov = -1
+sh_gov_request = nil
 num_give_lic = -1
 num_give_lic_term = 0
 last_dialog_title = ''
@@ -1014,7 +1061,7 @@ script_reset = 0
 return_mes_dep = ''
 shp_edit_all = {false, {}}
 new_version = '0'
-search_for_new_version = 0
+sh_update = {check = 'idle', install = 'idle'}
 dialog_fire = {
 	id = 27255,
 	text = {}
@@ -1025,7 +1072,6 @@ update_info = {}
 raw_upd_info_url = 'https://raw.githubusercontent.com/kysteno4ek/StateHelper/beta/update-beta.json'
 raw_upd_url = 'https://raw.githubusercontent.com/kysteno4ek/StateHelper/beta/StateHelper%20BETA.lua'
 update_scr_check = 30
-error_update = false
 script_ac = {reset = 0, del = 0}
 fire_active = false
 level_fire = 1
@@ -1074,6 +1120,7 @@ setting = {
 	winter_garland_style = 'amber',
 	winter_snow_front = false,
 	cmd_open_win = '',
+	roleplay_commands = {stop = 'stop', continue = 'continue'},
 	tab = {'settings', 'cmd', 'shpora', 'dep', 'sob', 'reminder', 'stat', 'music', 'rp_zona', 'help', 'actions'},
 	browser_before_actions = false,
 	browser_cookies = 'ask',
@@ -1151,6 +1198,8 @@ setting = {
 		flag = 5, 
 		dist = 21, 
 		vis = 70, 
+		max_visible = 10,
+		custom_palette = {title = false, work = false},
 		color = {title = 0xFFFF8585, default = 0xFFFFFFFF, work = 0xFFFF8C00},
 		pos = {x = sx - 30, y = sy / 3}
 	},
@@ -1350,7 +1399,6 @@ setting = {
 			cmd = 'suacc',
 			key = {'', {}}
 		},
-		auto_inves = false,
 		ghetto_notify = false,
 		keep_take_open = false,
 		afind = false,
@@ -1507,6 +1555,11 @@ function sh_audit.command(value)
 			if type(action[2]) ~= 'number' or action[2] < 0 or action[2] > 3600 then return false, 'неверная пауза' end
 		elseif kind == 'NEW_VAR' then
 			if type(action[2]) ~= 'string' or type(action[3]) ~= 'string' then return false, 'неверное присвоение переменной' end
+		elseif kind == 'SEND_DIALOG' or kind == 'SELECT_DIALOG_ROW' then
+			local id = action[3]
+			if type(action[2]) ~= 'string' or (id ~= nil and (type(id) ~= 'number' or id < 0 or id > 32767 or id % 1 ~= 0)) then
+				return false, 'неверный текст или ID диалога'
+			end
 		elseif kind ~= 'STOP' and kind ~= 'WAIT_ENTER' and type(action[2]) ~= 'string' then return false, 'неверный текст действия' end
 	end
 	if #stack > 0 then return false, 'незакрытое условие' end
@@ -1606,8 +1659,40 @@ function sh_audit.split_show(command)
 	end
 	return result
 end
+function sh_audit.migrate_government_roleplay()
+	if tonumber(setting.org) ~= 6 or setting.first_start or sh_audit.command_storage_unavailable then return end
+	local templates = {car = true, lic = true, pass = true, social = true, visa = true}
+	local replacements = {
+		["/do Бланк для замены информации в паспорте находится под столом."] = "/do Бланк для замены информации в паспорте находится в сумке.",
+		["/do Бланк для оформления визы находится под столом."] = "/do Бланк для оформления визы находится в сумке.",
+		["/do Бланк для получения сертификата находится под столом."] = "/do Бланк для получения сертификата находится в сумке.",
+		["/do Бланк для выдачи лицензии находится под столом."] = "/do Бланк для выдачи лицензии находится в сумке.",
+		["/me засунув руку под стол, взял{sex[][а]} бланк, после чего протянул{sex[][а]} его человеку напротив"] = "/me достал{sex[][а]} из сумки бланк и ручку, затем протянул{sex[][а]} их человеку напротив",
+		["/me засунув руку под стол, взял{sex[][а]} бланк, после чего заполнил{sex[][а]} его нужной информацией"] = "/me достал{sex[][а]} из сумки бланк и ручку, затем заполнил{sex[][а]} необходимые поля",
+		["/do Бланк социальной карты лежит на столе."] = "/do Бланк социальной карты и ручка находятся в сумке.",
+		["/me взял{sex[][а]} бланк со стола и заполнил{sex[][а]} его"] = "/me достал{sex[][а]} из сумки бланк и ручку, затем заполнил{sex[][а]} бланк",
+	}
+	local pending = {}
+	for _, command in ipairs(cmd[1]) do
+		if templates[command.cmd:lower()] then
+			for _, action in ipairs(command.act) do
+				if action[1] == 'SEND' and type(action[2]) == 'string' then
+					local replacement = replacements[u8:decode(action[2])]
+					if replacement then
+						pending[#pending + 1] = {action, action[2]}
+						action[2] = u8(replacement)
+					end
+				end
+			end
+		end
+	end
+	if #pending > 0 and not save_cmd() then
+		for _, change in ipairs(pending) do change[1][2] = change[2] end
+	end
+end
+
 function sh_audit.migrate_commands()
-	if setting.first_start then return end
+	if setting.first_start or sh_audit.command_storage_unavailable then return end
 	local names, uids = {}, {}
 	for _, c in ipairs(cmd[1]) do names[c.cmd] = true; if c.UID then uids[c.UID] = true end end
 	local result, changed = {}, false
@@ -2011,8 +2096,8 @@ function sh_audit.recover_commands(base)
 	return os.remove(journal) ~= nil
 end
 
-function save_cmd()
-	if settings_reset_pending or setting.first_start then return false end
+function save_cmd(during_setup)
+	if settings_reset_pending or (setting.first_start and not during_setup) or sh_audit.command_storage_unavailable then return false end
 	local base = dir .. '/State Helper/Отыгровки/'
 	if not doesDirectoryExist(base) then createDirectory(base) end
 	local plan, current, before, staged = {}, {}, {}, {}
@@ -2796,7 +2881,16 @@ function cefnotig(samp_text, duration_ms)
 	local light = setting.cl == 'White'
 	local textColor = light and '#1a1a1a' or '#f2f2f2'
 	local borderColor = light and '#c7c7c7' or '#2e2e2e'
-	local text_html = "<span style='color:" .. textColor .. ";'>" .. tostring(samp_text or ''):gsub('&', '&amp;'):gsub('<', '&lt;'):gsub('>', '&gt;'):gsub('"', '&quot;'):gsub("'", '&#39;') .. "</span>"
+	local color = setting.color_def or {0, 0.48, 1}
+	local function channel(i)
+		return math.floor(math.max(0, math.min(1, tonumber(color[i]) or 0)) * 255 + 0.5)
+	end
+	local accent = string.format('#%02x%02x%02x', channel(1), channel(2), channel(3))
+	local message = tostring(samp_text or '')
+	message = message:gsub('^%s*{%x%x%x%x%x%x}%s*%[SH%]%s*', ''):gsub('^%s*%[SH%]%s*', '')
+	message = '{FF5345}[SH] {FFFFFF}' .. message
+	message = message:gsub('%s+', ' ')
+	local text_html = "<span style='color:" .. textColor .. ";'>" .. message:gsub('&', '&amp;'):gsub('<', '&lt;'):gsub('>', '&gt;'):gsub('"', '&quot;'):gsub("'", '&#39;') .. "</span>"
 	text_html = text_html:gsub("{(%x%x%x%x%x%x)}", function(rgb)
 		local neutral = rgb:upper() == 'FFFFFF' or rgb:upper() == 'F2F2F2'
 		local shade = light and (neutral and textColor or rgb:upper() == 'A8A8A8' and '#666666')
@@ -2804,7 +2898,7 @@ function cefnotig(samp_text, duration_ms)
 	end)
 	local bgColor = light and "rgba(247, 247, 247, 0.96)" or "rgba(26, 26, 26, 0.9)"
 	local elementId = 'cefNotify_' .. math.random(1000, 9999)
-	local content = string.format([=[<div style="font-family:SHNotify,Arial,sans-serif;font-size:17px;font-weight:700;color:%s;text-align:center;padding-bottom:8px">StateHelper</div><hr style="border:none;height:1px;background-color:%s;margin:0 0 8px 0"><div style="font-family:SHNotify,Arial,sans-serif;font-size:18px;font-weight:500;color:%s">%s</div><div style="position:absolute;bottom:0;left:0;height:3px;width:0%%;background:#808080;border-radius:0 0 7px 7px;animation:cefNotifyProgress %dms linear forwards"></div>]=], textColor, borderColor, textColor, text_html, duration_ms - 400)
+	local content = string.format([=[<div style="font-family:SHNotify,Arial,sans-serif;font-size:17px;font-weight:700;color:%s;text-align:center;padding-bottom:8px">StateHelper</div><hr style="border:none;height:1px;background-color:%s;margin:0 0 8px 0"><div style="font-family:SHNotify,Arial,sans-serif;font-size:18px;font-weight:500;color:%s;white-space:nowrap;overflow:hidden" class="cefNotifyText"><span style="display:inline-block;transform-origin:left center">%s</span></div><div style="position:absolute;bottom:0;left:0;height:3px;width:0%%;background:linear-gradient(90deg,var(--sh-accent),var(--sh-highlight));border-radius:0 0 7px 7px;animation:cefNotifyProgress %dms linear forwards"></div>]=], textColor, borderColor, textColor, text_html, duration_ms - 400)
 	local js_code = string.format(
 	[[
 		let oldNotifies = document.querySelectorAll('.cefNotifyInstance');
@@ -2819,13 +2913,25 @@ function cefnotig(samp_text, duration_ms)
 		let el=document.createElement('div');el.id='%s';
 		el.classList.add('cefNotifyInstance');
 		el.innerHTML=%s;
-		el.style.cssText=`position:fixed;bottom:10%%;left:50%%;transform:translate(-50%%,0);background:%s;padding:12px 24px;padding-bottom:14px;border-radius:7px;border:1px solid %s;box-shadow:0 4px 12px rgba(0,0,0,0.3);z-index:99999;pointer-events:none;overflow:hidden;animation:cefNotifySlideIn %dms ease-out forwards`;
+		el.style.cssText=`position:fixed;bottom:10%%;left:50%%;transform:translate(-50%%,0);width:max-content;max-width:calc(100vw - 76px);--sh-accent:%s;--sh-highlight:%s;background:%s;padding:12px 24px;padding-bottom:14px;border-radius:7px;border:1px solid %s;box-shadow:0 4px 12px rgba(0,0,0,0.3);z-index:99999;pointer-events:none;overflow:hidden;animation:cefNotifySlideIn %dms ease-out forwards`;
 		document.body.appendChild(el);
+		const line=el.querySelector('.cefNotifyText');
+		const body=line.firstElementChild;
+		const fit=()=> {
+			line.style.fontSize='18px';
+			body.style.transform='';
+			if(body.scrollWidth>line.clientWidth) {
+				line.style.fontSize=Math.max(12,Math.floor(18*line.clientWidth/body.scrollWidth))+'px';
+				if(body.scrollWidth>line.clientWidth) body.style.transform='scaleX('+line.clientWidth/body.scrollWidth+')';
+			}
+		};
+		fit();
+		if(document.fonts) document.fonts.ready.then(()=>{if(el.isConnected) fit();});
 		setTimeout(()=>{let c=document.getElementById('%s');if(c)c.style.animation=`cefNotifySlideOut %dms ease-in forwards`},%d);
 		setTimeout(()=>{let c=document.getElementById('%s');if(c)c.remove()},%d);
 	]],
 	300, 300, 
-	elementId, json.encode(content), bgColor, borderColor, 400, elementId, 400, duration_ms - 400, elementId, duration_ms
+	elementId, json.encode(content), accent, light and accent or "#8fc5ff", bgColor, borderColor, 400, elementId, 400, duration_ms - 400, elementId, duration_ms
 	)
 	evalanon(js_code)
 end
@@ -2993,7 +3099,7 @@ do
    end
    local variant = deep_copy(command)
    variant.cmd = command.cmd .. choice
-   variant.desc = (command.cmd == 'lekzeks' and u8'Лекция для заключённых: ' or u8'Лекция: ') .. title
+   variant.desc = title
    variant.act = specialize(1, #command.act, choice)
    variant.id_element = #variant.act
    if #result > 0 then variant.key, variant.UID = {'', {}}, nil end
@@ -3001,7 +3107,7 @@ do
   end
   return #result > 0 and result or nil
  end
- local function remap_fast(fast, mapping)
+ local function remap_fast(fast, mapping, rename_defaults)
   local changed, visited = false, {}
   local function list(items)
    if type(items) ~= 'table' or visited[items] then return end
@@ -3015,6 +3121,10 @@ do
     if type(item) == 'table' then
      if item.items then list(item.items) end
      local name = type(item.cmd) == 'string' and item.cmd:match('^/?([%w_]+)$')
+     local rename = name and rename_defaults[name]
+     if rename and item.name == rename.old then
+      item.name, changed = rename.new, true
+     end
      local variants = name and mapping[name]
      if variants then
       table.remove(items, i)
@@ -3049,27 +3159,31 @@ do
   return changed
  end
  function migrate_lecture_commands()
-  if setting.first_start then return false end
-  local mapping = {}
+  if setting.first_start or sh_audit.command_storage_unavailable then return false end
+  local mapping, rename_defaults = {}, {}
   for old in pairs(legacy_names) do
    local variants = {}
    for _, group in ipairs(groups) do
     for _, command in ipairs(cmd_defoult[group] or {}) do
-     if command.cmd:match('^' .. old .. '%d+$') then variants[#variants + 1] = command end
+     if command.cmd:match('^' .. old .. '%d+$') then
+      variants[#variants + 1] = command
+      local prefix = old == 'lekzeks' and u8'Лекция для заключённых: ' or u8'Лекция: '
+      rename_defaults[command.cmd] = {old = prefix .. command.desc, new = command.desc}
+     end
     end
    end
    table.sort(variants, function(a, b) return tonumber(a.cmd:match('(%d+)$')) < tonumber(b.cmd:match('(%d+)$')) end)
    if #variants > 0 then mapping[old] = variants end
   end
   local names, uids = {}, {}
-  for _, command in ipairs(cmd[1]) do names[command.cmd] = true; if command.UID then uids[command.UID] = true end end
+  for _, command in ipairs(cmd[1]) do names[command.cmd:lower()] = true; if command.UID then uids[command.UID] = true end end
   local replacement, changed = {}, false
   for _, command in ipairs(cmd[1]) do
    local ok, variants = pcall(split_lecture, command)
    if not ok then print('[SH Lectures] ' .. tostring(variants)); variants = nil end
    if variants then
     for _, variant in ipairs(variants) do
-     if names[variant.cmd] then
+     if names[variant.cmd:lower()] then
       print('[SH Lectures] Command name already exists: ' .. variant.cmd .. '; original menu preserved.')
       variants = nil; break
      end
@@ -3080,17 +3194,22 @@ do
      if not variant.UID then
       repeat variant.UID = math.random(20, 95000000) until not uids[variant.UID]
      end
-     uids[variant.UID], names[variant.cmd] = true, true
+     uids[variant.UID], names[variant.cmd:lower()] = true, true
      replacement[#replacement + 1] = variant
     end
     mapping[command.cmd], changed = variants, true
    else
     if legacy_names[command.cmd] then mapping[command.cmd] = nil end
+    local rename = rename_defaults[command.cmd]
+    if rename and command.desc == rename.old then
+     command = deep_copy(command)
+     command.desc, changed = rename.new, true
+    end
     replacement[#replacement + 1] = command
    end
   end
   local next_fast = deep_copy(setting.fast)
-  local fast_changed = remap_fast(next_fast, mapping)
+  local fast_changed = remap_fast(next_fast, mapping, rename_defaults)
   if not changed and not fast_changed then return false end
   local backup = dir .. '/State Helper/Лекции-до-разделения-' .. os.time() .. '.json'
   local suffix = 1
@@ -3105,7 +3224,15 @@ do
    print('[SH Lectures] Save failed; original commands retained in memory. Backup: ' .. backup)
    return false
   end
-  if fast_changed then setting.fast = next_fast; save() end
+  if fast_changed then
+   local previous_fast = setting.fast
+   setting.fast = next_fast
+   if not save() then
+    setting.fast = previous_fast
+    print('[SH Lectures] Quick access was not saved; migration will retry next launch.')
+    return false
+   end
+  end
   print('[SH Lectures] Separate lecture commands installed. Backup: ' .. backup)
   return true
  end
@@ -3117,6 +3244,33 @@ function sh_audit.police_text(value)
 	if ffi.C.MultiByteToWideChar(65001, 8, value, #value, nil, 0) == 0 then return value end
 	local ok, converted = pcall(function() return u8:decode(value) end)
 	return ok and converted or nil
+end
+
+local members_palette = {
+	{title = 0xFFFF96A9, work = 0xFFFF4062},
+	{title = 0xFFFF96A9, work = 0xFFFF4062},
+	{title = 0xFFFF96A9, work = 0xFFFF4062},
+	{title = 0xFFFF96A9, work = 0xFFFF4062},
+	{title = 0xFFFFAD73, work = 0xFFFF6A00},
+	{title = 0xFFF3FF73, work = 0xFFEAFF00},
+	{title = 0xFFC6A28D, work = 0xFF97562F},
+	{title = 0xFFC6A28D, work = 0xFF97562F},
+	{title = 0xFFFF9A84, work = 0xFFFF4720},
+	{title = 0xFFC6A28D, work = 0xFF97562F},
+	{title = 0xFF739AFF, work = 0xFF0048FF},
+	{title = 0xFF739AFF, work = 0xFF0048FF},
+	{title = 0xFF739AFF, work = 0xFF0048FF},
+	{title = 0xFF739AFF, work = 0xFF0048FF},
+	{title = 0xFF739AFF, work = 0xFF0048FF},
+}
+function sh_audit.members_color(key)
+	local mb = setting.mb
+	local saved = mb.color[key]
+	local palette = members_palette[tonumber(setting.org)]
+	if palette and not (mb.custom_palette and mb.custom_palette[key]) then
+		return palette[key]
+	end
+	return saved
 end
 
 function main()
@@ -3412,10 +3566,11 @@ function main()
 	local old_cmds_file = dir .. '/State Helper/Отыгровки.json'
 	local base_dir = dir .. '/State Helper/Отыгровки/'
 
-	if not sh_audit.recover_commands(base_dir) then
-		sh_audit.io_error('Не удалось восстановить сохранение отыгровок.', base_dir)
-	end
-	if doesFileExist(old_cmds_file) then	-- 976
+	sh_audit.command_storage_unavailable = not sh_audit.recover_commands(base_dir)
+	if sh_audit.command_storage_unavailable then
+		sh_audit.io_error('Не удалось восстановить сохранение. Отыгровки отключены до восстановления файлов и перезапуска.', base_dir)
+		cmd[1] = {}
+	elseif doesFileExist(old_cmds_file) then	-- 976
 		sampAddChatMessage('[SH]{FFFFFF} Обнаружен старый файл отыгровок. Начинаем перенос в новую структуру...', 0xFF5345)
 		lua_thread.create(function()
 			wait(100)
@@ -3555,11 +3710,11 @@ function main()
 		save_cmd()
 	end
 	-- New finance licenses also become available in existing CL installations.
-	if setting.org == 5 and not setting.first_start then
+	if setting.org == 5 and not setting.first_start and not sh_audit.command_storage_unavailable then
 		local changed, present, used_uids = false, {}, {}
 		local license_folder = 4
 		for _, command in ipairs(cmd[1]) do
-			present[command.cmd] = true
+			present[command.cmd:lower()] = true
 			if command.UID then used_uids[command.UID] = true end
 			if command.cmd == 'licfly' and cmd[2][command.folder] then license_folder = command.folder end
 			if command.cmd == 'price' then
@@ -3572,18 +3727,45 @@ function main()
 			end
 		end
 		for _, default in ipairs(cmd_defoult.driving_school) do
-			if (default.cmd == 'liccrypto' or default.cmd == 'licstocks') and not present[default.cmd] then
+			if (default.cmd == 'liccrypto' or default.cmd == 'licstocks' or default.cmd == 'givelic') and not present[default.cmd] then
 				local command = deep_copy(default)
 				if cmd[2][license_folder] then command.folder = license_folder end
 				repeat command.UID = math.random(20, 95000000) until not used_uids[command.UID]
-				used_uids[command.UID], present[command.cmd] = true, true
+				used_uids[command.UID], present[command.cmd:lower()] = true, true
 				cmd[1][#cmd[1] + 1], changed = command, true
 			end
 		end
 		if changed and not save_cmd() then print('[SH] Could not save new license commands; they remain available in this session.') end
 	end
+	if setting.org == 6 and not setting.first_start and not sh_audit.command_storage_unavailable then
+		local name_taken, used_ids, folder = false, {}, 4
+		for _, command in ipairs(cmd[1]) do
+			local name = command.cmd:lower()
+			if name == 'social' then name_taken = true end
+			if command.UID then used_ids[command.UID] = true end
+			if (name == 'visa' or name == 'pass' or name == 'car') and cmd[2][command.folder] then
+				folder = command.folder
+			end
+		end
+		for _, name in ipairs(all_cmd) do
+			if name:lower() == 'social' then name_taken = true end
+		end
+		if not name_taken then
+			for _, default in ipairs(cmd_defoult.government) do
+				if default.cmd == 'social' then
+					local command = deep_copy(default)
+					command.folder = cmd[2][folder] and folder or 1
+					repeat command.UID = math.random(20, 95000000) until not used_ids[command.UID]
+					cmd[1][#cmd[1] + 1] = command
+					if not save_cmd() then print('[SH] Could not save the social card command; it is available for this session.') end
+					break
+				end
+			end
+		end
+	end
 	migrate_lecture_commands()
 	sh_audit.migrate_commands()
+	sh_audit.migrate_government_roleplay()
 	do
 		local changed = false
 		for _, command in ipairs(cmd[1]) do
@@ -3738,46 +3920,39 @@ afind_bypass = false
 function afind_halt()
 	afind_gen = afind_gen + 1
 	afind_run = false
-end
-
-function afind_sleep(ms)
-	local until_t = os.clock() + ms / 1000
-	while os.clock() < until_t do
-		wait(50)
-	end
+	afind_q = {}
 end
 
 function afind_take_cmd(argument, cmd_name)
-	afind_q[#afind_q + 1] = { argument, cmd_name }
+	local job = {
+		argument = argument, command = cmd_name, generation = afind_gen,
+		server = table.concat({sampGetCurrentServerAddress()}, ':')
+	}
+	if #afind_q >= 30 then
+		sampAddChatMessage('[SH]{FFFFFF} Очередь отыгровок Auto Find заполнена.', 0xFF5345)
+		return
+	end
+	afind_q[#afind_q + 1] = job
 	if afind_worker then return end
 	afind_worker = true
 	lua_thread.create(function()
-		local primed = true
-		while true do
-			if #afind_q > 0 then
-				local job = table.remove(afind_q, 1)
-				while thread and thread:status() ~= 'dead' do wait(50) end
-				if primed then afind_sleep(math.random(1000, 2000)) end
-				primed = true
-				while thread and thread:status() ~= 'dead' do wait(50) end
+		local function valid(queued)
+			return afind_run and queued.generation == afind_gen and sampIsLocalPlayerSpawned()
+				and queued.server == table.concat({sampGetCurrentServerAddress()}, ':')
+		end
+		while #afind_q > 0 do
+			local queued = table.remove(afind_q, 1)
+			local ready = os.clock() + math.random(1000, 2000) / 1000
+			while valid(queued) and (thread:status() ~= 'dead' or os.clock() < ready) do wait(50) end
+			if valid(queued) then
 				afind_bypass = true
-				pcall(cmd_start, job[1], job[2])
+				local ok, err = pcall(cmd_start, queued.argument, queued.command)
 				afind_bypass = false
-				while thread and thread:status() ~= 'dead' do wait(50) end
-			else
-				local until_t = os.clock() + math.random(1000, 2000) / 1000
-				while os.clock() < until_t and #afind_q == 0 do
-					wait(50)
-				end
-				while os.clock() < until_t do wait(50) end
-				if #afind_q == 0 then
-					afind_worker = false
-					if #afind_q == 0 then break end
-					afind_worker = true
-				end
-				primed = false
+				if not ok then print('[SH Auto Find] ' .. tostring(err)) end
+				while valid(queued) and thread:status() ~= 'dead' do wait(50) end
 			end
 		end
+		afind_worker = false
 	end)
 end
 
@@ -3801,16 +3976,24 @@ function afind_cmd(arg)
 		return
 	end
 	local id = tonumber((arg or ''):match('^%s*(%d+)%s*$'))
-	if not id or id < 0 or id > 999 then
-		sampAddChatMessage('[SH]{FFFFFF} Использование: /afind [id 0-999]', 0xFF5345)
+	if not id or id < 0 or id > 1003 then
+		sampAddChatMessage('[SH]{FFFFFF} Использование: /afind [id 0-1003]', 0xFF5345)
 		return
 	end
+	if not sampIsLocalPlayerSpawned() or not sampIsPlayerConnected(id) then
+		sampAddChatMessage('[SH]{FFFFFF} Игрок не найден.', 0xFF5345)
+		return
+	end
+	local target_nick = sampGetPlayerNickname(id)
+	local server = table.concat({sampGetCurrentServerAddress()}, ':')
 	afind_gen = afind_gen + 1
 	local gen = afind_gen
 	afind_run = true
 	lua_thread.create(function()
 		local function still()
 			return afind_run and afind_gen == gen and setting.police_settings.afind and setting.org >= 11 and setting.org <= 15
+				and sampIsLocalPlayerSpawned() and server == table.concat({sampGetCurrentServerAddress()}, ':')
+				and sampIsPlayerConnected(id) and sampGetPlayerNickname(id) == target_nick
 		end
 		while still() do
 			while still() and (afind_worker or #afind_q > 0) do
@@ -3825,7 +4008,7 @@ function afind_cmd(arg)
 				wait(50)
 			end
 		end
-		if afind_gen == gen then afind_run = false end
+		if afind_gen == gen then afind_halt() end
 	end)
 	sampAddChatMessage('[SH]{FFFFFF} /afind ' .. id .. ' включен. Ещё раз /afind остановит его.', 0xFF5345)
 end
@@ -3842,11 +4025,10 @@ end
 		afind_bind(true)
 	end
 	swanted_bind()
-	--[[
 	if setting.police_settings.smart_ticket and (setting.org >= 11 and setting.org <= 15) then
 		sampRegisterChatCommand('ticket', smart_ticket_func)
 		download_ticket_reasons()
-	end]]
+	end
 	if setting.cl == 'White' then
 		change_design('White', false)
 	else
@@ -3912,9 +4094,9 @@ end
 	end
 	
 	col_mb = {
-		title = convert_color(setting.mb.color.title),
+		title = convert_color(sh_audit.members_color("title")),
 		default = convert_color(setting.mb.color.default),
-		work = convert_color(setting.mb.color.work)
+		work = convert_color(sh_audit.members_color("work"))
 	}
 	fontes = renderCreateFont('Trebuchet MS', setting.mb.size, setting.mb.flag)
 	col_wanted = {
@@ -3935,7 +4117,6 @@ end
 	
 	if setting.first_start then
 		update_scr_check = 5
-		search_for_new_version = 30
 	end
 	
 	if setting.button_close == 2 then
@@ -3949,10 +4130,12 @@ end
 	sampRegisterChatCommand('sh', function()
 		open_main()
 	end)
+	sh_roleplay.bind_commands()
 	sh_usage_start()
 	while true do wait(0)
 		debug_frame()
 		cover_flush()
+		music_stream_tick()
 		ym_auth_poll()
 		http_poll()
 		sh_browser_tick()
@@ -5060,6 +5243,9 @@ function gui.DrawBox(pos_draw, size_imvec2, col_draw_imvec4, col_draw_imvec4_emp
 	local p = imgui.GetCursorScreenPos()
 	imgui.GetWindowDrawList():AddRectFilled(imgui.ImVec2(p.x + pos_draw[1], p.y + pos_draw[2]), imgui.ImVec2(p.x + size_imvec2[1] + pos_draw[1], p.y + size_imvec2[2] + pos_draw[2]), imgui.GetColorU32Vec4(col_draw_imvec4), 0, flag_draw)
 	winter.card(p.x + pos_draw[1], p.y + pos_draw[2], size_imvec2[1], size_imvec2[2])
+	if sh_settings_search and sh_settings_search.geometry and pos_draw[1] <= 26 and size_imvec2[1] >= 540 then
+		sh_settings_search.record_geometry('cards', p.x + pos_draw[1], p.y + pos_draw[2], size_imvec2[1], size_imvec2[2])
+	end
 	
 	pos_draw[1], pos_draw[2] = pos_draw[1] - 1.5, pos_draw[2] - 1.5
 	size_imvec2[1], size_imvec2[2] = size_imvec2[1] + 3, size_imvec2[2] + 3
@@ -5087,6 +5273,9 @@ end
 function gui.DrawLine(pos_draw_A, pos_draw_B, col_draw_imvec4, thickness_line)
 	imgui.SetCursorPos(imgui.ImVec2(0, 0))
 	local p = imgui.GetCursorScreenPos()
+	if sh_settings_search and sh_settings_search.geometry and pos_draw_A[2] == pos_draw_B[2] and pos_draw_A[1] <= 26 and pos_draw_B[1] >= 570 then
+		sh_settings_search.record_geometry('lines', p.x + pos_draw_A[1], p.y + pos_draw_A[2])
+	end
 	imgui.GetWindowDrawList():AddLine(imgui.ImVec2(p.x + pos_draw_A[1], p.y + pos_draw_A[2]), imgui.ImVec2(p.x + pos_draw_B[1], p.y + pos_draw_B[2]), imgui.GetColorU32Vec4(col_draw_imvec4), (thickness_line or nil))
 end
 
@@ -5099,6 +5288,7 @@ function gui.Text(pos_text_x, pos_text_y, text_gui, font_text_gui)
 		imgui.PushFont(font_text_gui)
 	end
 	imgui.SetCursorPos(imgui.ImVec2(pos_text_x, pos_text_y))
+	if sh_settings_search and sh_settings_search.geometry then sh_settings_search.mark(text_gui) end
 	imgui.Text(u8(text_gui))
 	if font_text_gui then
 		imgui.PopFont()
@@ -6003,12 +6193,12 @@ function find_track_link(search_text, page) --> Поиск песни в интернете
 	debug_log('search hitmotop q=%s page=%s', tostring(search_text), tostring(page))
 	current_page = page
 
-	local query = mus.search or search_text or ''
+	local query = search_text or ''
 	local encoded = hitmo_urlencode(query, true)
 	local path_query = hitmo_urlencode(query, false)
 	local finished = false
 	local pending = 0
-	local grace_started = false
+	local failed_sources = 0
 
 	local function finish_with(list, source)
 		if finished or search_token ~= mus.search_token then return end
@@ -6020,30 +6210,22 @@ function find_track_link(search_text, page) --> Поиск песни в интернете
 	local function finish_empty()
 		if finished or search_token ~= mus.search_token then return end
 		finished = true
-		tracks = {{link = '', artist = 'Ошибка404', name = '', time = '', image = ''}}
-		debug_log('search hitmotop empty')
+		tracks = {{link = '', artist = 'Ошибка404', name = '', time = '', image = '',
+			search_error = failed_sources > 0}}
+		debug_log('search hitmotop empty; failed sources=%d', failed_sources)
 	end
 
 	local function empty_source(source)
 		if finished or search_token ~= mus.search_token then return end
 		pending = pending - 1
 		debug_log('search hitmotop %s empty pending=%d', tostring(source), pending)
-		if pending <= 0 then
-			finish_empty()
-			return
-		end
-		if not grace_started then
-			grace_started = true
-			lua_thread.create(function()
-				wait(4000)
-				if not finished and search_token == mus.search_token then finish_empty() end
-			end)
-		end
+		if pending <= 0 then finish_empty() end
 	end
 
 	local function fail_source(source, err)
 		if finished or search_token ~= mus.search_token then return end
 		pending = pending - 1
+		failed_sources = failed_sources + 1
 		debug_log('search hitmotop %s fail: %s', tostring(source), tostring(err))
 		if pending <= 0 then finish_empty() end
 	end
@@ -6051,8 +6233,7 @@ function find_track_link(search_text, page) --> Поиск песни в интернете
 	local function accept_source(source, list)
 		if finished or search_token ~= mus.search_token then return end
 		if type(list) ~= 'table' then
-			debug_log('search hitmotop %s parse failed', tostring(source))
-			empty_source(source)
+			fail_source(source, 'unexpected search response')
 			return
 		end
 		if #list == 0 then
@@ -6109,7 +6290,9 @@ function find_track_link(search_text, page) --> Поиск песни в интернете
 		function(response)
 			if search_token ~= mus.search_token or finished then return end
 			local status = response and tonumber(response.status_code)
-			if status == 200 and response.text then
+			if status == 404 then
+				empty_source('old')
+			elseif status == 200 and response.text then
 				accept_source('old', hitmo_parse_old(response.text, page))
 			else
 				fail_source('old', status or 'no response')
@@ -6210,36 +6393,75 @@ local function ym_https_request(method, url, args, resolve, reject)
 	sh_winhttps_request(method, host, path, args, resolve, reject)
 end
 
+function sh_audit.complete_setup(register)
+	if not setting.first_start then return true end
+	local org = tonumber(setting.org) or 0
+	local group = org <= 4 and 'hospital' or org == 5 and 'driving_school'
+		or org == 6 and 'government' or (org == 7 or org == 8) and 'army'
+		or org == 9 and 'fire_department' or org == 10 and 'jail'
+		or org >= 11 and org <= 15 and 'police'
+	local original, original_gun = cmd[1], setting.gun_func
+	local staged, names, added = deep_copy(original), {}, {}
+	for _, command in ipairs(staged) do names[command.cmd:lower()] = true end
+	local function append(defaults)
+		for _, default in ipairs(defaults) do
+			local name = default.cmd:lower()
+			if not names[name] then
+				local template = group == 'hospital' and s_na == 'Phoenix' and name == 'mc' and mc_phoenix.cmd and mc_phoenix or default
+				local command = deep_copy(template)
+				staged[#staged + 1], added[#added + 1], names[name] = command, command, true
+			end
+		end
+	end
+	append(cmd_defoult.all)
+	if group then append(cmd_defoult[group]) end
+	cmd[1] = staged
+	if not save_cmd(true) then cmd[1] = original; return false end
+	if group == 'army' or group == 'jail' or group == 'police' then setting.gun_func = true end
+	setting.first_start = false
+	if not save() then
+		setting.first_start, setting.gun_func, cmd[1] = true, original_gun, original
+		if not save_cmd(true) then
+			cmd[1] = staged
+			print('[SH] Setup command rollback failed; setup remains incomplete.')
+		end
+		return false
+	end
+	if register then
+		for _, command in ipairs(added) do
+			if command.cmd ~= '' then
+				local name, uid = command.cmd, command.UID
+				sampRegisterChatCommand(name, function(arg) cmd_start(arg, tostring(uid) .. name) end)
+			end
+		end
+	end
+	add_cmd_in_all_cmd()
+	return true
+end
+
 function sh_usage_start()
 	local path = sh_audit.private_root .. '/usage-id.txt'
-	local function read_id(source)
+	local function read_mode(source)
 		local file = io.open(source, 'rb')
-		if not file then return end
-		local saved = file:read(64)
+		if not file then return nil, nil, false end
+		local saved = file:read(128) or ''
 		file:close()
-		local mode, id = (saved or ''):match('^(%a+) ([0-9a-f]*)\n$')
-		if id and #id == 32 and (mode == 'on' or mode == 'off' or mode == 'auto') then
-			return id
-		end
+		local mode = saved:match('^(%a+)%s*$')
+		local id
+		if not mode then mode, id = saved:match('^(%a+)%s+([0-9a-f]+)%s*$') end
+		if id and #id ~= 32 then id = nil end
+		return mode, id, true
 	end
 
-	local id = read_id(path)
+	local function consent()
+		local mode, id, present = read_mode(path)
+		if present then return mode, id end
+		return read_mode(dir .. '/State Helper/usage-consent.txt')
+	end
+
+	local mode, id = consent()
+	if mode ~= 'on' and mode ~= 'auto' then return end
 	local next_send, in_flight, enrolling = 0, false, false
-
-	local function hardware_id()
-		ffi.cdef [[
-			int __stdcall GetVolumeInformationA(const char*, char*, unsigned long, unsigned long*,
-				unsigned long*, unsigned long*, char*, unsigned long);
-		]]
-		local drive = os.getenv('SystemDrive')
-		if not drive or not drive:match('^%a:$') then return nil end
-		local serial = ffi.new('unsigned long[1]')
-		if ffi.load('kernel32').GetVolumeInformationA(drive .. '/', nil, 0, serial, nil, nil, nil, 0) == 0 or serial[0] == 0 then
-			return nil
-		end
-		local hash = sh_resource.sha256(('StateHelper usage HWID v1:%08X'):format(tonumber(serial[0])))
-		return hash and hash:sub(1, 32)
-	end
 
 	local function create_id()
 		ffi.cdef 'long __stdcall BCryptGenRandom(void*, unsigned char*, unsigned long, unsigned long);'
@@ -6252,25 +6474,22 @@ function sh_usage_start()
 	end
 
 	if not id then
-		local ok, result = pcall(function()
-			local install_id = read_id(dir .. '/State Helper/usage-consent.txt')
-			if not install_id then
-				local hardware_ok, hardware = pcall(hardware_id)
-				install_id = (hardware_ok and hardware) or create_id()
-			end
-			assert(sh_audit.ensure_private_storage())
-			assert(write_file(path, 'auto ' .. install_id .. '\n'))
-			return install_id
-		end)
+		local ok, result = pcall(create_id)
 		if not ok then
-			print('[SH Usage] Could not save installation ID.')
+			print('[SH Usage] Could not create installation ID.')
 			return
 		end
 		id = result
 	end
+	if not sh_audit.ensure_private_storage() then return end
+	local active_mode, active_id = read_mode(path)
+	if (active_mode ~= 'on' or active_id ~= id) and not write_file(path, 'on ' .. id .. '\n') then
+		print('[SH Usage] Could not save installation ID.')
+		return
+	end
 
 	local secret_path = sh_audit.private_root .. '/usage-key.txt'
-	local secret = read_id(secret_path)
+	local _, secret = read_mode(secret_path)
 	if not secret then
 		local ok, result = pcall(create_id)
 		if not ok or not write_file(secret_path, 'auto ' .. result .. '\n') then
@@ -6337,9 +6556,17 @@ function sh_usage_start()
 	table.sort(queue, function(a, b) return a.data < b.data end)
 	local auth = id .. ' ' .. secret
 
+	local function send_usage(endpoint, data, finish)
+		local ok = pcall(sh_winhttps_request, 'POST', 'statehelper.top', '/api/' .. endpoint, {
+			headers = {['Content-Type'] = 'text/plain'}, data = data, timeout = 5
+		}, finish, function() finish() end)
+		if not ok then finish() end
+	end
+
 	lua_thread.create(function()
 		while true do
 			if not in_flight and os.time() >= next_send and sampIsLocalPlayerSpawned() then
+				if read_mode(path) ~= 'on' then return end
 				local pending = queue[1]
 				local endpoint = enrolling and 'register' or (pending and 'launch' or 'heartbeat')
 				local data = endpoint == 'register' and auth or (auth .. ' ' .. (pending and pending.data or snapshot()))
@@ -6362,52 +6589,80 @@ function sh_usage_start()
 						next_send = os.time() + 300
 					end
 				end
-				local ok = pcall(sh_winhttps_request, 'POST', '92.246.137.6', '/statehelper-usage/' .. endpoint, {
-					headers = {['Content-Type'] = 'text/plain'}, data = data, timeout = 5
-				}, finish, function() finish() end)
-				if not ok then finish() end
+				send_usage(endpoint, data, finish)
 			end
 			wait(5000)
 		end
 	end)
 end
 
+local function ym_set_account(token)
+	mus.ym_generation = (mus.ym_generation or 0) + 1
+	mus.ym_auth, mus.ym_attempt, mus.ym_user_code = nil, nil, ''
+	mus.ym_status = token ~= '' and 'ok' or ''
+	setting.ym_token, setting.ym_uid = token, ''
+	ym_playlists = nil
+	ym_wave, ym_wave_busy, ym_wave_failed = {}, false, false
+	ym_chart, ym_chart_busy, ym_chart_failed = {}, false, false
+	if setting.music_source == 'yandex' then
+		mus.search_token = (mus.search_token or 0) + 1
+		tracks, playlist_view, playlist_playing = {}, nil, nil
+		set_song_status('STOP')
+	end
+	return save()
+end
+
 function ym_request(url, resolve, reject)
+	local token, generation = setting.ym_token, mus.ym_generation
+	local function active()
+		return token == setting.ym_token and generation == mus.ym_generation
+	end
+	local function fail(problem)
+		if not active() then return end
+		debug_log('http ! %s %s', tostring(url), tostring(problem))
+		if reject then reject(problem) end
+	end
+	if token == '' then return fail('Authorization required') end
 	debug_log('http > %s', tostring(url))
 	ym_https_request('GET', url, {
 		headers = {
 			['X-Yandex-Music-Client'] = 'YandexMusicAndroid/24023621',
-			['Authorization'] = 'OAuth ' .. setting.ym_token,
+			['Authorization'] = 'OAuth ' .. token,
 			['Accept-Language'] = 'ru'
 		},
 		timeout = 15
 	}, function(response)
-		debug_log('http < %s code=%s len=%s', tostring(url), tostring(response and response.status_code), tostring(response and response.text and #response.text))
-		if response and tonumber(response.status_code) == 401 and setting.ym_token ~= '' then
-			setting.ym_token = ''
-			setting.ym_uid = ''
-			ym_playlists = nil
-			save()
+		if not active() then return end
+		local status = response and tonumber(response.status_code)
+		debug_log('http < %s code=%s', tostring(url), tostring(status))
+		if status == 401 then
+			ym_set_account('')
 			sampAddChatMessage('[SH] {FFFFFF}Токен Яндекс Музыки недействителен, войдите заново.', 0xFF5345)
+			return
+		end
+		if not status or status < 200 or status >= 300 or type(response.text) ~= 'string' then
+			return fail(status and ('HTTP ' .. status) or 'No response')
 		end
 		if resolve then resolve(response) end
-	end, function(err)
-		debug_log('http ! %s %s', tostring(url), tostring(err))
-		if reject then reject(err) end
-	end)
+	end, fail)
 end
 
 function ym_auth_start()
 	debug_log('ym auth start')
 	mus.ym_status = 'requesting'
 	mus.ym_auth = nil
+	local attempt = {}
+	mus.ym_attempt = attempt
 	ym_https_request('POST', 'https://oauth.yandex.ru/device/code', {
 		data = 'client_id=' .. YM_CLIENT_ID .. '&device_id=' .. ym_device_id .. '&device_name=StateHelper',
 		headers = {['Content-Type'] = 'application/x-www-form-urlencoded'},
 		timeout = 15
 	}, function(response)
 		local ok, data = pcall(json.decode, response.text)
-		if not ok or not data or not data.device_code then
+		if mus.ym_attempt ~= attempt then return end
+		mus.ym_attempt = nil
+		if not ok or type(data) ~= 'table' or type(data.device_code) ~= 'string'
+			or type(data.user_code) ~= 'string' then
 			mus.ym_status = 'error'
 			sampAddChatMessage('[SH] {FFFFFF}Не удалось начать вход в Яндекс Музыку.', 0xFF5345)
 			return
@@ -6416,14 +6671,15 @@ function ym_auth_start()
 		debug_log('ym device code received; interval=%s', tostring(data.interval))
 		mus.ym_user_code = data.user_code
 		mus.ym_interval = tonumber(data.interval) or 5
-		local url = data.verification_url or 'https://ya.ru/device'
-		if type(url) ~= 'string' or not url:match('^https://') then url = 'https://ya.ru/device' end
+		local url = 'https://ya.ru/device'
 		setClipboardText(tostring(data.user_code))
 		shell32.ShellExecuteA(nil, 'open', url, nil, nil, 1)
 		sampAddChatMessage('[SH] {FFFFFF}Код входа: {FFD700}' .. tostring(data.user_code) .. '{FFFFFF} скопирован в буфер. Открыт ' .. url, 0xFF5345)
 		ym_auth_wait(data.device_code, tonumber(data.expires_in) or 300)
 	end, function(err)
-		print(err)
+		if mus.ym_attempt ~= attempt then return end
+		mus.ym_attempt = nil
+		debug_log('ym auth ! %s', tostring(err))
 		mus.ym_status = 'error'
 		sampAddChatMessage('[SH] {FFFFFF}Не удалось начать вход в Яндекс Музыку.', 0xFF5345)
 	end)
@@ -6458,16 +6714,14 @@ function ym_auth_poll()
 		local ok, data = pcall(json.decode, response.text)
 		if not ok or type(data) ~= 'table' then return end
 		debug_log('ym poll err=%s', tostring(data.error))
-		if data.access_token then
-			mus.ym_auth = nil
-			setting.ym_token = data.access_token
-			setting.ym_uid = ''
-			ym_playlists = nil
-			mus.ym_status = 'ok'
-			save()
-			sampAddChatMessage('[SH] {FFFFFF}Вход в Яндекс Музыку выполнен.', 0xFF5345)
+		if type(data.access_token) == 'string' and data.access_token ~= '' then
+			local saved = ym_set_account(data.access_token)
+			local message = saved and 'Вход в Яндекс Музыку выполнен.'
+				or 'Вход выполнен на этот запуск. Сохранить данные входа не удалось.'
+			sampAddChatMessage('[SH] {FFFFFF}' .. message, 0xFF5345)
 		elseif data.error == 'slow_down' then
 			mus.ym_interval = (mus.ym_interval or 5) + 5
+			auth.next_time = os.time() + mus.ym_interval
 		elseif data.error and data.error ~= 'authorization_pending' then
 			mus.ym_auth = nil
 			mus.ym_status = 'error'
@@ -6517,17 +6771,22 @@ function sefon_http(url, resolve, reject)
 		end
 		local code = ffi.new('unsigned long[1]')
 		local clen = ffi.new('unsigned long[1]', 4)
-		wi.HttpQueryInfoA(h, 19 + 0x20000000, code, clen, nil)
-		local buf, got = ffi.new('char[65536]'), ffi.new('unsigned long[1]')
-		local parts, total = {}, 0
-		while wi.InternetReadFile(h, buf, 65536, got) ~= 0 and got[0] > 0 do
-			parts[#parts + 1] = ffi.string(buf, got[0])
-			total = total + got[0]
-			if total > 8 * 1024 * 1024 then break end
-		end
+		local ok, result = pcall(function()
+			assert(wi.HttpQueryInfoA(h, 19 + 0x20000000, code, clen, nil) ~= 0, 'Missing HTTP status')
+			local buf, got = ffi.new('char[65536]'), ffi.new('unsigned long[1]')
+			local parts, total = {}, 0
+			while true do
+				assert(wi.InternetReadFile(h, buf, 65536, got) ~= 0, 'Incomplete HTTP response')
+				if got[0] == 0 then break end
+				total = total + tonumber(got[0])
+				assert(total <= 8 * 1024 * 1024, 'HTTP response too large')
+				parts[#parts + 1] = ffi.string(buf, got[0])
+			end
+			return {status_code = tonumber(code[0]), text = table.concat(parts)}
+		end)
 		wi.InternetCloseHandle(h)
 		wi.InternetCloseHandle(session)
-		return true, {status_code = tonumber(code[0]), text = table.concat(parts)}
+		return ok, result
 	end)(url, SEFON_UA)
 	table.insert(http_pending, {runner = th, resolve = resolve or function() end, reject = reject or function() end, url = url})
 end
@@ -6833,12 +7092,11 @@ function sefon_page(id, callback)
 	end)
 end
 
-function sefon_show(list, search_token)
+function sefon_show(list, search_token, failed)
 	if search_token ~= mus.search_token then return end
 	if #list == 0 then
-		list[1] = {link = '', artist = 'Ошибка404', name = '', time = '', image = ''}
+		list[1] = {link = '', artist = 'Ошибка404', name = '', time = '', image = '', search_error = failed}
 	end
-	tracks = list
 	tracks = list
 	sefon_fill_times(list)
 end
@@ -6855,10 +7113,11 @@ function sefon_search(search_text)
 		else
 			debug_log('search sefon code=%s', tostring(response.status_code))
 		end
-		sefon_show(list, search_token)
+		local status = tonumber(response.status_code)
+		sefon_show(list, search_token, status ~= 200 and status ~= 404)
 	end, function(err)
 		debug_log('search sefon ! %s', tostring(err))
-		sefon_show({}, search_token)
+		sefon_show({}, search_token, true)
 	end)
 end
 
@@ -7001,7 +7260,7 @@ function music_cover(info, num_i)
 		end)
 		return
 	end
-	if info.image == '' or info.image:find('no%-cover%-150') then
+	if type(info.image) ~= 'string' or info.image == '' or info.image:find('no%-cover%-150') then
 		return apply(nil)
 	end
 	load_image(info.image)
@@ -7104,7 +7363,7 @@ function music_gate()
 		ym_auth_start()
 	end
 	if gui.Button(u8'Назад##К выбору платформы', {724, 327}, {100, 28}) then
-		mus.ym_auth = nil
+		mus.ym_auth, mus.ym_attempt, mus.ym_user_code = nil, nil, ''
 		mus.ym_status = ''
 		music_platform('')
 	end
@@ -7117,18 +7376,24 @@ playlist_colors = {
 }
 
 function ym_track_item(item)
+	if type(item) ~= 'table' then return end
 	local track = item.track or item
-	local artist = track.artists and track.artists[1] and track.artists[1].name or 'Неизвестно'
-	local album = track.albums and track.albums[1] and track.albums[1].id or 0
-	local seconds = math.floor((tonumber(track.durationMs) or 0) / 1000)
+	if type(track) ~= 'table' or not tostring(track.id):match('^%d+$') then return end
+	local artist_info = type(track.artists) == 'table' and track.artists[1]
+	local artist = type(artist_info) == 'table' and type(artist_info.name) == 'string'
+		and artist_info.name or 'Неизвестно'
+	local album_info = type(track.albums) == 'table' and track.albums[1]
+	local album = type(album_info) == 'table' and tonumber(album_info.id) or 0
+	local duration = tonumber(track.durationMs) or 0
+	local seconds = duration >= 0 and duration < 36000000 and math.floor(duration / 1000) or 0
 	local cover = 'no-cover-150'
-	if track.coverUri then
+	if type(track.coverUri) == 'string' then
 		cover = 'https://' .. track.coverUri:gsub('%%+$', '400x400')
 	end
 	return {
 		link = 'yandex:' .. tostring(track.id) .. ':' .. tostring(album),
 		artist = u8:decode(artist),
-		name = u8:decode(track.title or ''),
+		name = u8:decode(type(track.title) == 'string' and track.title or ''),
 		time = string.format('%d:%02d', math.floor(seconds / 60), seconds % 60),
 		image = cover
 	}
@@ -7141,7 +7406,11 @@ function ym_uid_get(callback)
 	end
 	ym_request(YM_API .. '/account/status', function(response)
 		local ok, data = pcall(json.decode, response.text)
-		local uid = ok and data and data.result and data.result.account and data.result.account.uid
+		local result = ok and type(data) == 'table' and data.result
+		local account = type(result) == 'table' and result.account
+		local uid = type(account) == 'table' and account.uid
+		uid = (type(uid) == 'string' or type(uid) == 'number') and tostring(uid) or nil
+		if uid and not uid:match('^%d+$') then uid = nil end
 		if uid then
 			setting.ym_uid = tostring(uid)
 			save()
@@ -7164,10 +7433,12 @@ function ym_tracks_by_ids(ids, callback)
 	end
 	ym_request(YM_API .. '/tracks?track-ids=' .. table.concat(ids, ','), function(response)
 		local ok, data = pcall(json.decode, response.text)
-		local res = ok and data and data.result or {}
+		local res = ok and type(data) == 'table' and data.result
 		local list = {}
-		for i = 1, #res do
-			list[i] = ym_track_item(res[i])
+		if type(res) ~= 'table' then callback(nil); return end
+		for _, entry in ipairs(res) do
+			local item = ym_track_item(entry)
+			if item then list[#list + 1] = item end
 		end
 		callback(list)
 	end, function(err)
@@ -7180,25 +7451,31 @@ function ym_playlists_load()
 	local target = {status = 'loading', list = {}, likes_count = 0}
 	ym_playlists = target
 	ym_uid_get(function(uid)
-		if not uid or ym_playlists ~= target then return end
+		if ym_playlists ~= target then return end
+		if not uid then target.status = 'error'; return end
 		ym_request(YM_API .. '/users/' .. uid .. '/playlists/list', function(response)
 			if ym_playlists ~= target then return end
 			local ok, data = pcall(json.decode, response.text)
-			local res = ok and data and data.result or {}
+			local res = ok and type(data) == 'table' and data.result
+			if type(res) ~= 'table' then target.status = 'error'; return end
 			local list = {}
-			for i = 1, #res do
-				list[i] = {
-					kind = tostring(res[i].kind),
-					title = u8:decode(res[i].title or ''),
-					count = tonumber(res[i].trackCount) or 0
-				}
+			for _, entry in ipairs(res) do
+				if type(entry) == 'table' and (type(entry.kind) == 'string' or type(entry.kind) == 'number')
+					and type(entry.title) == 'string' then
+					list[#list + 1] = {
+						kind = tostring(entry.kind),
+						title = u8:decode(entry.title),
+						count = tonumber(entry.trackCount) or 0
+					}
+				end
 			end
 			target.list = list
 			ym_request(YM_API .. '/users/' .. uid .. '/likes/tracks', function(r2)
 				if ym_playlists ~= target then return end
 				local ok2, d2 = pcall(json.decode, r2.text)
-				local lib = ok2 and d2 and d2.result and d2.result.library
-				target.likes_count = lib and lib.tracks and #lib.tracks or 0
+				local result = ok2 and type(d2) == 'table' and d2.result
+				local lib = type(result) == 'table' and result.library
+				target.likes_count = type(lib) == 'table' and type(lib.tracks) == 'table' and #lib.tracks or 0
 				target.status = 'ok'
 				debug_log('ym playlists=%d likes=%d', #list, target.likes_count)
 			end, function(err)
@@ -7215,20 +7492,25 @@ function ym_playlists_load()
 end
 
 function ym_playlist_open(kind, title)
-	playlist_view = {kind = 'ym', title = title, tracks = {}}
+	local view = {kind = 'ym', title = title, tracks = {}}
+	playlist_view = view
 	ym_uid_get(function(uid)
-		if not uid then return end
+		if not uid or playlist_view ~= view then return end
 		if kind == 'likes' then
 			ym_request(YM_API .. '/users/' .. uid .. '/likes/tracks', function(response)
+				if playlist_view ~= view then return end
 				local ok, data = pcall(json.decode, response.text)
-				local lib = ok and data and data.result and data.result.library
+				local result = ok and type(data) == 'table' and data.result
+				local lib = type(result) == 'table' and result.library
 				local ids = {}
-				for i = 1, #(lib and lib.tracks or {}) do
-					ids[i] = tostring(lib.tracks[i].id)
+				if type(lib) == 'table' and type(lib.tracks) == 'table' then
+					for _, item in ipairs(lib.tracks) do
+						if type(item) == 'table' and item.id then ids[#ids + 1] = tostring(item.id) end
+					end
 				end
 				ym_tracks_by_ids(ids, function(list)
-					if playlist_view and playlist_view.kind == 'ym' and playlist_view.title == title then
-						playlist_view.tracks = list or {}
+					if playlist_view == view then
+						view.tracks = list or {}
 					end
 				end)
 			end, function(err)
@@ -7237,13 +7519,16 @@ function ym_playlist_open(kind, title)
 		else
 			ym_request(YM_API .. '/users/' .. uid .. '/playlists/' .. tostring(kind), function(response)
 				local ok, data = pcall(json.decode, response.text)
-				local pl = ok and data and data.result
+				local pl = ok and type(data) == 'table' and data.result
 				local list = {}
-				for i = 1, #(pl and pl.tracks or {}) do
-					list[i] = ym_track_item(pl.tracks[i])
+				if type(pl) == 'table' and type(pl.tracks) == 'table' then
+					for _, entry in ipairs(pl.tracks) do
+						local item = ym_track_item(entry)
+						if item then list[#list + 1] = item end
+					end
 				end
-				if playlist_view and playlist_view.kind == 'ym' and playlist_view.title == title then
-					playlist_view.tracks = list
+				if playlist_view == view then
+					view.tracks = list
 				end
 				debug_log('ym playlist open kind=%s tracks=%d', tostring(kind), #list)
 			end, function(err)
@@ -7253,35 +7538,48 @@ function ym_playlist_open(kind, title)
 	end)
 end
 
-function ym_wave_more()
-	if ym_wave_busy then return end
-	ym_wave_busy = true
+function ym_wave_more(refresh)
+	if ym_wave_busy and not refresh then return end
+	local request = {}
+	ym_wave_busy = request
 	ym_request(YM_API .. '/rotor/station/user:onyourwave/tracks?settings2=true', function(response)
+		if ym_wave_busy ~= request then return end
 		ym_wave_busy = false
 		local ok, data = pcall(json.decode, response.text)
-		local seq = ok and data and data.result and data.result.sequence
-		if not seq then
+		local result = ok and type(data) == 'table' and data.result
+		local seq = type(result) == 'table' and result.sequence
+		local list, seen = {}, {}
+		if type(seq) == 'table' then
+			for _, entry in ipairs(seq) do
+				local item = type(entry) == 'table' and entry.track and ym_track_item(entry)
+				if item and not seen[item.link] then
+					list[#list + 1] = item
+					seen[item.link] = true
+				end
+			end
+		end
+		if #list == 0 then
 			ym_wave_failed = true
 			debug_log('ym wave empty')
 			return
 		end
 		ym_wave_failed = false
-		local added = 0
-		for i = 1, #seq do
-			if seq[i].track then
-				local item = ym_track_item(seq[i].track)
-				local exists = false
-				for k = 1, #ym_wave do
-					if ym_wave[k].link == item.link then exists = true break end
-				end
-				if not exists then
-					table.insert(ym_wave, item)
-					added = added + 1
-				end
+		if refresh then
+			local current = playlist_playing == ym_wave and play.tab == 'PLAYLIST' and play.info.link and play.info
+			for i = #ym_wave, 1, -1 do ym_wave[i] = nil end
+			if current then
+				ym_wave[1] = current
+				play.i = 1
 			end
 		end
-		debug_log('ym wave +%d total=%d', added, #ym_wave)
+		seen = {}
+		for _, item in ipairs(ym_wave) do seen[item.link] = true end
+		for _, item in ipairs(list) do
+			if not seen[item.link] then ym_wave[#ym_wave + 1] = item end
+		end
+		debug_log('ym wave total=%d', #ym_wave)
 	end, function(err)
+		if ym_wave_busy ~= request then return end
 		ym_wave_busy = false
 		ym_wave_failed = true
 		debug_log('ym wave ! %s', tostring(err))
@@ -7294,16 +7592,20 @@ function ym_chart_load()
 	ym_request(YM_API .. '/landing3/chart', function(response)
 		ym_chart_busy = false
 		local ok, data = pcall(json.decode, response.text)
-		local pl = ok and data and data.result and data.result.chart
-		local tracks = pl and pl.tracks or {}
-		if #tracks == 0 then
+		local result = ok and type(data) == 'table' and data.result
+		local pl = type(result) == 'table' and result.chart
+		local tracks = type(pl) == 'table' and pl.tracks
+		local list = {}
+		if type(tracks) == 'table' then
+			for _, entry in ipairs(tracks) do
+				local item = ym_track_item(entry)
+				if item then list[#list + 1] = item end
+			end
+		end
+		if #list == 0 then
 			ym_chart_failed = true
 			debug_log('ym chart empty')
 			return
-		end
-		local list = {}
-		for i = 1, #tracks do
-			list[i] = ym_track_item(tracks[i])
 		end
 		ym_chart = list
 		ym_chart_failed = false
@@ -7458,32 +7760,29 @@ end
 function find_track_yandex(search_text, page)
 	mus.search_token = (mus.search_token or 0) + 1
 	local search_token = mus.search_token
-	ym_request(YM_API .. '/search?text=' .. urlencode(search_text) .. '&type=track&page=0', function(response)
+	local function finish(list, failed)
+		if search_token ~= mus.search_token then return end
+		if #list == 0 then
+			list[1] = {link = '', artist = 'Ошибка404', name = '', time = '', image = '', search_error = failed}
+		end
+		tracks = list
+	end
+	local page_index = math.max(0, (tonumber(page) or 1) - 1)
+	ym_request(YM_API .. '/search?text=' .. urlencode(search_text) .. '&type=track&page=' .. page_index, function(response)
 		if search_token ~= mus.search_token then return end
 		local ok, data = pcall(json.decode, response.text)
-		local results = ok and data and data.result and data.result.tracks and data.result.tracks.results
-		debug_log('search yandex q=%s', tostring(search_text))
-		local track_list = {}
-		if results then
-			for i = 1, #results do
-				track_list[i] = ym_track_item(results[i])
-			end
-		else
-			track_list[1] = {link = '', artist = 'Ошибка404', name = '', time = '', image = ''}
+		local result = ok and type(data) == 'table' and data.result
+		local found = type(result) == 'table' and result.tracks
+		local results = type(found) == 'table' and found.results
+		local list = {}
+		if type(results) ~= 'table' then return finish(list, true) end
+		for _, entry in ipairs(results) do
+			local item = ym_track_item(entry)
+			if item then list[#list + 1] = item end
 		end
-		tracks = track_list
-		debug_log('search yandex tracks=%d', #track_list)
-	end, function(err)
-		print(err)
-		if tostring(err):find('401', 1, true) then
-			setting.ym_token = ''
-			setting.ym_uid = ''
-			ym_playlists = nil
-			save()
-			sampAddChatMessage('[SH] {FFFFFF}Токен Яндекс Музыки недействителен, войдите заново.', 0xFF5345)
-		else
-			sampAddChatMessage('{FF6347}[SH] {FFFFFF}Ошибка поиска Яндекс Музыки.', -1)
-		end
+		finish(list, false)
+	end, function()
+		finish({}, true)
 	end)
 end
 
@@ -7496,19 +7795,20 @@ function ym_resolve_link(link, callback)
 	end
 	ym_request(YM_API .. '/tracks/' .. track_id .. '/download-info', function(response)
 		local ok, data = pcall(json.decode, response.text)
-		local infos = ok and data and data.result
-		local best
-		if infos then
-			for i = 1, #infos do
-				local info = infos[i]
-				if info.codec == 'mp3' and not info.preview then
-					if not best or (tonumber(info.bitrateInKbps) or 0) > (tonumber(best.bitrateInKbps) or 0) then
+		local infos = ok and type(data) == 'table' and data.result
+		local best, fallback
+		if type(infos) == 'table' then
+			for _, info in ipairs(infos) do
+				if type(info) == 'table' and type(info.downloadInfoUrl) == 'string' then
+					fallback = fallback or info
+					if info.codec == 'mp3' and not info.preview
+						and (not best or (tonumber(info.bitrateInKbps) or 0) > (tonumber(best.bitrateInKbps) or 0)) then
 						best = info
 					end
 				end
 			end
-			best = best or infos[1]
 		end
+		best = best or fallback
 		if not best or not best.downloadInfoUrl then
 			debug_log('ym resolve no-info')
 			callback(nil)
@@ -7538,129 +7838,183 @@ function ym_resolve_link(link, callback)
 	end)
 end
 
-function play_song(table_track, loop_track, num_i, song_tab, stream_url)
-	debug_log('play_song tab=%s i=%s link=%s resolved=%s', tostring(song_tab), tostring(num_i), tostring(type(table_track) == 'table' and table_track.link), tostring(stream_url ~= nil))
-	if song_tab == 'PLAYLIST' and playlist_playing == ym_wave and num_i >= #ym_wave - 1 then
-		ym_wave_more()
-	end
-	if not stream_url then
-		mus.play_token = mus.play_token + 1
-		cover_drop_pending()
-	end
-	local play_token = mus.play_token
-	if not stream_url and song_tab ~= 'RECORD' and song_tab ~= 'RADIO' then
-		music_cover(table_track, num_i)
-	end
-	local resolver = table_track.link and (table_track.link:sub(1, 7) == 'yandex:' and ym_resolve_link or table_track.link:sub(1, 6) == 'sefon:' and sefon_resolve_link)
-	if not stream_url and resolver then
-		if song_tab ~= 'RECORD' and song_tab ~= 'RADIO' then
-			play.switching = true
-			if get_status_potok_song() ~= 0 then
-				bass.BASS_ChannelStop(play.stream)
-			end
-			resolver(table_track.link, function(url)
-				if play_token ~= mus.play_token then return end
-				if url then
-					play_song(table_track, loop_track, num_i, song_tab, url)
-				else
-					play.switching = false
-					play.status = 'STOP'
-					sampAddChatMessage('[SH] {FFFFFF}Не удалось получить трек.', 0xFF5345)
+do
+	local opening, queued
+
+	local function begin(job)
+		local ok, problem = pcall(function()
+			job.result, job.decision = effil.channel(), effil.channel()
+			job.runner = effil.thread(function(url, fallback, flags, device, result, decision)
+				local ffi = require 'ffi'
+				ffi.cdef[[
+					int __stdcall BASS_SetDevice(unsigned long device);
+					unsigned long __stdcall BASS_StreamCreateURL(const char*, unsigned long, unsigned long, void*, void*);
+					int __stdcall BASS_StreamFree(unsigned long handle);
+					int __stdcall BASS_ErrorGetCode(void);
+				]]
+				local api = ffi.load('bass')
+				if device and device >= 0 and device < 4294967295 and api.BASS_SetDevice(device) == 0 then
+					result:push(0, tonumber(api.BASS_ErrorGetCode()))
+					return
 				end
-			end, table_track)
+				local handle = tonumber(api.BASS_StreamCreateURL(url, 0, flags, nil, nil))
+				if handle == 0 and fallback and not decision:pop(0) then
+					handle = tonumber(api.BASS_StreamCreateURL(fallback, 0, flags, nil, nil))
+				end
+				result:push(handle, handle == 0 and tonumber(api.BASS_ErrorGetCode()) or nil)
+				if handle ~= 0 and decision:pop() ~= 'accept' then api.BASS_StreamFree(handle) end
+			end)(job.url, job.fallback, job.flags, tonumber(bass.BASS_GetDevice()), job.result, job.decision)
+		end)
+		if not ok then
+			job.done(0, problem)
+			return
 		end
+		opening = job
+	end
+
+	function music_stream_open(url, fallback, flags, token, done)
+		local job = {url = url, fallback = fallback, flags = flags, token = token, done = done}
+		if opening then
+			queued = job
+		else
+			begin(job)
+		end
+	end
+
+	function music_stream_tick()
+		local job = opening
+		if not job then return end
+		local handle, problem = job.result:pop(0)
+		if handle == nil then
+			local ok, status, failure = pcall(function() return job.runner:status() end)
+			if ok and (status == 'running' or status == 'paused') then return end
+			-- A worker can publish its result between the first poll and status().
+			handle, problem = job.result:pop(0)
+			if handle == nil then handle, problem = 0, failure or status end
+		end
+		local current = job.token == mus.play_token
+		job.decision:push(current and handle ~= 0 and 'accept' or 'discard')
+		opening = nil
+		if current then job.done(handle, problem) end
+		if not opening and queued then
+			local next_job = queued
+			queued = nil
+			if next_job.token == mus.play_token then begin(next_job) end
+		end
+	end
+
+	function music_stream_shutdown()
+		queued = nil
+		if opening then
+			opening.decision:push('discard')
+			opening = nil
+		end
+	end
+end
+
+function play_song(table_track, loop_track, num_i, song_tab, stream_url)
+	local radio = song_tab == 'RECORD' or song_tab == 'RADIO'
+	local from_wave = song_tab == 'PLAYLIST' and playlist_playing == ym_wave
+	local link = radio and table_track or type(table_track) == 'table' and table_track.link
+	if type(link) ~= 'string' or link == '' then
+		play.switching = false
 		return
 	end
-	if song_tab ~= 'RECORD' and song_tab ~= 'RADIO' then
-		local cp = play.cover_pending
-		local cover_ready = cp and cp.token == play_token
-		if not cover_ready and play.cover_wait_token ~= play_token then
-			play.cover_wait_token = play_token
-			play.switching = true
-			local go_url = stream_url or table_track.link
-			lua_thread.create(function()
-				local t0 = os.clock()
-				while play_token == mus.play_token and os.clock() - t0 < 3 do
-					local p = play.cover_pending
-					if p and p.token == play_token then break end
-					wait(0)
-				end
-				if play_token ~= mus.play_token then return end
-				play_song(table_track, loop_track, num_i, song_tab, go_url)
-			end)
-			return
-		end
-		play.i = num_i
-		play.info = table_track
-		play.time = 0
-		play.seek_base = 0
-		play.status = 'PLAY'
-		play.switching = false
-		play.len_time = get_track_length(play.info.time)
-		play.tab = song_tab
-		
-		sh_audit.audio_release()
-		
-		local link = stream_url or play.info.link
-				debug_log('play source=%s', tostring(play.info.link and play.info.link:match('^(%w+):') or 'file'))
-		local flag = loop_track and BASS_SAMPLE_LOOP or BASS_STREAM_AUTOFREE
-		if not link:find('^http') then
-			flag = bit.bor(flag, 0x20000)
-		end
-		if link:find('^http') then
-			local stream_link = link
-			if link:find('hitmoz.org', 1, true) then
-				stream_link = link .. '\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36\r\nAccept-Language: ru-RU,ru;q=0.9\r\nReferer: https://ru.hitmoz.org/\r\n'
-			end
-			play.stream = bass.BASS_StreamCreateURL(stream_link, 0, flag, nil, nil)
-			if (not play.stream or play.stream == 0) and tostring(play.info.link):sub(1, 6) == 'sefon:' then
-				play.stream = bass.BASS_StreamCreateURL(link .. '\r\nReferer: https://sefon.pro/\r\n', 0, flag, nil, nil)
-			end
 
-		else
-			play.stream = bass.BASS_StreamCreateFile(0, ffi.cast('const char*', link), 0, 0, flag)
+	if not stream_url then
+		if from_wave and num_i >= #ym_wave - 1 then
+			ym_wave_more()
 		end
-		if not play.stream or play.stream == 0 then
-			play.status = 'STOP'
-			play.switching = false
-			sampAddChatMessage('[SH] {FFFFFF}Не удалось открыть поток трека.', 0xFF5345)
+		mus.play_token = mus.play_token + 1
+		cover_drop_pending()
+		cover_release()
+		play.image_label = image_no_label
+		sh_audit.audio_release()
+		play.switching = true
+		if not radio then music_cover(table_track, num_i) end
+	end
+
+	local token = mus.play_token
+	local function fail(message, problem)
+		cover_drop_pending()
+		play.switching = false
+		play.status = 'STOP'
+		debug_log('play failed: %s', tostring(problem))
+		sampAddChatMessage('[SH] {FFFFFF}' .. message, 0xFF5345)
+	end
+
+	local resolver
+	if not radio and not stream_url then
+		if link:sub(1, 7) == 'yandex:' then resolver = ym_resolve_link
+		elseif link:sub(1, 6) == 'sefon:' then resolver = sefon_resolve_link end
+	end
+	if resolver then
+		resolver(link, function(url)
+			if token ~= mus.play_token then return end
+			if url then
+				play_song(table_track, loop_track, num_i, song_tab, url)
+			else
+				fail('Не удалось получить трек.')
+			end
+		end, table_track)
+		return
+	end
+
+	local source = stream_url or link
+	local flags = (radio or loop_track) and BASS_SAMPLE_LOOP or 0
+	local function ready(handle, problem)
+		if not handle or handle == 0 then
+			fail(radio and 'Не удалось открыть поток радио.' or 'Не удалось открыть поток трека.', problem)
 			return
 		end
-		bass.BASS_ChannelPlay(play.stream, false)
-		debug_log('bass stream=%s act=%s err=%s', tostring(play.stream), tostring(get_status_potok_song()), tostring(bass.BASS_ErrorGetCode()))
-		bass.BASS_ChannelSetAttribute(play.stream, BASS_ATTRIB_VOL, play.volume)
-		if not play.len_time or play.len_time <= 0 or play.len_time == 999 then
-			local okl, sec = pcall(function()
-				return tonumber(bass.BASS_ChannelBytes2Seconds(play.stream, bass.BASS_ChannelGetLength(play.stream, BASS_POS_BYTE)))
+
+		play.stream = handle
+		if bass.BASS_ChannelPlay(handle, false) == 0 then
+			local bass_error = bass.BASS_ErrorGetCode()
+			sh_audit.audio_release()
+			fail('Не удалось начать воспроизведение.', bass_error)
+			return
+		end
+		if from_wave and playlist_playing == ym_wave then
+			local found
+			for index, item in ipairs(ym_wave) do
+				if item.link == link then found = index; break end
+			end
+			if not found then
+				table.insert(ym_wave, 1, table_track)
+				found = 1
+			end
+			num_i = found
+		end
+		play.i, play.info, play.tab = num_i, radio and {} or table_track, song_tab
+		play.time, play.pos_time, play.seek_base = 0, 0, 0
+		play.status, play.switching = 'PLAY', false
+		play.len_time = radio and 0 or get_track_length(type(table_track.time) == 'string' and table_track.time or '')
+		bass.BASS_ChannelSetAttribute(handle, BASS_ATTRIB_VOL, play.volume)
+		if not radio and (play.len_time <= 0 or play.len_time == 999) then
+			local ok, seconds = pcall(function()
+				return tonumber(bass.BASS_ChannelBytes2Seconds(handle, bass.BASS_ChannelGetLength(handle, BASS_POS_BYTE)))
 			end)
-			debug_log('len из потока ok=%s sec=%s', tostring(okl), tostring(sec))
-			if okl and sec and sec > 0 and sec < 36000 then
-				play.len_time = math.floor(sec + 0.5)
+			if ok and seconds and seconds > 0 and seconds < 36000 then
+				play.len_time = math.floor(seconds + 0.5)
 				play.info.time = string.format('%d:%02d', math.floor(play.len_time / 60), play.len_time % 60)
 			end
 		end
-		play.loaded_token = play_token
+		play.loaded_token = token
 		cover_try_commit()
-	else
-		play.i = num_i
-		play.info = {}
-		play.time = 0
-		play.status = 'PLAY'
-		play.len_time = 0
-		play.tab = song_tab
-		
-		sh_audit.audio_release()
-		
-		play.stream = bass.BASS_StreamCreateURL(table_track, 0, BASS_SAMPLE_LOOP, nil, nil)
-		if not play.stream or play.stream == 0 then
-			play.status = 'STOP'
-			sampAddChatMessage('[SH] {FFFFFF}Не удалось открыть поток радио.', 0xFF5345)
-			return
+	end
+
+	if source:match('^https?://') then
+		local stream_link, fallback = source, nil
+		if source:find('hitmoz.org', 1, true) then
+			stream_link = source .. '\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36\r\nAccept-Language: ru-RU,ru;q=0.9\r\nReferer: https://ru.hitmoz.org/\r\n'
+		elseif not radio and link:sub(1, 6) == 'sefon:' then
+			fallback = source .. '\r\nReferer: https://sefon.pro/\r\n'
 		end
-		bass.BASS_ChannelPlay(play.stream, false)
-		bass.BASS_ChannelSetAttribute(play.stream, BASS_ATTRIB_VOL, play.volume)
-		
-		play.image_label = image_no_label
+		music_stream_open(stream_link, fallback, flags, token, ready)
+	else
+		local handle = bass.BASS_StreamCreateFile(0, ffi.cast('const char*', source), 0, 0, bit.bor(flags, 0x20000))
+		ready(handle, bass.BASS_ErrorGetCode())
 	end
 end
 
@@ -7884,13 +8238,13 @@ function control_song_when_finished()
 		bass.BASS_ChannelPlay(play.stream, false)
 	elseif status == 0 and play.status == 'PLAY' and not play.switching then
 		play.switching = true
-		if play.repeat_track == 2 then
-			play_song(play.info, play.repeat_track == 2, play.i, play.tab)
-		elseif not next_track(play.repeat_track == 1) then
+		local radio = play.tab == 'RECORD' or play.tab == 'RADIO'
+		if not radio and play.repeat_track == 2 then
+			play_song(play.info, true, play.i, play.tab)
+		elseif radio or not next_track(play.repeat_track == 1) then
+			sh_audit.audio_release()
 			play.switching = false
-			if play.tab ~= 'RECORD' and play.tab ~= 'RADIO' then
-				play.status = 'STOP'
-			end
+			play.status = 'STOP'
 		end
 	end
 end
@@ -7968,6 +8322,351 @@ local function winter_style_chip(id, x, y, w, h, title, dot, active)
 	return clicked
 end
 local members_settings_anim = nil
+sh_settings_search = {
+	buffer = ffi.new('char[160]'),
+	progress = 0,
+	tab_names = {
+		[1] = 'Личная информация',
+		[2] = 'Игровой чат',
+		[3] = 'Ценовая политика',
+		[4] = 'Быстрый доступ',
+		[5] = 'Мемберс',
+		[6] = 'Доп. функции',
+		[7] = 'Уведомления',
+		[8] = 'Акцент',
+		[9] = 'Другие функции',
+		[10] = 'Оформление',
+		[11] = 'Параметры скрипта',
+		[12] = 'Обновление',
+		[13] = 'О скрипте',
+		[14] = 'Команды',
+		[15] = 'Шпаргалки',
+		[16] = 'Департамент',
+		[17] = 'Собеседование',
+		[18] = 'Напоминания',
+		[19] = 'Статистика',
+		[20] = 'Музыка',
+		[21] = 'РП зона',
+		[22] = 'Действия',
+		[23] = 'Доп. функции',
+		[24] = 'Браузер',
+	},
+	entries = {
+		{1, 'Никнейм на русском', ''},
+		{1, 'Пол персонажа', ''},
+		{1, 'Организация', ''},
+		{1, 'Должность', ''},
+		{2, 'Скрыть сообщения чата (общий фильтр)', 'фильтр чат'},
+		{2, 'Заменить сообщения о флуде всплывающей надписью', ''},
+		{2, 'Изменить цвет ника по цвету организации', ''},
+		{2, 'Заменять цвет текста в IC сообщениях', ''},
+		{2, 'Заменять цвет текста в /s', ''},
+		{2, 'Заменять цвет текста в /c', ''},
+		{2, 'Заменять цвет текста в /b', ''},
+		{2, 'Корректор чата', ''},
+		{2, 'Автокоррекция отыгровок /me, /do, /todo', ''},
+		{2, 'Автоотыгровка при принятии и закрытии документов', ''},
+		{2, 'Автоотыгровка дубинки', ''},
+		{2, 'Автоотыгровка /time', ''},
+		{2, 'Автоотыгровка /r', ''},
+		{2, 'Тег в рацию /r', ''},
+		{2, 'Использовать автоотыгровки при взаимодействии с оружием', ''},
+		{2, 'Автоматический перенос длинного текста в игровом чате', ''},
+		{4, 'Круговое меню быстрого доступа', 'радиальное меню колесо'},
+		{4, 'Текущая активация', ''},
+		{5, 'Мемберс организации на Вашем экране', 'members список сотрудников'},
+		{7, 'Уведомлять звуковым сигналом о спавне авто', ''},
+		{7, 'Уведомлять о вызове организации в рации департамента', ''},
+		{8, 'Использовать акцент в разговоре', ''},
+		{9, 'Автоматическое принятие документов', ''},
+		{9, 'Отключить команду рации департамента', ''},
+		{9, 'Отображать под миникартой расстояние до серверной метки', ''},
+		{9, 'Отображать под миникартой расстояние до пользовательской метки', ''},
+		{9, 'Скриншот экрана + /time командой /ts', ''},
+		{9, 'Отображать дату и время под миникартой', ''},
+		{9, 'Клавиша для остановки отыгровки', 'page down'},
+		{9, 'Клавиша для продолжения отыгровки', 'enter'},
+		{9, 'Изменить значение текущего времени', ''},
+		{9, 'Авто-домкрат (перевёрнутый транспорт)', ''},
+		{9, 'Автоматически кикать при привышение нормы АФК', 'afk'},
+		{10, 'Светлое оформление', ''},
+		{10, 'Тёмное оформление', ''},
+		{10, 'Цветовой акцент', ''},
+		{10, 'Прозрачность окна', ''},
+		{10, 'Зимнее оформление', 'зима снег тема'},
+		{10, 'Заменять уведомления скрипта на оконные', 'cef всплывающие'},
+		{11, 'Комбинация клавиш для открытия скрипта', ''},
+		{11, 'Дополнительная команда для открытия скрипта', ''},
+		{11, 'Анимация движения окон', ''},
+		{11, 'Приветственное сообщение при запуске скрипта', ''},
+		{11, 'Порядок расположения вкладок', ''},
+		{11, 'Отображать кнопку закрытия скрипта', ''},
+		{11, 'Отображать лог ошибок в чате игры в случае сбоя скрипта', ''},
+		{12, 'Автообновление', 'версия апдейт'},
+		{16, 'Настройки мини-департамента', ''},
+		{17, 'Передавать в аргумент команды id игрока', ''},
+		{19, 'Отображать статистику онлайна на экране', ''},
+		{5, 'Отображать id игроков', '', function() return setting.mb.func end},
+		{5, 'Отображать ранг игроков', '', function() return setting.mb.func end},
+		{5, 'Отображать время АФК', '', function() return setting.mb.func end},
+		{5, 'Отображать количество выговоров', '', function() return setting.mb.func end},
+		{5, 'Отображать теги организации в никнеймах', '', function() return setting.mb.func end},
+		{5, 'Выделять цветом тех, кто в форме', '', function() return setting.mb.func end},
+		{5, 'Скрывать при открытом диалоге', '', function() return setting.mb.func end},
+		{5, 'Инверсировать текст', '', function() return setting.mb.func end},
+		{5, 'Флаг шрифта', '', function() return setting.mb.func end},
+		{5, 'Прозрачность', '', function() return setting.mb.func end},
+		{5, 'Расстояние между строками', '', function() return setting.mb.func end},
+		{5, 'Сотрудники в форме', '', function() return setting.mb.func end},
+		{5, 'Сотрудники без формы', '', function() return setting.mb.func end},
+		{5, 'Отображать только сотрудников со следующими рангами:', '', function() return setting.mb.func end},
+		{5, 'Положение текста на экране', '', function() return setting.mb.func end},
+		{5, 'Максимум сотрудников на экране', '', function() return setting.mb.func end},
+		{6, 'Умный розыск', '', function() return setting.org >= 11 and setting.org <= 15 end},
+		{6, 'Умные штрафы', '', function() return setting.org >= 11 and setting.org <= 15 end},
+		{6, 'Быстрое включение сирены', '', function() return setting.org >= 11 and setting.org <= 15 end},
+		{6, 'Расшифровка тен-кодов в чате.', '', function() return setting.org >= 11 and setting.org <= 15 end},
+		{6, 'Сообщать при заезде в опасный район', '', function() return setting.org >= 11 and setting.org <= 15 end},
+		{6, 'Auto Find', '', function() return setting.org >= 11 and setting.org <= 15 end},
+		{6, 'Автоматическое помечание /z', '', function() return setting.org >= 11 and setting.org <= 15 end},
+		{6, 'Автоматически включать боди камеру', '', function() return setting.org >= 11 and setting.org <= 15 end},
+		{6, 'Принимать запрос на выдачу розыска', '', function() return setting.org >= 11 and setting.org <= 15 end},
+		{6, 'Умный Wanted', '', function() return setting.org >= 11 and setting.org <= 15 end},
+		{6, 'Одевание маски в форме SWAT', '', function() return setting.org >= 11 and setting.org <= 15 end},
+		{6, 'Не закрывать диалог /take после выбора предмета', '', function() return setting.org >= 11 and setting.org <= 15 end},
+		{6, 'Список разыскиваемых на Вашем экране', '', function() return setting.org >= 11 and setting.org <= 15 end},
+		{6, 'Упростить систему выездов на пожары', '', function() return setting.org == 9 end},
+		{6, 'Упростить систему вызовов /godeath', '', function() return setting.org <= 4 end},
+		{6, 'Авто Heal', '', function() return setting.org <= 4 end},
+		{6, 'Умный тюремный срок', '', function() return setting.org == 10 end},
+		{3, 'Как скопировать цены', '', function() return setting.org == 5 end},
+		{9, 'Команда для остановки отыгровки', 'stop отменить'},
+		{9, 'Команда для продолжения отыгровки', 'continue'},
+		{24, 'Текущая активация курсора', 'браузер управление клавиша', function() return sh_settings_search.browser_available(true) end},
+		{24, 'Поисковая система браузера', 'яндекс гугл google', function() return sh_settings_search.browser_available() end},
+		{24, 'Где открывать браузер', 'отдельное окно', function() return sh_settings_search.browser_available() end},
+		{24, 'Сохранять куки браузера между запусками?', 'cookies', function() return sh_settings_search.browser_available() and (setting.browser_cookies == "yes" or setting.browser_cookies == "no") end},
+		{14, 'Команда для открытия вкладки:', ''},
+		{14, 'Клавиша активации для открытия вкладки:', ''},
+		{15, 'Команда для открытия вкладки:', ''},
+		{15, 'Клавиша активации для открытия вкладки:', ''},
+		{17, 'Команда для открытия вкладки:', ''},
+		{17, 'Клавиша активации для открытия вкладки:', ''},
+		{18, 'Команда для открытия вкладки:', ''},
+		{18, 'Клавиша активации для открытия вкладки:', ''},
+		{20, 'Команда для открытия вкладки:', ''},
+		{20, 'Клавиша активации для открытия вкладки:', ''},
+		{21, 'Команда для открытия вкладки:', ''},
+		{21, 'Клавиша активации для открытия вкладки:', ''},
+		{22, 'Команда для открытия вкладки:', ''},
+		{22, 'Клавиша активации для открытия вкладки:', ''},
+		{24, 'Команда для открытия вкладки:', ''},
+		{24, 'Клавиша активации для открытия вкладки:', ''},
+	}
+}
+
+function sh_settings_search.normalize(value)
+	return value:lower():gsub('[А-ЯЁё]', function(char)
+		if char == 'Ё' or char == 'ё' then return 'е' end
+		return string.char(char:byte() + 32)
+	end)
+end
+
+function sh_settings_search.matches(query)
+	local words = {}
+	for word in sh_settings_search.normalize(query):gmatch('%S+') do
+		word = word:gsub('^/+', '')
+		if word ~= '' then words[#words + 1] = word end
+	end
+	if #words == 0 then return {} end
+	local hits = {}
+	for index, item in ipairs(sh_settings_search.entries) do
+		local title = sh_settings_search.normalize(item[2])
+		local combined = title .. ' ' .. sh_settings_search.normalize(item[3] .. ' ' .. sh_settings_search.tab_names[item[1]])
+		local matches, score = true, 0
+		for _, word in ipairs(words) do
+			local first = title:find(word, 1, true)
+			if first then
+				score = score + (first == 1 and 3 or 2)
+			elseif not combined:find(word, 1, true) then
+				matches = false
+				break
+			end
+		end
+		if matches and (not item[4] or item[4]()) then hits[#hits + 1] = {item = item, score = score, index = index} end
+	end
+	table.sort(hits, function(a, b)
+		if a.score == b.score then return a.index < b.index end
+		return a.score > b.score
+	end)
+	return hits
+end
+
+function sh_settings_search.mark(text)
+	local state = sh_settings_search
+	local target = state.target
+	if state.scope ~= tab_settings or not target or target[1] ~= tab_settings then return end
+	if os.clock() >= state.expires then state.target = nil; return end
+	local label = target[2]
+	if type(text) ~= 'string' or text:sub(1, #label) ~= label then return end
+	local window = imgui.GetWindowPos()
+	local geometry = state.geometry
+	if window.x ~= geometry.x or window.y ~= geometry.y then return end
+	local pos = imgui.GetCursorScreenPos()
+	state.highlight_y = state.highlight_y or (pos.y + imgui.GetFontSize() * 0.5)
+end
+
+function sh_settings_search.record_geometry(kind, x, y, width, height)
+	local geometry = sh_settings_search.geometry
+	local window = imgui.GetWindowPos()
+	if window.x ~= geometry.x or window.y ~= geometry.y then return end
+	local list = geometry[kind]
+	if kind == 'lines' then list[#list + 1] = y
+	else list[#list + 1] = {x = x, y = y, w = width, h = height} end
+end
+
+function sh_settings_search.highlight_bounds(geometry, y)
+	local card
+	for _, candidate in ipairs(geometry.cards) do
+		if y >= candidate.y and y < candidate.y + candidate.h and (not card or candidate.h < card.h) then
+			card = candidate
+		end
+	end
+	if not card then return geometry.x + 18, y - 16, geometry.x + 600, y + 16 end
+	local top, bottom = card.y, card.y + card.h
+	for _, line in ipairs(geometry.lines) do
+		if line < y and line > top then top = line end
+		if line > y and line < bottom then bottom = line end
+	end
+	return card.x + 2, top + 2, card.x + card.w - 2, bottom - 2
+end
+
+function sh_settings_search.paint_highlight()
+	local state = sh_settings_search
+	if not state.highlight_y or not state.geometry then return end
+	local left, top, right, bottom = sh_settings_search.highlight_bounds(state.geometry, state.highlight_y)
+	if bottom <= top then return end
+	if state.scroll_pending then
+		local current = imgui.GetScrollY()
+		local center = (top + bottom) * 0.5
+		local desired = math.max(0, current + center - state.geometry.y - imgui.GetWindowHeight() * 0.5)
+		local destination = math.min(desired, imgui.GetScrollMaxY())
+		state.scroll_frames = (state.scroll_frames or 0) + 1
+		if state.scroll_frames > 1 and math.abs(current - destination) < 1 then
+			state.scroll_pending = false
+		else
+			imgui.SetScrollY(destination)
+		end
+	end
+	if state.scroll_pending or edit_key or edit_cmd then return end
+	local geometry = state.geometry
+	local window_bottom = geometry.y + imgui.GetWindowHeight()
+	if bottom <= geometry.y or top >= window_bottom then return end
+	if not state.visible_since then
+		state.visible_since = os.clock()
+		state.expires = state.visible_since + 4
+	end
+	local draw = imgui.GetForegroundDrawList()
+	draw:PushClipRect(imgui.ImVec2(geometry.x, geometry.y),
+		imgui.ImVec2(geometry.x + imgui.GetWindowWidth(), window_bottom), true)
+	draw:AddRect(imgui.ImVec2(left, top), imgui.ImVec2(right, bottom), imgui.GetColorU32Vec4(cl.def), 4, 15, 1.5)
+	draw:PopClipRect()
+end
+
+function sh_settings_search.draw_header()
+	local state = sh_settings_search
+	local step = math.max(0, imgui.GetIO().DeltaTime) * 9
+	state.progress = state.open and math.min(1, state.progress + step) or math.max(0, state.progress - step)
+	if state.open or state.progress > 0 then
+		local width = 34 + 726 * state.progress
+		local left = 802 - width
+		local top, height = 8, 26
+		gui.DrawBox({left - 4, top}, {width + 4, height}, cl.bg, cl.line, 6, 15)
+		if state.open then
+			imgui.PushFont(font[3])
+			imgui.SetCursorPos(imgui.ImVec2(left + 22, top))
+			imgui.PushItemWidth(width - 24)
+			local clear = imgui.ImVec4(0, 0, 0, 0)
+			imgui.PushStyleColor(imgui.Col.FrameBg, clear)
+			imgui.PushStyleColor(imgui.Col.FrameBgHovered, clear)
+			imgui.PushStyleColor(imgui.Col.FrameBgActive, clear)
+			imgui.PushStyleVarFloat(imgui.StyleVar.FrameBorderSize, 0)
+			imgui.PushStyleVarVec2(imgui.StyleVar.FramePadding, imgui.ImVec2(8, (height - imgui.GetFontSize()) * 0.5))
+			if state.focus then imgui.SetKeyboardFocusHere(); state.focus = false end
+			imgui.InputText('##SHSettingsSearch', state.buffer, ffi.sizeof(state.buffer))
+			local min, max = imgui.GetItemRectMin(), imgui.GetItemRectMax()
+			imgui.PopStyleVar(2)
+			imgui.PopStyleColor(3)
+			imgui.PopItemWidth()
+			local muted = imgui.ImVec4(cl.text.x, cl.text.y, cl.text.z, 0.55)
+			if state.buffer[0] == 0 then
+				local hint = u8'Введите название настройки'
+				local draw = imgui.GetWindowDrawList()
+				draw:PushClipRect(min, max, true)
+				draw:AddText(imgui.ImVec2(min.x + 8, (min.y + max.y - imgui.GetFontSize()) * 0.5),
+					imgui.GetColorU32Vec4(muted), hint)
+				draw:PopClipRect()
+			end
+			imgui.PopFont()
+			gui.FaText(left + 7, top + 8, fa.MAGNIFYING_GLASS, fa_font[2], muted)
+		end
+	end
+	imgui.SetCursorPos(imgui.ImVec2(806, 8))
+	if imgui.InvisibleButton('##SHSettingsSearchToggle', imgui.ImVec2(30, 26)) then
+		state.open = not state.open
+		state.focus = state.open
+		if state.open then ffi.fill(state.buffer, ffi.sizeof(state.buffer)) end
+	end
+	gui.FaText(813, 11, state.open and fa.XMARK or fa.MAGNIFYING_GLASS, fa_font[3], cl.text)
+end
+
+function sh_settings_search.draw_results()
+	local state = sh_settings_search
+	gui.Draw({4, 39}, {840, 369}, cl.tab, 0, 15)
+	imgui.SetCursorPos(imgui.ImVec2(4, 39))
+	imgui.BeginChild('##SHSettingsSearchResults', imgui.ImVec2(840, 369), false)
+	local valid, value = pcall(u8.decode, u8, ffi.string(state.buffer))
+	if not valid then value = '' end
+	if state.last_query ~= value then
+		state.last_query, state.results = value, sh_settings_search.matches(value)
+		imgui.SetScrollY(0)
+	end
+	local results = state.results or {}
+	if #results == 0 and value:find('%S') then
+		local label = 'Совпадений не найдено'
+		imgui.PushFont(font[3])
+		local size = imgui.CalcTextSize(u8(label))
+		imgui.PopFont()
+		gui.Text((840 - size.x) * 0.5, (369 - size.y) * 0.5, label, font[3])
+	end
+	for i, result in ipairs(results) do
+		local entry = result.item
+		local y = 10 + (i - 1) * 43
+		imgui.SetCursorPos(imgui.ImVec2(12, y))
+		local clicked = imgui.InvisibleButton('##SHSettingsSearchResult' .. result.index, imgui.ImVec2(808, 38))
+		local hovered = imgui.IsItemHovered()
+		gui.DrawBox({12, y}, {808, 38}, hovered and cl.bg2 or cl.bg, cl.line, 5, 15)
+		gui.Text(23, y + 4, entry[2], font[3])
+		gui.Text(23, y + 20, state.tab_names[entry[1]], font[2])
+		if clicked then
+			state.open, state.focus, state.progress = false, false, 0
+			state.target, state.expires, state.visible_since = entry, os.clock() + 10, nil
+			state.scroll_pending, state.sidebar_pending, state.scroll_frames = true, true, 0
+			tab_settings = entry[1]
+			bool_reset_tab_scroll = false
+			imgui.Scroller.id_bool_scroll[u8'Суть вкладки главное'] = nil
+			if tab_settings == 6 and setting.org == 9 then
+				an[27] = setting.fire.auto_send and 42 or 0
+			elseif tab_settings == 12 and sh_update.check ~= 'checking' and new_version == '0' then
+				update_check()
+			end
+			break
+		end
+	end
+	imgui.EndChild()
+	return true
+end
+
 function hall.settings()
 	gui.Draw({4, 39}, {220, 369}, cl.tab, 0, 15)
 	imgui.SetCursorPos(imgui.ImVec2(4, 39))
@@ -7992,11 +8691,12 @@ function hall.settings()
 					ANIMATE[2] = animate(0, 0, 0, 0, an[27], an[27], 1, 4)
 				end
 			elseif tab_settings == 12 then
-				if search_for_new_version == 0 and new_version == '0' then
-					search_for_new_version = 615
-					update_check()
-				end
+				if sh_update.check ~= 'checking' and new_version == '0' then update_check() end
 			end
+		end
+		if sh_settings_search.sidebar_pending and sh_settings_search.target and sh_settings_search.target[1] == num_return_tab_set then
+			imgui.SetScrollHereY(0.5)
+			sh_settings_search.sidebar_pending = false
 		end
 		if num_return_tab_set == tab_settings then
 			gui.Draw({10, 66 + ((num_pos_plus_tab_set - 1) * 32)}, {200, 29}, cl.def, 4, 15)
@@ -8107,7 +8807,10 @@ function hall.settings()
 	imgui.SetCursorPos(imgui.ImVec2(226, 39 + stroi_pin))
 	--if tab_settings == 4 then size_y_child = 335 end
 	imgui.BeginChild(u8'Суть вкладки главное', imgui.ImVec2(618, 369 - stroi_pin), false, imgui.WindowFlags.NoScrollWithMouse + (tab_settings == 13 and imgui.WindowFlags.NoScrollbar or 0))
-	imgui.Scroller(u8'Суть вкладки главное', img_step[1][0], img_duration[1][0])
+	local target = sh_settings_search.target
+	if not (target and target[1] == tab_settings and sh_settings_search.scroll_pending and os.clock() < sh_settings_search.expires) then
+		imgui.Scroller(u8'Суть вкладки главное', img_step[1][0], img_duration[1][0])
+	end
 	if bool_reset_tab_scroll then
 		bool_reset_tab_scroll = false
 		imgui.SetScrollY(0)
@@ -8327,6 +9030,13 @@ function hall.settings()
 		imgui.EndChild()
 		imgui.EndPopup()
 	end
+	sh_settings_search.scope = tab_settings
+	sh_settings_search.highlight_y = nil
+	local search_target = sh_settings_search.target
+	if search_target and search_target[1] == tab_settings and os.clock() < sh_settings_search.expires then
+		local window = imgui.GetWindowPos()
+		sh_settings_search.geometry = {x = window.x, y = window.y, cards = {}, lines = {}}
+	end
 	if tab_settings == 1 then
 		gui.Text(25, 12, 'Основное', bold_font[1])
 		new_draw(37, 87)
@@ -8354,6 +9064,8 @@ function hall.settings()
 		setting.org = gui.ListTableMove({572, 181}, {u8'Больница Лос-Сантос', u8'Больница Сан-Фиерро', u8'Больница Лас-Вентурас', u8'Больница Джефферсон', u8'Центр Лицензирования', u8'Правительство', u8'Армия Лос-Сантос', u8'Армия Сан-Фиерро', u8'Пожарный департамент', u8'Тюрьма строгого режима', u8'Полиция Лос-Сантос', u8'Полиция Лас-Вентурас', u8'Полиция Сан-Фиерро', u8'Полиция Рэд-Каунти', u8'ФБР'}, setting.org, 'Select Organization')
 		--setting.org = gui.ListTableMove({572, 181}, {u8'Больница Лос-Сантос', u8'Больница Сан-Фиерро', u8'Больница Лас-Вентурас', u8'Больница Джефферсон', u8'Центр Лицензирования', u8'Правительство', u8'Армия Лос-Сантос', u8'Армия Сан-Фиерро', u8'Пожарный департамент', u8'Тюрьма строгого режима', u8'СМИ Лос-Сантос', u8'СМИ Сан-Фиерро', u8'СМИ Лас-Вентурас'}, setting.org, 'Select Organization')
 		if setting.org ~= bool_set_org then
+			col_mb.title = convert_color(sh_audit.members_color("title"))
+			col_mb.work = convert_color(sh_audit.members_color("work"))
 			remove_old_org_commands(setting.org, true)
 			if setting.org <= 4 then --> Для Больниц
 				for i = 1, #cmd_defoult.hospital do
@@ -9079,148 +9791,152 @@ function hall.settings()
 			gui.TextInfo({26, 352}, {'Скрипт будет оставлять окно /getjail открытым на экране, для возможности его скриншота.'})
 			]]
 		elseif setting.org == 5 then
-			new_draw(16, 514)
+			new_draw(16, 63)
+			gui.Text(26, 24, 'Как скопировать цены', bold_font[1])
+			gui.Text(26, 43, 'Введите /givelic [ID игрока] и выберите последний пункт меню:', font[3])
+			gui.Text(26, 60, '[SH] Скопировать цены лицензий в ценовую политику', font[3])
+			new_draw(89, 514)
 			
-			gui.DrawLine({109, 16}, {109, 524}, cl.line)
-			gui.DrawLine({273, 16}, {273, 524}, cl.line)
-			gui.DrawLine({437, 16}, {437, 524}, cl.line)
-			gui.DrawLine({16, 44}, {602, 44}, cl.line)
-			gui.DrawLine({16, 84}, {602, 84}, cl.line)
-			gui.DrawLine({16, 124}, {602, 124}, cl.line)
-			gui.DrawLine({16, 164}, {602, 164}, cl.line)
-			gui.DrawLine({16, 204}, {602, 204}, cl.line)
-			gui.DrawLine({16, 244}, {602, 244}, cl.line)
-			gui.DrawLine({16, 284}, {602, 284}, cl.line)
-			gui.DrawLine({16, 324}, {602, 324}, cl.line)
-			gui.DrawLine({16, 364}, {602, 364}, cl.line)
-			gui.DrawLine({16, 404}, {602, 404}, cl.line)
-			gui.DrawLine({16, 444}, {602, 444}, cl.line)
-			gui.DrawLine({16, 484}, {602, 484}, cl.line)
+			gui.DrawLine({109, 89}, {109, 597}, cl.line)
+			gui.DrawLine({273, 89}, {273, 597}, cl.line)
+			gui.DrawLine({437, 89}, {437, 597}, cl.line)
+			gui.DrawLine({16, 117}, {602, 117}, cl.line)
+			gui.DrawLine({16, 157}, {602, 157}, cl.line)
+			gui.DrawLine({16, 197}, {602, 197}, cl.line)
+			gui.DrawLine({16, 237}, {602, 237}, cl.line)
+			gui.DrawLine({16, 277}, {602, 277}, cl.line)
+			gui.DrawLine({16, 317}, {602, 317}, cl.line)
+			gui.DrawLine({16, 357}, {602, 357}, cl.line)
+			gui.DrawLine({16, 397}, {602, 397}, cl.line)
+			gui.DrawLine({16, 437}, {602, 437}, cl.line)
+			gui.DrawLine({16, 477}, {602, 477}, cl.line)
+			gui.DrawLine({16, 517}, {602, 517}, cl.line)
+			gui.DrawLine({16, 557}, {602, 557}, cl.line)
 			
-			gui.Text(166, 21, '1 месяц', font[3])
-			gui.Text(326, 21, '2 месяца', font[3])
-			gui.Text(490, 21, '3 месяца', font[3])
+			gui.Text(166, 94, '1 месяц', font[3])
+			gui.Text(326, 94, '2 месяца', font[3])
+			gui.Text(490, 94, '3 месяца', font[3])
 			
-			gui.Text(26, 56, 'Авто', font[3])
-			gui.Text(26, 96, 'Мото', font[3])
-			gui.Text(26, 136, 'Полёты', font[3])
-			gui.Text(26, 176, 'Рыбалка', font[3])
-			gui.Text(26, 216, 'Водное т/c', font[3])
-			gui.Text(26, 256, 'Оружие', font[3])
-			gui.Text(26, 296, 'Охота', font[3])
-			gui.Text(26, 336, 'Раскопки', font[3])
-			gui.Text(26, 376, 'Такси', font[3])
-			gui.Text(26, 416, 'Механик', font[3])
-			gui.Text(26, 456, 'Крипта', font[3])
-			gui.Text(26, 496, 'Акции', font[3])
+			gui.Text(26, 129, 'Авто', font[3])
+			gui.Text(26, 169, 'Мото', font[3])
+			gui.Text(26, 209, 'Полёты', font[3])
+			gui.Text(26, 249, 'Рыбалка', font[3])
+			gui.Text(26, 289, 'Водное т/c', font[3])
+			gui.Text(26, 329, 'Оружие', font[3])
+			gui.Text(26, 369, 'Охота', font[3])
+			gui.Text(26, 409, 'Раскопки', font[3])
+			gui.Text(26, 449, 'Такси', font[3])
+			gui.Text(26, 489, 'Механик', font[3])
+			gui.Text(26, 529, 'Крипта', font[3])
+			gui.Text(26, 569, 'Акции', font[3])
 			
 			local bool_set_auto1 = setting.price[2].auto[1]
-			setting.price[2].auto[1] = gui.InputText({140, 58}, 99, setting.price[2].auto[1], u8'Цена авто 1', 20, u8'Цена', 'num')
+			setting.price[2].auto[1] = gui.InputText({140, 131}, 99, setting.price[2].auto[1], u8'Цена авто 1', 20, u8'Цена', 'num')
 			if setting.price[2].auto[1] ~= bool_set_auto1 then save() end
 			local bool_set_auto1 = setting.price[2].auto[2]
-			setting.price[2].auto[2] = gui.InputText({304, 58}, 99, setting.price[2].auto[2], u8'Цена авто 2', 20, u8'Цена', 'num')
+			setting.price[2].auto[2] = gui.InputText({304, 131}, 99, setting.price[2].auto[2], u8'Цена авто 2', 20, u8'Цена', 'num')
 			if setting.price[2].auto[2] ~= bool_set_auto1 then save() end
 			local bool_set_auto1 = setting.price[2].auto[3]
-			setting.price[2].auto[3] = gui.InputText({468, 58}, 99, setting.price[2].auto[3], u8'Цена авто 3', 20, u8'Цена', 'num')
+			setting.price[2].auto[3] = gui.InputText({468, 131}, 99, setting.price[2].auto[3], u8'Цена авто 3', 20, u8'Цена', 'num')
 			if setting.price[2].auto[3] ~= bool_set_auto1 then save() end
 			
 			local bool_set_moto1 = setting.price[2].moto[1]
-			setting.price[2].moto[1] = gui.InputText({140, 98}, 99, setting.price[2].moto[1], u8'Цена мото 1', 20, u8'Цена', 'num')
+			setting.price[2].moto[1] = gui.InputText({140, 171}, 99, setting.price[2].moto[1], u8'Цена мото 1', 20, u8'Цена', 'num')
 			if setting.price[2].moto[1] ~= bool_set_moto1 then save() end
 			local bool_set_moto2 = setting.price[2].moto[2]
-			setting.price[2].moto[2] = gui.InputText({304, 98}, 99, setting.price[2].moto[2], u8'Цена мото 2', 20, u8'Цена', 'num')
+			setting.price[2].moto[2] = gui.InputText({304, 171}, 99, setting.price[2].moto[2], u8'Цена мото 2', 20, u8'Цена', 'num')
 			if setting.price[2].moto[2] ~= bool_set_moto2 then save() end
 			local bool_set_moto3 = setting.price[2].moto[3]
-			setting.price[2].moto[3] = gui.InputText({468, 98}, 99, setting.price[2].moto[3], u8'Цена мото 3', 20, u8'Цена', 'num')
+			setting.price[2].moto[3] = gui.InputText({468, 171}, 99, setting.price[2].moto[3], u8'Цена мото 3', 20, u8'Цена', 'num')
 			if setting.price[2].moto[3] ~= bool_set_moto3 then save() end
 			
 			local bool_set_fly1 = setting.price[2].fly[1]
-			setting.price[2].fly[1] = gui.InputText({140, 138}, 99, setting.price[2].fly[1], u8'Цена полёты', 20, u8'Цена', 'num')
+			setting.price[2].fly[1] = gui.InputText({140, 211}, 99, setting.price[2].fly[1], u8'Цена полёты', 20, u8'Цена', 'num')
 			if setting.price[2].fly[1] ~= bool_set_fly1 then save() end
-			gui.Text(316, 136, 'Недоступно', font[3])
-			gui.Text(480, 136, 'Недоступно', font[3])
+			gui.Text(316, 209, 'Недоступно', font[3])
+			gui.Text(480, 209, 'Недоступно', font[3])
 			
 			local bool_set_fish1 = setting.price[2].fish[1]
-			setting.price[2].fish[1] = gui.InputText({140, 178}, 99, setting.price[2].fish[1], u8'Цена рыба 1', 20, u8'Цена', 'num')
+			setting.price[2].fish[1] = gui.InputText({140, 251}, 99, setting.price[2].fish[1], u8'Цена рыба 1', 20, u8'Цена', 'num')
 			if setting.price[2].fish[1] ~= bool_set_fish1 then save() end
 			local bool_set_fish2 = setting.price[2].fish[2]
-			setting.price[2].fish[2] = gui.InputText({304, 178}, 99, setting.price[2].fish[2], u8'Цена рыба 2', 20, u8'Цена', 'num')
+			setting.price[2].fish[2] = gui.InputText({304, 251}, 99, setting.price[2].fish[2], u8'Цена рыба 2', 20, u8'Цена', 'num')
 			if setting.price[2].fish[2] ~= bool_set_fish2 then save() end
 			local bool_set_fish3 = setting.price[2].fish[3]
-			setting.price[2].fish[3] = gui.InputText({468, 178}, 99, setting.price[2].fish[3], u8'Цена рыба 3', 20, u8'Цена', 'num')
+			setting.price[2].fish[3] = gui.InputText({468, 251}, 99, setting.price[2].fish[3], u8'Цена рыба 3', 20, u8'Цена', 'num')
 			if setting.price[2].fish[3] ~= bool_set_fish3 then save() end
 			
 			local bool_set_swim1 = setting.price[2].swim[1]
-			setting.price[2].swim[1] = gui.InputText({140, 218}, 99, setting.price[2].swim[1], u8'Цена плавание 1', 20, u8'Цена', 'num')
+			setting.price[2].swim[1] = gui.InputText({140, 291}, 99, setting.price[2].swim[1], u8'Цена плавание 1', 20, u8'Цена', 'num')
 			if setting.price[2].swim[1] ~= bool_set_swim1 then save() end
 			local bool_set_swim2 = setting.price[2].swim[2]
-			setting.price[2].swim[2] = gui.InputText({304, 218}, 99, setting.price[2].swim[2], u8'Цена плавание 2', 20, u8'Цена', 'num')
+			setting.price[2].swim[2] = gui.InputText({304, 291}, 99, setting.price[2].swim[2], u8'Цена плавание 2', 20, u8'Цена', 'num')
 			if setting.price[2].swim[2] ~= bool_set_swim2 then save() end
 			local bool_set_swim3 = setting.price[2].swim[3]
-			setting.price[2].swim[3] = gui.InputText({468, 218}, 99, setting.price[2].swim[3], u8'Цена плавание 3', 20, u8'Цена', 'num')
+			setting.price[2].swim[3] = gui.InputText({468, 291}, 99, setting.price[2].swim[3], u8'Цена плавание 3', 20, u8'Цена', 'num')
 			if setting.price[2].swim[3] ~= bool_set_swim3 then save() end
 			
 			local bool_set_gun1 = setting.price[2].gun[1]
-			setting.price[2].gun[1] = gui.InputText({140, 258}, 99, setting.price[2].gun[1], u8'Цена оружие 1', 20, u8'Цена', 'num')
+			setting.price[2].gun[1] = gui.InputText({140, 331}, 99, setting.price[2].gun[1], u8'Цена оружие 1', 20, u8'Цена', 'num')
 			if setting.price[2].gun[1] ~= bool_set_gun1 then save() end
 			local bool_set_gun2 = setting.price[2].gun[2]
-			setting.price[2].gun[2] = gui.InputText({304, 258}, 99, setting.price[2].gun[2], u8'Цена оружие 2', 20, u8'Цена', 'num')
+			setting.price[2].gun[2] = gui.InputText({304, 331}, 99, setting.price[2].gun[2], u8'Цена оружие 2', 20, u8'Цена', 'num')
 			if setting.price[2].gun[2] ~= bool_set_gun2 then save() end
 			local bool_set_gun3 = setting.price[2].gun[3]
-			setting.price[2].gun[3] = gui.InputText({468, 258}, 99, setting.price[2].gun[3], u8'Цена оружие 3', 20, u8'Цена', 'num')
+			setting.price[2].gun[3] = gui.InputText({468, 331}, 99, setting.price[2].gun[3], u8'Цена оружие 3', 20, u8'Цена', 'num')
 			if setting.price[2].gun[3] ~= bool_set_gun3 then save() end
 			
 			local bool_set_hunt1 = setting.price[2].hunt[1]
-			setting.price[2].hunt[1] = gui.InputText({140, 298}, 99, setting.price[2].hunt[1], u8'Цена охота 1', 20, u8'Цена', 'num')
+			setting.price[2].hunt[1] = gui.InputText({140, 371}, 99, setting.price[2].hunt[1], u8'Цена охота 1', 20, u8'Цена', 'num')
 			if setting.price[2].hunt[1] ~= bool_set_hunt1 then save() end
 			local bool_set_hunt2 = setting.price[2].hunt[2]
-			setting.price[2].hunt[2] = gui.InputText({304, 298}, 99, setting.price[2].hunt[2], u8'Цена охота 2', 20, u8'Цена', 'num')
+			setting.price[2].hunt[2] = gui.InputText({304, 371}, 99, setting.price[2].hunt[2], u8'Цена охота 2', 20, u8'Цена', 'num')
 			if setting.price[2].hunt[2] ~= bool_set_hunt2 then save() end
 			local bool_set_hunt3 = setting.price[2].hunt[3]
-			setting.price[2].hunt[3] = gui.InputText({468, 298}, 99, setting.price[2].hunt[3], u8'Цена охота 3', 20, u8'Цена', 'num')
+			setting.price[2].hunt[3] = gui.InputText({468, 371}, 99, setting.price[2].hunt[3], u8'Цена охота 3', 20, u8'Цена', 'num')
 			if setting.price[2].hunt[3] ~= bool_set_hunt3 then save() end
 			
 			local bool_set_exc1 = setting.price[2].exc[1]
-			setting.price[2].exc[1] = gui.InputText({140, 338}, 99, setting.price[2].exc[1], u8'Цена раскопки 1', 20, u8'Цена', 'num')
+			setting.price[2].exc[1] = gui.InputText({140, 411}, 99, setting.price[2].exc[1], u8'Цена раскопки 1', 20, u8'Цена', 'num')
 			if setting.price[2].exc[1] ~= bool_set_exc1 then save() end
 			local bool_set_exc2 = setting.price[2].exc[2]
-			setting.price[2].exc[2] = gui.InputText({304, 338}, 99, setting.price[2].exc[2], u8'Цена раскопки 2', 20, u8'Цена', 'num')
+			setting.price[2].exc[2] = gui.InputText({304, 411}, 99, setting.price[2].exc[2], u8'Цена раскопки 2', 20, u8'Цена', 'num')
 			if setting.price[2].exc[2] ~= bool_set_exc2 then save() end
 			local bool_set_exc3 = setting.price[2].exc[3]
-			setting.price[2].exc[3] = gui.InputText({468, 338}, 99, setting.price[2].exc[3], u8'Цена раскопки 3', 20, u8'Цена', 'num')
+			setting.price[2].exc[3] = gui.InputText({468, 411}, 99, setting.price[2].exc[3], u8'Цена раскопки 3', 20, u8'Цена', 'num')
 			if setting.price[2].exc[3] ~= bool_set_exc3 then save() end
 			
 			local bool_set_taxi1 = setting.price[2].taxi[1]
-			setting.price[2].taxi[1] = gui.InputText({140, 378}, 99, setting.price[2].taxi[1], u8'Цена такси 1', 20, u8'Цена', 'num')
+			setting.price[2].taxi[1] = gui.InputText({140, 451}, 99, setting.price[2].taxi[1], u8'Цена такси 1', 20, u8'Цена', 'num')
 			if setting.price[2].taxi[1] ~= bool_set_taxi1 then save() end
 			local bool_set_taxi2 = setting.price[2].taxi[2]
-			setting.price[2].taxi[2] = gui.InputText({304, 378}, 99, setting.price[2].taxi[2], u8'Цена такси 2', 20, u8'Цена', 'num')
+			setting.price[2].taxi[2] = gui.InputText({304, 451}, 99, setting.price[2].taxi[2], u8'Цена такси 2', 20, u8'Цена', 'num')
 			if setting.price[2].taxi[2] ~= bool_set_taxi2 then save() end
 			local bool_set_taxi3 = setting.price[2].taxi[3]
-			setting.price[2].taxi[3] = gui.InputText({468, 378}, 99, setting.price[2].taxi[3], u8'Цена такси 3', 20, u8'Цена', 'num')
+			setting.price[2].taxi[3] = gui.InputText({468, 451}, 99, setting.price[2].taxi[3], u8'Цена такси 3', 20, u8'Цена', 'num')
 			if setting.price[2].taxi[3] ~= bool_set_taxi3 then save() end
 			
 			local bool_set_meh1 = setting.price[2].meh[1]
-			setting.price[2].meh[1] = gui.InputText({140, 418}, 99, setting.price[2].meh[1], u8'Цена механик 1', 20, u8'Цена', 'num')
+			setting.price[2].meh[1] = gui.InputText({140, 491}, 99, setting.price[2].meh[1], u8'Цена механик 1', 20, u8'Цена', 'num')
 			if setting.price[2].meh[1] ~= bool_set_meh1 then save() end
 			local bool_set_meh2 = setting.price[2].meh[2]
-			setting.price[2].meh[2] = gui.InputText({304, 418}, 99, setting.price[2].meh[2], u8'Цена механик 2', 20, u8'Цена', 'num')
+			setting.price[2].meh[2] = gui.InputText({304, 491}, 99, setting.price[2].meh[2], u8'Цена механик 2', 20, u8'Цена', 'num')
 			if setting.price[2].meh[2] ~= bool_set_meh2 then save() end
 			local bool_set_meh3 = setting.price[2].meh[3]
-			setting.price[2].meh[3] = gui.InputText({468, 418}, 99, setting.price[2].meh[3], u8'Цена механик 3', 20, u8'Цена', 'num')
+			setting.price[2].meh[3] = gui.InputText({468, 491}, 99, setting.price[2].meh[3], u8'Цена механик 3', 20, u8'Цена', 'num')
 			if setting.price[2].meh[3] ~= bool_set_meh3 then save() end
 			
 			local bool_set_crypto1 = setting.price[2].crypto[1]
-			setting.price[2].crypto[1] = gui.InputText({140, 458}, 99, setting.price[2].crypto[1], u8'Цена крипта', 20, u8'Цена', 'num')
+			setting.price[2].crypto[1] = gui.InputText({140, 531}, 99, setting.price[2].crypto[1], u8'Цена крипта', 20, u8'Цена', 'num')
 			if setting.price[2].crypto[1] ~= bool_set_crypto1 then save() end
-			gui.Text(316, 456, 'Недоступно', font[3])
-			gui.Text(480, 456, 'Недоступно', font[3])
+			gui.Text(316, 529, 'Недоступно', font[3])
+			gui.Text(480, 529, 'Недоступно', font[3])
 			
 			local bool_set_stocks1 = setting.price[2].stocks[1]
-			setting.price[2].stocks[1] = gui.InputText({140, 498}, 99, setting.price[2].stocks[1], u8'Цена акции', 20, u8'Цена', 'num')
+			setting.price[2].stocks[1] = gui.InputText({140, 571}, 99, setting.price[2].stocks[1], u8'Цена акции', 20, u8'Цена', 'num')
 			if setting.price[2].stocks[1] ~= bool_set_stocks1 then save() end
-			gui.Text(316, 496, 'Недоступно', font[3])
-			gui.Text(480, 496, 'Недоступно', font[3])
+			gui.Text(316, 569, 'Недоступно', font[3])
+			gui.Text(480, 569, 'Недоступно', font[3])
 			
 			
 			imgui.Dummy(imgui.ImVec2(0, 24))
@@ -9425,7 +10141,7 @@ function hall.settings()
 		
 		if members_settings_anim > 0 then
 			imgui.SetCursorPos(imgui.ImVec2(0, 60))
-			imgui.BeginChild('##members_settings_details', imgui.ImVec2(618, 940 * members_settings_anim), false, imgui.WindowFlags.NoScrollbar + imgui.WindowFlags.NoScrollWithMouse)
+			imgui.BeginChild('##members_settings_details', imgui.ImVec2(618, (1047 + 21 - 60) * members_settings_anim), false, imgui.WindowFlags.NoScrollbar + imgui.WindowFlags.NoScrollWithMouse)
 			local slide_y = -60 - 12 * (1 - members_settings_anim)
 			gui.Text(25, 72 + slide_y, 'Содержимое', bold_font[1])
 			new_draw(97 + slide_y, 215)
@@ -9537,6 +10253,14 @@ function hall.settings()
 			
 			gui.Text(25, 705 + slide_y, 'Цветовой стиль текста', bold_font[1])
 			new_draw(730 + slide_y, 107)
+			local custom = setting.mb.custom_palette
+			local palette_label = custom and (custom.title or custom.work) and 'Палитра организации' or 'Мои цвета'
+			if gui.Button(u8(palette_label), {365, 733 + slide_y}, {180, 24}) then
+				setting.mb.custom_palette = palette_label == 'Мои цвета' and {title = true, work = true} or {}
+				col_mb.title = convert_color(sh_audit.members_color("title"))
+				col_mb.work = convert_color(sh_audit.members_color("work"))
+				save()
+			end
 			gui.Text(26, 739 + slide_y, 'Заголовок', font[3])
 			gui.DrawLine({16, 765 + slide_y}, {602, 765 + slide_y}, cl.line)
 			gui.Text(26, 775 + slide_y, 'Сотрудники в форме', font[3])
@@ -9548,6 +10272,8 @@ function hall.settings()
 				local c = imgui.ImVec4(col_mb.title[0], col_mb.title[1], col_mb.title[2], col_mb.title[3])
 				local argb = imgui.ColorConvertFloat4ToARGB(c)
 				setting.mb.color.title = imgui.ColorConvertFloat4ToARGB(c)
+				setting.mb.custom_palette = setting.mb.custom_palette or {}
+				setting.mb.custom_palette.title = true
 				save()
 			end
 			imgui.SetCursorPos(imgui.ImVec2(564, 770 + slide_y))
@@ -9555,6 +10281,8 @@ function hall.settings()
 				local c = imgui.ImVec4(col_mb.work[0], col_mb.work[1], col_mb.work[2], col_mb.work[3])
 				local argb = imgui.ColorConvertFloat4ToARGB(c)
 				setting.mb.color.work = imgui.ColorConvertFloat4ToARGB(c)
+				setting.mb.custom_palette = setting.mb.custom_palette or {}
+				setting.mb.custom_palette.work = true
 				save()
 			end
 			imgui.SetCursorPos(imgui.ImVec2(564, 806 + slide_y))
@@ -9597,7 +10325,20 @@ function hall.settings()
 				changePosition()
 			end
 			
-			imgui.Dummy(imgui.ImVec2(0, 21))
+			new_draw(990 + slide_y, 57)
+			gui.Text(26, 999 + slide_y, 'Максимум сотрудников на экране', font[3])
+			gui.TextInfo({26, 1022 + slide_y}, {'0 — показывать всех'})
+			local limit = sh_audit.members_limit(setting.mb.max_visible)
+			local input = gui.InputText({465, 998 + slide_y}, 115, tostring(limit),
+				u8'##MembersVisibleLimit', 5, u8'10', 'num')
+			local number = tonumber(input)
+			if number and sh_audit.members_limit(number) ~= limit then
+				setting.mb.max_visible = sh_audit.members_limit(number)
+				save()
+			end
+
+			imgui.SetCursorPos(imgui.ImVec2(16, 1047 + slide_y))
+			imgui.Dummy(imgui.ImVec2(1, 16))
 			imgui.EndChild()
 		end
 	elseif tab_settings == 6 then
@@ -9747,9 +10488,9 @@ function hall.settings()
 				gui.Text(25, 88, 'Взаимодействие с вызовами', bold_font[1])
 				new_draw(113, 179 + an[27])
 				
-				gui.Text(26, 122, 'Принимать последний вызов командой /go', font[3])
+				gui.Text(26, 122, 'Сокращенная команда для открытия вызовов /go', font[3])
 				imgui.SetCursorPos(imgui.ImVec2(561, 118))
-				if gui.Switch(u8'##Принимать последний вызов командой /go', setting.godeath.cmd_go) then
+				if gui.Switch(u8'##Сокращенная команда для открытия вызовов /go', setting.godeath.cmd_go) then
 					setting.godeath.cmd_go = not setting.godeath.cmd_go
 					if setting.godeath.cmd_go then
 						sampRegisterChatCommand('go', function()
@@ -9998,7 +10739,24 @@ function hall.settings()
 				save()
 			end
 			gui.TextInfo({26, 44 + stroi_off}, {'Позволяет удобно выдавать розыск, активация /su'})
-				--> 976 Штрафы сюда
+			new_draw(88 + stroi_off, 53)
+			gui.Text(26, 97 + stroi_off, 'Умные штрафы', font[3])
+			imgui.SetCursorPos(imgui.ImVec2(561, 93 + stroi_off))
+			do
+				local toggled_ticket, new_ticket = gui.Switch('##smart_ticket', setting.police_settings.smart_ticket ~= false)
+				if toggled_ticket then
+					setting.police_settings.smart_ticket = new_ticket
+					if new_ticket then
+						sampRegisterChatCommand('ticket', smart_ticket_func)
+						download_ticket_reasons()
+					else
+						sampUnregisterChatCommand('ticket')
+					end
+					save()
+				end
+			end
+			gui.TextInfo({26, 116 + stroi_off}, {'Позволяет выписывать штрафы по АК, активация /ticket'})
+			stroi_off = stroi_off + 72
 			new_draw(88 + stroi_off, 53)
 			gui.Text(26, 98 + stroi_off, 'Быстрое включение сирены', font[3])
 			imgui.SetCursorPos(imgui.ImVec2(561, 93 + stroi_off))
@@ -10094,25 +10852,16 @@ function hall.settings()
 			end
 			gui.TextInfo({26, 188 + stroi_off}, {'Расшифровывает полицейские тен-коды (10-XX) в чате.'})
 
-			new_draw(232 + stroi_off, 53)
-			gui.Text(26, 232 + 9 + stroi_off, 'Заполнять бланк расследования', font[3])
-			imgui.SetCursorPos(imgui.ImVec2(561, 232 + 5 + stroi_off))
-			if gui.Switch(u8'##auto_inves_toggle', setting.police_settings.auto_inves) then
-				setting.police_settings.auto_inves = not setting.police_settings.auto_inves
-				save()
-			end
-			gui.TextInfo({26, 232 + 28 + stroi_off}, {'Заполняет данные в бланке расследования за вас (дата, время, оружие...)'})
-
-			new_draw(16 + 288 + stroi_off, 53)
-			gui.Text(26, 26 + 288 + stroi_off, 'Сообщать при заезде в опасный район', font[3])
-			imgui.SetCursorPos(imgui.ImVec2(561, 21 + 288 + stroi_off))
+			new_draw(16 + 216 + stroi_off, 53)
+			gui.Text(26, 26 + 216 + stroi_off, 'Сообщать при заезде в опасный район', font[3])
+			imgui.SetCursorPos(imgui.ImVec2(561, 21 + 216 + stroi_off))
 			if gui.Switch(u8'##notify_ghetto', setting.police_settings.ghetto_notify) then
 				setting.police_settings.ghetto_notify = not setting.police_settings.ghetto_notify
 				save()
 			end
-			gui.TextInfo({26, 45 + 288 + stroi_off}, {'Уведомления, когда вы заезжаете в зону опасного района.'})
+			gui.TextInfo({26, 45 + 216 + stroi_off}, {'Уведомления, когда вы заезжаете в зону опасного района.'})
 
-			local pos_afind = 304 + 53 + 19 + stroi_off
+			local pos_afind = 232 + 53 + 19 + stroi_off
 			new_draw(pos_afind, 53)
 			gui.Text(26, pos_afind + 9, 'Auto Find', font[3])
 			imgui.SetCursorPos(imgui.ImVec2(561, pos_afind + 5))
@@ -10495,7 +11244,8 @@ function hall.settings()
 				setting.police_settings.wanted_list.func = not setting.police_settings.wanted_list.func
 				save()
 			end
-			pos_wanted = pos_wanted + 37 + 19
+			local wanted_bottom = pos_wanted + 37
+			pos_wanted = wanted_bottom + 19
 			local wanted_progress = gui.RevealProgress('wanted_settings', setting.police_settings.wanted_list.func)
 			if gui.BeginReveal(wanted_progress, pos_wanted - 4, 700) then
 				gui.Text(25, pos_wanted, 'Содержимое', bold_font[1])
@@ -10604,12 +11354,11 @@ function hall.settings()
 				if gui.Button(u8'Изменить...', {491, pos_wanted + 5}, {99, 25}) then
 					changeWantedPosition()
 				end
-				pos_wanted = pos_wanted + position_box_height
-				imgui.Dummy(imgui.ImVec2(0, 21))
+				wanted_bottom = wanted_bottom + (pos_wanted + position_box_height - wanted_bottom) * wanted_progress
 				gui.EndReveal()
-			else
-				imgui.Dummy(imgui.ImVec2(0, 21))
 			end
+			imgui.SetCursorPos(imgui.ImVec2(0, wanted_bottom))
+			imgui.Dummy(imgui.ImVec2(0, 12))
 		end
 	
 	elseif tab_settings == 23 then
@@ -10765,7 +11514,7 @@ function hall.settings()
 			gui.EndReveal()
 		end
 	elseif tab_settings == 9 then
-		new_draw(16, 361)
+		new_draw(16, 433)
 		
 		gui.Text(26, 35, 'Автоматическое принятие документов', font[3])
 		imgui.SetCursorPos(imgui.ImVec2(561, 30))
@@ -10836,8 +11585,10 @@ function hall.settings()
 			current_key = {u8'Page Down', {34}}
 		end
 		gui.DrawLine({16, 341}, {602, 341}, cl.line)
-		gui.Text(26, 351, 'Клавиша для продолжения отыгровки - ' .. setting.enter_key[2], font[3])
-		if gui.Button(u8'Изменить...##клавишу продолжения', {491, 347}, {99, 25}) then
+		sh_roleplay.command_row('stop', 'Команда для остановки отыгровки', 351)
+		gui.DrawLine({16, 377}, {602, 377}, cl.line)
+		gui.Text(26, 387, 'Клавиша для продолжения отыгровки - ' .. setting.enter_key[2], font[3])
+		if gui.Button(u8'Изменить...##клавишу продолжения', {491, 383}, {99, 25}) then
 			imgui.OpenPopup(u8'Изменить клавишу продолжения команды')
 			lockPlayerControl(true)
 			edit_key = true
@@ -10845,16 +11596,19 @@ function hall.settings()
 			current_key = {u8'Enter', {13}}
 		end
 		
-		new_draw(396, 53)
-		gui.Text(26, 405, 'Изменить значение текущего времени', font[3])
-		gui.TextInfo({26, 424}, {'Скрипт начнёт воспринимать текущее время с учётом Вашего изменения.'})
+		gui.DrawLine({16, 413}, {602, 413}, cl.line)
+		sh_roleplay.command_row('continue', 'Команда для продолжения отыгровки', 423)
+
+		new_draw(468, 53)
+		gui.Text(26, 477, 'Изменить значение текущего времени', font[3])
+		gui.TextInfo({26, 496}, {'Скрипт начнёт воспринимать текущее время с учётом Вашего изменения.'})
 		
 		local color_imVec4_button1, color_imVec4_button_text1 = cl.bg, cl.text
 		if setting.time_offset >= 12 then
 			color_imVec4_button1 = imgui.ImVec4(0.40, 0.40, 0.40, 0.50)
 			color_imVec4_button_text1 = imgui.ImVec4(0.50, 0.50, 0.50, 1.00)
 		else
-			imgui.SetCursorPos(imgui.ImVec2(566, 410))
+			imgui.SetCursorPos(imgui.ImVec2(566, 482))
 			if imgui.InvisibleButton(u8'##Прибавить значение к времени', imgui.ImVec2(26, 26)) then
 				setting.time_offset = setting.time_offset + 1
 				save()
@@ -10865,15 +11619,15 @@ function hall.settings()
 				color_imVec4_button_text1 = imgui.ImVec4(0.95, 0.95, 0.95, 1.00)
 			end
 		end
-		gui.DrawCircle({578.5, 422.5}, 12.5, color_imVec4_button1)
-		gui.FaText(572, 414, fa.PLUS, fa_font[3], color_imVec4_button_text1)
+		gui.DrawCircle({578.5, 494.5}, 12.5, color_imVec4_button1)
+		gui.FaText(572, 486, fa.PLUS, fa_font[3], color_imVec4_button_text1)
 		
 		local color_imVec4_button2, color_imVec4_button_text2 = cl.bg, cl.text
 		if setting.time_offset <= -12 then
 			color_imVec4_button2 = imgui.ImVec4(0.40, 0.40, 0.40, 0.50)
 			color_imVec4_button_text2 = imgui.ImVec4(0.50, 0.50, 0.50, 1.00)
 		else
-			imgui.SetCursorPos(imgui.ImVec2(450, 410))
+			imgui.SetCursorPos(imgui.ImVec2(486, 482))
 			if imgui.InvisibleButton(u8'##Убавить значение к времени', imgui.ImVec2(26, 26)) then
 				setting.time_offset = setting.time_offset - 1
 				save()
@@ -10884,8 +11638,8 @@ function hall.settings()
 				color_imVec4_button_text2 = imgui.ImVec4(0.95, 0.95, 0.95, 1.00)
 			end
 		end
-		gui.DrawCircle({462.5, 422.5}, 12.5, color_imVec4_button2)
-		gui.FaText(456, 414, fa.MINUS, fa_font[3], color_imVec4_button_text2)
+		gui.DrawCircle({462.5, 494.5}, 12.5, color_imVec4_button2)
+		gui.FaText(456, 486, fa.MINUS, fa_font[3], color_imVec4_button_text2)
 		
 		local format_time_text = ' час'
 		if setting.time_offset >= -4 and setting.time_offset <= 4 and setting.time_offset ~= -1 and setting.time_offset ~= 1 then
@@ -10895,19 +11649,19 @@ function hall.settings()
 		end
 		
 		if setting.time_offset == 0 then
-			gui.Text(492, 412, '0 часов', bold_font[1])
+			gui.Text(492, 484, '0 часов', bold_font[1])
 		elseif setting.time_offset > 0 then
 			imgui.PushFont(bold_font[1])
 			local text_format = '+' .. tostring(setting.time_offset) .. format_time_text
 			local calc_size_text = imgui.CalcTextSize(u8(text_format))
 			imgui.PopFont()
-			gui.Text(521 - (calc_size_text.x / 2), 412, text_format, bold_font[1])
+			gui.Text(521 - (calc_size_text.x / 2), 484, text_format, bold_font[1])
 		else
 			imgui.PushFont(bold_font[1])
 			local text_format = tostring(setting.time_offset) .. format_time_text
 			local calc_size_text = imgui.CalcTextSize(u8(text_format))
 			imgui.PopFont()
-			gui.Text(521 - (calc_size_text.x / 2), 412, text_format, bold_font[1])
+			gui.Text(521 - (calc_size_text.x / 2), 484, text_format, bold_font[1])
 		end
 		
 		if imgui.BeginPopupModal(u8'Изменить клавишу деактивации команды', null, imgui.WindowFlags.AlwaysAutoResize + imgui.WindowFlags.NoMove + imgui.WindowFlags.NoTitleBar) then
@@ -11055,43 +11809,42 @@ function hall.settings()
 		end
 			
 		
-		new_draw(468, 56)
-		gui.Text(26, 477, 'Авто-домкрат (перевёрнутый транспорт)', font[3])
-		imgui.SetCursorPos(imgui.ImVec2(561, 473))
+		new_draw(540, 56)
+		gui.Text(26, 549, 'Авто-домкрат (перевёрнутый транспорт)', font[3])
+		imgui.SetCursorPos(imgui.ImVec2(561, 545))
 		if gui.Switch(u8'##Авто-домкрат', setting.auto_jack) then
 			setting.auto_jack = not setting.auto_jack
 			save()
 		end
-		gui.TextInfo({26, 496}, {'Если транспорт перевернут — уведомление, /domkrat отправится после нажатия E.'})
+		gui.TextInfo({26, 568}, {'Если транспорт перевернут — уведомление, /domkrat отправится после нажатия E.'})
 
 		local afk_progress = gui.RevealProgress('afk_settings', setting.kick_afk.func)
-		new_draw(530, 35 + 72 * afk_progress)
-		gui.Text(26, 539, 'Автоматически кикать при привышение нормы АФК', font[3])
-		imgui.SetCursorPos(imgui.ImVec2(561, 535))
+		new_draw(602, 35 + 72 * afk_progress)
+		gui.Text(26, 611, 'Автоматически кикать при привышение нормы АФК', font[3])
+		imgui.SetCursorPos(imgui.ImVec2(561, 607))
 		if gui.Switch(u8'##Автокик АФК', setting.kick_afk.func) then
 			setting.kick_afk.func = not setting.kick_afk.func
 			save()
 		end
-		if gui.BeginReveal(afk_progress, 565, 72) then
-			gui.DrawLine({16, 565}, {602, 565}, cl.line)
-			gui.Text(26, 575, 'Введите значение в минутах', font[3])
-			local bool_save_input_afk = setting.accent.text
-			setting.kick_afk.time_kick = gui.InputText({417, 577}, 164, setting.kick_afk.time_kick, u8'АФК кик', 4, u8'Введите значение', 'num')
+		if gui.BeginReveal(afk_progress, 637, 72) then
+			gui.DrawLine({16, 637}, {602, 637}, cl.line)
+			gui.Text(26, 647, 'Введите значение в минутах', font[3])
+			local bool_save_input_afk = setting.kick_afk.time_kick
+			setting.kick_afk.time_kick = gui.InputText({417, 649}, 164, setting.kick_afk.time_kick, u8'АФК кик', 4, u8'Введите значение', 'num')
 			if setting.kick_afk.time_kick ~= bool_save_input_afk then
 				save()
 			end
-			gui.DrawLine({16, 601}, {602, 601}, cl.line)
-			gui.Text(26, 611, 'Действие после привышения значения', font[3])
+			gui.DrawLine({16, 673}, {602, 673}, cl.line)
+			gui.Text(26, 683, 'Действие после привышения значения', font[3])
 			local bool_set_act = setting.kick_afk.mode
-			setting.kick_afk.mode = gui.ListTableMove({572, 611}, {u8'Полностью закрыть игру', u8'Закрыть соединение с сервером'}, setting.kick_afk.mode, 'Select action AFK')
+			setting.kick_afk.mode = gui.ListTableMove({572, 683}, {u8'Полностью закрыть игру', u8'Закрыть соединение с сервером'}, setting.kick_afk.mode, 'Select action AFK')
 			if setting.kick_afk.mode ~= bool_set_act then
 				save() 
 			end
-			imgui.Dummy(imgui.ImVec2(0, 22))
 			gui.EndReveal()
-		else
-			imgui.Dummy(imgui.ImVec2(0, 25))
 		end
+		imgui.SetCursorPos(imgui.ImVec2(0, 637 + 72 * afk_progress))
+		imgui.Dummy(imgui.ImVec2(0, 12))
 	elseif tab_settings == 10 then
 		local function accent_col(num_acc, color_acc, color_acc_act)
 			imgui.SetCursorPos(imgui.ImVec2(278 + (num_acc * 43), 224))
@@ -11595,7 +12348,7 @@ function hall.settings()
 		end
 		
 		if new_version == '0' then
-			if search_for_new_version > 600 then
+			if sh_update.check == 'checking' then
 				local function update_tail_rotation()
 					tail_rotation_angle = (tail_rotation_angle + rotation_speed * anim) % 360
 				end
@@ -11632,20 +12385,21 @@ function hall.settings()
 				local calc_text_size = imgui.CalcTextSize(u8(sh_display_version))
 				imgui.PopFont()
 				gui.Text(309 - (calc_text_size.x / 2), 192, sh_display_version, bold_font[1])
+				local status_text = sh_update.check == 'current' and 'Версия актуальна'
+					or sh_update.check == 'failed' and 'Не удалось проверить обновления.'
+					or 'Проверка обновлений ещё не выполнена.'
+				imgui.PushFont(font[3])
+				local status_size = imgui.CalcTextSize(u8(status_text))
+				imgui.PopFont()
 				imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.40, 0.40, 0.40, 1.00))
-				gui.Text(252, 212, 'Версия актуальна', font[3])
+				gui.Text(309 - status_size.x / 2, 212, status_text, font[3])
 				imgui.PopStyleColor(1)
+				if sh_update.check ~= 'current' and gui.Button(u8'Проверить обновления', {192, 239}, {230, 27}) then update_check() end
 			end
 		else
 			new_draw(72, 254)
 			imgui.SetCursorPos(imgui.ImVec2(25, 81))
 			imgui.Image(image_logo_update, imgui.ImVec2(47, 47))
-			imgui.PushFont(bold_font[3])
-			local calc_text_logo = imgui.CalcTextSize(update_info.version)
-			imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(1.00, 1.00, 1.00, 1.00))
-			gui.Text(48.5 - (calc_text_logo.x / 2), 92, update_info.version, bold_font[3])
-			imgui.PopStyleColor(1)
-			imgui.PopFont()
 			gui.Text(80, 87, 'State Helper ' .. update_info.version, font[3])
 			if update_info.size then gui.Text(80, 105, tostring(update_info.size) .. ' кб.', font[3]) end
 			
@@ -11673,15 +12427,11 @@ function hall.settings()
 			end
 			imgui.Dummy(imgui.ImVec2(0, 10))
 			imgui.EndChild()
-			if update_request >= 9 then
-				gui.Button(u8'Обновление запрошено...', {16, 334}, {586, 27}, false)
-			elseif update_request > 0 then
-				gui.Button(u8'Произошла ошибка при попытке обновления, пытаемся восстановить...', {16, 334}, {586, 27}, false)
+			if sh_update.install == 'downloading' then
+				gui.Button(u8'Скачиваем обновление...', {16, 334}, {586, 27}, false)
 			else
-				if gui.Button(u8'Установить', {16, 334}, {586, 27}) then
-					update_request = 20
-					update_download()
-				end
+				local label = sh_update.install == 'failed' and 'Повторить установку' or 'Установить'
+				if gui.Button(u8(label), {16, 334}, {586, 27}) then update_download() end
 			end
 		end
 	elseif tab_settings == 13 then
@@ -11945,6 +12695,9 @@ function hall.settings()
 		cmd_amd_key_tab(10)
 		hall.browser_settings()
 	end
+	sh_settings_search.paint_highlight()
+	sh_settings_search.geometry = nil
+	sh_settings_search.scope = nil
 	imgui.EndChild()
 	
 	if edit_order_tabs then
@@ -13730,6 +14483,9 @@ if imgui.BeginPopupModal(u8'Подтверждение удаления команды2' .. i, null, imgui.W
 						gui.DrawLine({16 + if_disp, 319 + pxl}, {824, 319 + pxl}, cl.line)
 						gui.FaText(23 + 1 + if_disp, 295 + pxl, fa.PEN_TO_SQUARE, fa_font[3], imgui.ImVec4(0.90, 0.90, 0.90, 1.00))
 						gui.Text(50 + if_disp, 295 + pxl, 'Отправить текст в диалог', font[3])
+						gui.Text(455 + if_disp, 295 + pxl, 'ID диалога:', font[3])
+						local dialog_id = gui.InputText({528 + if_disp, 297 + pxl}, 60, tostring(bl_cmd.act[i][3] or ''), u8'ID диалога##send'..i, 5, u8'ID', 'num')
+						bl_cmd.act[i][3] = tonumber(dialog_id)
 						if AddMoveButtons(i, pxl) then break end
 						if remove_action(pxl, i) then
 							table.remove(bl_cmd.act, i)
@@ -13784,8 +14540,10 @@ if imgui.BeginPopupModal(u8'Подтверждение удаления команды2' .. i, null, imgui.W
 							break
 						end
 
+						gui.Text(412 + if_disp, 295 + pxl, 'ID диалога:', font[3])
+						local dialog_id = gui.InputText({485 + if_disp, 297 + pxl}, 60, tostring(bl_cmd.act[i][3] or ''), u8'ID диалога##select'..i, 5, u8'ID', 'num')
+						bl_cmd.act[i][3] = tonumber(dialog_id)
 						gui.Text(568 + if_disp, 295 + pxl, 'Номер рядка (от 1):', font[3])
-						local bool_set_row = bl_cmd.act[i][2]
 						bl_cmd.act[i][2] = gui.InputText({708 + if_disp, 297 + pxl}, 15, bl_cmd.act[i][2], u8'Номер рядка диалога'..i, 5, u8'№', 'num')
 						if bl_cmd.act[i][2] == '' then
 							bl_cmd.act[i][2] = '0'
@@ -16123,12 +16881,11 @@ function hall.music()
 			else
 				imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.50, 0.50, 0.50, 0.50))
 			end
-			if play.status ~= 'NULL' then
-				gui.Text(345, 162, 'Ничего не найдено', bold_font[3])
-			else
-				gui.Text(345, 189, 'Ничего не найдено', bold_font[3])
-				
-			end
+			local message = tracks[1].search_error and 'Не удалось выполнить поиск. Повторите попытку.' or 'Ничего не найдено'
+			imgui.PushFont(bold_font[3])
+			local width = imgui.CalcTextSize(u8(message)).x
+			imgui.PopFont()
+			gui.Text(490 - width / 2, play.status ~= 'NULL' and 162 or 189, message, bold_font[3])
 			imgui.PopStyleColor(1)
 		end
 	elseif tab_music == 2 then
@@ -17088,10 +17845,7 @@ function hall.music()
 			gui.DrawLine({160, platform_y + 37}, {824, platform_y + 37}, cl.line)
 			gui.Text(170, platform_y + 48, 'Вход в Яндекс Музыку выполнен', font[3])
 			if gui.Button(u8'Выйти', {713, platform_y + 44}, {100, 27}) then
-				setting.ym_token = ''
-				setting.ym_uid = ''
-				ym_playlists = nil
-				save()
+				ym_set_account('')
 			end
 
 		end
@@ -17414,9 +18168,8 @@ function hall.wave_toolbar()
 
 	imgui.SetCursorPos(imgui.ImVec2(705, 5))
 	if imgui.InvisibleButton(u8'##Обновить волну', imgui.ImVec2(65, 32)) then
-		ym_wave = {}
 		ym_wave_failed = false
-		ym_wave_more()
+		ym_wave_more(true)
 	end
 	if imgui.IsItemActive() or imgui.IsItemHovered() then
 		if an[37] < 0.45 then an[37] = an[37] + (anim * 1) end
@@ -17964,7 +18717,7 @@ end
 function sh_browser_input.window_blocked()
     local cursor_busy = not windows.fast[0] and not windows.action[0] and not sampIsChatInputActive() and not sh_browser_cursor_owned
         and type(sampGetCursorMode) == 'function' and sampGetCursorMode() ~= 0
-    return windows.main[0] or windows.smart_su[0] or windows.stroi[0]
+    return windows.main[0] or windows.smart_su[0] or windows.smart_ticket[0] or windows.stroi[0]
         or windows.shpora[0] or windows.reminder[0] or cursor_busy or sampIsDialogActive()
         or isGamePaused() or scene_active or edit_key or edit_cmd
 end
@@ -17987,31 +18740,62 @@ function sh_browser_input.release_controls()
     end
 end
 
+function sh_browser_input.tab_height(state)
+    if sh_browser_manager and sh_browser_manager.draw_tabs and type(state.status.tabs) == 'table' then return 32 end
+    return 0
+end
+
 function sh_browser_input.content_top(state)
-    return state.status.fullscreen and 32 or 78
+    return state.status.fullscreen and 32 or (78 + sh_browser_input.tab_height(state))
 end
 
 function sh_browser_input.disable(state)
-    if state.web_mouse_down and state.overlay_rect and state.started then
-        local x, y = getCursorPos()
-        local rect = state.overlay_rect
-        sh_browser_manager.pointer('mouseReleased', x - rect.x, y - rect.y - sh_browser_input.content_top(state), 0, false)
-    end
+    local release_web_mouse = state.web_mouse_down and state.overlay_rect and state.started
     sh_browser_input.enabled = false
     sh_browser_input.close_pressed = false
     state.address_edit = false
+    local click_count = state.web_click_count
     state.web_mouse_down = false
+    state.web_click_count = nil
+    state.last_web_press = nil
     state.web_keyboard = false
     state.web_surrogate = nil
     state.pointer_drag = nil
     state.pointer_down = false
     sh_browser_input.release_controls()
+    if release_web_mouse then
+        local x, y = getCursorPos()
+        local rect = state.overlay_rect
+        pcall(sh_browser_manager.pointer, 'mouseReleased', x - rect.x, y - rect.y - sh_browser_input.content_top(state), 0, false, click_count)
+    end
 end
 pcall(ffi.cdef, 'short __stdcall GetAsyncKeyState(int vKey);')
 pcall(ffi.cdef, 'short __stdcall GetKeyState(int vKey);')
 pcall(ffi.cdef, 'int __stdcall IsWindowUnicode(void* window);')
 pcall(ffi.cdef, 'int __stdcall MultiByteToWideChar(unsigned int codePage, unsigned long flags, const char* source, int sourceLength, unsigned short* output, int outputLength);')
+pcall(ffi.cdef, 'unsigned int __stdcall GetDoubleClickTime(void);')
+pcall(ffi.cdef, 'int __stdcall GetSystemMetrics(int index);')
 local sh_browser_user32=ffi.load('user32')
+
+function sh_browser_input.web_press(state, x, y, explicit_double)
+    local previous = state.last_web_press
+    local now = getGameTimer()
+    local x_radius = math.max(1, math.floor(sh_browser_user32.GetSystemMetrics(36) / 2))
+    local y_radius = math.max(1, math.floor(sh_browser_user32.GetSystemMetrics(37) / 2))
+    local close_in_time = previous and now >= previous.at
+        and now - previous.at <= sh_browser_user32.GetDoubleClickTime()
+    local nearby = previous and math.abs(x - previous.x) <= x_radius and math.abs(y - previous.y) <= y_radius
+    local double = explicit_double or (close_in_time and nearby)
+    state.web_click_count = double and 2 or 1
+    state.last_web_press = not double and {x = x, y = y, at = now, x_radius = x_radius, y_radius = y_radius} or nil
+end
+
+function sh_browser_input.web_release(state)
+    local click_count = state.web_click_count
+    state.web_mouse_down = false
+    state.web_click_count = nil
+    return click_count
+end
 
 function sh_browser_input.web_text(state, value)
     if value >= 128 and value < 256
@@ -18043,6 +18827,10 @@ end
 function sh_browser_input.drag_to(state, x, y)
     if x == state.web_drag_x and y == state.web_drag_y then return end
     state.web_drag_x, state.web_drag_y = x, y
+    local previous = state.last_web_press
+    if previous and (math.abs(x - previous.x) > previous.x_radius or math.abs(y - previous.y) > previous.y_radius) then
+        state.last_web_press = nil
+    end
     local rect = state.overlay_rect
     sh_browser_manager.pointer('mouseMoved', x - rect.x, y - rect.y - sh_browser_input.content_top(state), 0, true)
 end
@@ -18076,34 +18864,53 @@ end,function(self)
     dl:AddText(imgui.ImVec2(r.x+12,r.y+8),0xFFF0E8E0,u8(cursor_active and (bs.status.fullscreen and 'Браузер — Esc: выйти из полноэкранного режима' or 'Браузер — Esc: вернуть управление игре') or ('Браузер — курсор: ' .. sh_browser_input.key_label())))
     dl:AddText(imgui.ImVec2(r.x+r.w-25,r.y+8),0xFFFFFFFF,'X')
     if not bs.status.fullscreen then
-        dl:AddRectFilled(imgui.ImVec2(r.x,r.y+32),imgui.ImVec2(r.x+r.w,r.y+78),0xFF252321)
+        local tab_height = sh_browser_input.tab_height(bs)
+        if tab_height > 0 then
+            local mouse_x, mouse_y
+            if cursor_active then mouse_x, mouse_y = getCursorPos() end
+            sh_browser_manager.draw_tabs(dl,r,mouse_x,mouse_y)
+        end
+        dl:AddRectFilled(imgui.ImVec2(r.x,r.y+tab_height+32),imgui.ImVec2(r.x+r.w,r.y+tab_height+78),0xFF252321)
+        local address_top = tab_height + 40
+        local toolbar_height = 30
         local function button(x,w,label,enabled)
-            dl:AddRectFilled(imgui.ImVec2(r.x+x,r.y+40),imgui.ImVec2(r.x+x+w,r.y+70),0xFF403A35,5)
-            dl:AddText(imgui.ImVec2(r.x+x+10,r.y+47),enabled and 0xFFF5F0EB or 0xFF807870,label)
+            dl:AddRectFilled(imgui.ImVec2(r.x+x,r.y+address_top),imgui.ImVec2(r.x+x+w,r.y+address_top+toolbar_height),0xFF403A35,5)
+            if label ~= '' then
+                local size = imgui.CalcTextSize(label)
+                dl:AddText(imgui.ImVec2(r.x+x+(w-size.x)*0.5,r.y+address_top+(toolbar_height-size.y)*0.5),
+                    enabled and 0xFFF5F0EB or 0xFF807870,label)
+            end
         end
         button(8,34,'<',bs.status.can_back==true)
         button(48,34,'>',bs.status.can_forward==true)
         button(88,34,'',true)
-        dl:AddCircle(imgui.ImVec2(r.x+105,r.y+55),7,0xFFF5F0EB,20,1.5)
-        dl:AddTriangleFilled(imgui.ImVec2(r.x+108,r.y+45),imgui.ImVec2(r.x+114,r.y+49),imgui.ImVec2(r.x+107,r.y+51),0xFFF5F0EB)
+        dl:AddCircle(imgui.ImVec2(r.x+105,r.y+tab_height+55),7,0xFFF5F0EB,20,1.5)
+        dl:AddTriangleFilled(imgui.ImVec2(r.x+108,r.y+tab_height+45),imgui.ImVec2(r.x+114,r.y+tab_height+49),imgui.ImVec2(r.x+107,r.y+tab_height+51),0xFFF5F0EB)
         button(r.w-92,84,u8'Перейти',true)
-        dl:AddRectFilled(imgui.ImVec2(r.x+130,r.y+40),imgui.ImVec2(r.x+r.w-100,r.y+70),0xFF4A413A,8)
+        dl:AddRectFilled(imgui.ImVec2(r.x+130,r.y+tab_height+40),imgui.ImVec2(r.x+r.w-100,r.y+tab_height+70),0xFF4A413A,8)
         if bs.address_edit then
             if bs.address_focus then
                 ffi.fill(sh_browser_address_buf,2048)
                 local value=tostring(bs.address_text or ''):sub(1,2047);ffi.copy(sh_browser_address_buf,value,#value)
                 imgui.SetKeyboardFocusHere();bs.address_focus=false
             end
-            imgui.SetCursorPos(imgui.ImVec2(136,41))
-            imgui.SetNextItemWidth(math.max(80,r.w-242))
-            if imgui.InputText('##SHBrowserAddress',sh_browser_address_buf,2048,imgui.InputTextFlags.EnterReturnsTrue+imgui.InputTextFlags.AutoSelectAll) then
-                sh_browser_manager.submit_address(ffi.string(sh_browser_address_buf))
-            end
+            imgui.SetCursorPos(imgui.ImVec2(130,address_top))
+            imgui.SetNextItemWidth(math.max(80,r.w-230))
+            local clear = imgui.ImVec4(0,0,0,0)
+            imgui.PushStyleColor(imgui.Col.FrameBg,clear)
+            imgui.PushStyleColor(imgui.Col.FrameBgHovered,clear)
+            imgui.PushStyleColor(imgui.Col.FrameBgActive,clear)
+            imgui.PushStyleVarFloat(imgui.StyleVar.FrameBorderSize,0)
+            imgui.PushStyleVarVec2(imgui.StyleVar.FramePadding,imgui.ImVec2(8,math.max(0,(toolbar_height-imgui.GetFontSize())*0.5)))
+            local submit = imgui.InputText('##SHBrowserAddress',sh_browser_address_buf,2048,imgui.InputTextFlags.EnterReturnsTrue+imgui.InputTextFlags.AutoSelectAll)
+            imgui.PopStyleVar(2)
+            imgui.PopStyleColor(3)
             bs.address_text=ffi.string(sh_browser_address_buf)
+            if submit then sh_browser_manager.submit_address(bs.address_text) end
         else
             local url=bs.status.url or u8'Адрес сайта или поисковый запрос'
-            dl:PushClipRect(imgui.ImVec2(r.x+138,r.y+40),imgui.ImVec2(r.x+r.w-108,r.y+70),true)
-            dl:AddText(imgui.ImVec2(r.x+138,r.y+47),0xFFE8E0D8,url)
+            dl:PushClipRect(imgui.ImVec2(r.x+138,r.y+tab_height+40),imgui.ImVec2(r.x+r.w-108,r.y+tab_height+70),true)
+            dl:AddText(imgui.ImVec2(r.x+138,r.y+address_top+(toolbar_height-imgui.GetFontSize())*0.5),0xFFE8E0D8,url)
             dl:PopClipRect()
         end
     end
@@ -18113,7 +18920,7 @@ end,function(self)
 end)
 local sh_browser_load_error = nil
 
-function sh_browser_tick()
+function sh_browser_input.tick()
     if not sh_browser_manager then return end
     local visible = windows.main[0] and tab == 'help' and not anim_func and not close_win_anim
     local state = sh_browser_manager.state
@@ -18124,17 +18931,12 @@ function sh_browser_tick()
         local x, y = getCursorPos()
         sh_browser_input.drag_to(state, x, y)
         if bit.band(sh_browser_user32.GetAsyncKeyState(1), 0x8000) == 0 then
-            state.web_mouse_down = false
+            local click_count = sh_browser_input.web_release(state)
             local rect = state.overlay_rect
-            sh_browser_manager.pointer('mouseReleased', x - rect.x, y - rect.y - sh_browser_input.content_top(state), 0, false)
+            sh_browser_manager.pointer('mouseReleased', x - rect.x, y - rect.y - sh_browser_input.content_top(state), 0, false, click_count)
         end
     end
-    local ok, err = pcall(sh_browser_manager.poll, visible)
-    if not ok then
-        if sh_browser_manager.state.mode ~= 'external' then pcall(sh_browser_manager.close, 'poll_error')
-        else sh_browser_manager.state.status.code = 'connection_wait' end
-        sh_browser_manager.state.message = 'Ошибка связи с браузером. Перезагрузите StateHelper.'
-    end
+    sh_browser_manager.poll(visible)
     if state.install_state and state.install_state.state == 'ready' and not state.installing then
         state.dependency_repair = nil
     end
@@ -18160,6 +18962,21 @@ function sh_browser_tick()
     end
 end
 
+function sh_browser_tick()
+    local ok, problem = pcall(sh_browser_input.tick)
+    if ok then return end
+    local state = sh_browser_manager.state
+    if state.mode ~= 'external' then
+        pcall(sh_browser_input.disable, state)
+        pcall(sh_browser_manager.close, 'poll_error')
+    else
+        state.status.code = 'connection_wait'
+    end
+    local message = 'Ошибка связи с браузером. Перезагрузите StateHelper.'
+    if state.message ~= message then print('[SH Browser] ' .. tostring(problem)) end
+    state.message = message
+end
+
 function sh_browser_close()
     sh_browser_input.enabled = false
     if sh_browser_manager then
@@ -18175,22 +18992,29 @@ end
 local sh_browser_bootstrap = {
     url = 'https://raw.githubusercontent.com/kysteno4ek/StateHelper/beta/Browser/',
     installed = {
-        {'StateHelperBrowser.exe', 91648, '81a187364942879941c64c04f2a10d9179ceddb5044401844074c0667b2d1126', 77312, '032a96d5a66411a699e3719d9b1701ea3f387434a441f84a7b5cdcbb84af33ba'},
-        {'browser.lua', 34560, '1000be1cb0d6f3e29f5727ed70e79a048db2845054a27f314188c5ac777ccab6', 34468, '7a8f4d0b679660d0fd832d31435f6b2d38deb07475a7be1366676c4215158949'},
+        {'StateHelperBrowser.exe', 120832, '5250bf33741dc411f121778aebf94b7711f859ee257256f696efab6d5c3e4c44'},
+        {'browser.lua', 37977, 'e8eb04bce66f78e39e9d8358d90da86b19c480d6efafeeaa06428b631da158d9'},
     },
 }
 
 function sh_browser_bootstrap.verify_entry(data, entry)
-    if entry[4] and data and #data == entry[4] then
-        return sh_resource.verify_sha256(data, entry[4], entry[5])
+    if type(data) ~= 'string' then return false end
+    local digest
+    for index = 2, #entry, 2 do
+        if #data == entry[index] then
+            digest = digest or sh_resource.sha256(data)
+            if digest == entry[index + 1] then return true end
+        end
     end
-    return sh_resource.verify_sha256(data, entry[2], entry[3])
+    return false
 end
 
 function sh_browser_bootstrap.file_ready(path, entry)
     local file = io.open(path, 'rb')
     if not file then return false end
-    local data = file:read(math.max(entry[2], entry[4] or 0) + 1)
+    local max_size = 0
+    for index = 2, #entry, 2 do max_size = math.max(max_size, entry[index]) end
+    local data = file:read(max_size + 1)
     file:close()
     local ok, valid = pcall(sh_browser_bootstrap.verify_entry, data, entry)
     return ok and valid
@@ -18213,32 +19037,17 @@ function sh_browser_bootstrap.start()
             for attempt = 1, 2 do
                 if installed then break end
                 local pending = true
-                local ok, id = pcall(sh_resource.download, setup.url .. name, path, function(_, status)
-                    if not pending then return end
+                sh_resource.download(setup.url .. name, path, function(_, status)
                     if status == dlstatus.STATUS_ENDDOWNLOADDATA then
-                        installed = true
-                        pending = false
-                    elseif status == dlstatus.STATUS_DOWNLOAD_ERROR or status == dlstatus.STATUSEX_ENDDOWNLOAD then
-                        reason = 'download ended without a verified file'
-                        pending = false
+                        installed, pending = true, false
+                    elseif status == dlstatus.STATUS_DOWNLOAD_ERROR then
+                        reason, pending = 'download ended without a verified file', false
                     end
                 end, function(data)
-                    return pending and setup.verify_entry(data, entry)
+                    return setup.verify_entry(data, entry)
                         and (name ~= 'browser.lua' or loadstring(data, '@browser.lua') ~= nil)
                 end)
-                if pending and (not ok or not id or id == 0) then
-                    reason = ok and 'download did not start' or tostring(id)
-                    pending = false
-                end
-                local elapsed = 0
-                while pending and elapsed < 30000 do
-                    wait(100)
-                    elapsed = elapsed + 100
-                end
-                if pending then
-                    reason = 'download timed out'
-                    pending = false
-                end
+                while pending do wait(100) end
                 if not installed and attempt == 1 then wait(1000) end
             end
             if not installed then
@@ -18257,7 +19066,6 @@ end
 
 do
     pcall(ffi.cdef, 'unsigned long __stdcall GetFileAttributesA(const char*);')
-    pcall(ffi.cdef, 'int __stdcall DeleteFileA(const char*);')
     pcall(ffi.cdef, 'unsigned long __stdcall GetLastError(void);')
     local kernel = ffi.load('kernel32')
 
@@ -18279,23 +19087,19 @@ do
         return true
     end
 
-    local function clear_database(folder)
+    local function collect_database(folder, paths)
         for _, suffix in ipairs({'', '-wal', '-shm', '-journal'}) do
             local path = folder .. '/Cookies' .. suffix
             local value = attributes(path)
             if value then
                 if bit.band(value, 0x10) ~= 0 then error('Expected a cookie database file') end
-                if kernel.DeleteFileA(path) == 0 then
-                    local error_code = tonumber(kernel.GetLastError())
-                    if error_code ~= 2 and error_code ~= 3 then
-                        error('Could not remove browser cookies: ' .. error_code)
-                    end
-                end
+                paths[#paths + 1] = path
             end
         end
     end
 
     function sh_browser_bootstrap.clear_saved_cookies()
+        local paths = {}
         for _, parent in ipairs({sh_audit.private_root, dir .. '/State Helper'}) do
             local root = parent .. '/Browser'
             if is_directory(parent) and is_directory(root) then
@@ -18306,14 +19110,48 @@ do
                         if is_directory(profile) and is_directory(profile .. '/EBWebView') then
                             local default = profile .. '/EBWebView/Default'
                             if is_directory(default) then
-                                clear_database(default)
-                                if is_directory(default .. '/Network') then clear_database(default .. '/Network') end
+                                collect_database(default, paths)
+                                if is_directory(default .. '/Network') then collect_database(default .. '/Network', paths) end
                             end
                         end
                     end
                 end
             end
         end
+        local staged = {}
+        local function rollback()
+            local restored = true
+            for index = #staged, 1, -1 do
+                local entry = staged[index]
+                if not os.rename(entry.temporary, entry.path) then restored = false end
+            end
+            return restored
+        end
+        local ok, reason = pcall(function()
+            for _, path in ipairs(paths) do
+                local prefix = path .. '.statehelper-removal-' .. os.time()
+                local temporary, attempt = prefix, 1
+                while attributes(temporary) do
+                    attempt = attempt + 1
+                    temporary = prefix .. '-' .. attempt
+                end
+                if not os.rename(path, temporary) then error('Could not stage browser cookies for deletion') end
+                staged[#staged + 1] = {path = path, temporary = temporary}
+            end
+            if not sh_browser_bootstrap.save_cookie_choice('no') then error('Could not save browser preferences') end
+        end)
+        if not ok then
+            if not rollback() then error('Could not restore all browser cookie files: ' .. tostring(reason)) end
+            error(reason)
+        end
+        local removed = true
+        for _, entry in ipairs(staged) do
+            if not os.remove(entry.temporary) then
+                removed = false
+                print('[SH Browser] Could not remove staged cookie file: ' .. entry.temporary)
+            end
+        end
+        return removed
     end
 end
 
@@ -18392,7 +19230,9 @@ function sh_browser_bootstrap.draw_cookie_choice(x, y)
         if gui.Button(u8'Да##BrowserCookiesYes', {x, button_y}, {220, 32}) then
             setup.confirm_cookie_clear = nil
             setup.cookie_choice_error = nil
-            setup.save_cookie_choice('yes')
+            if not setup.save_cookie_choice('yes') then
+                setup.cookie_choice_error = 'Не удалось сохранить настройки браузера.'
+            end
         end
         local no_label = setup.confirm_cookie_clear and 'Уверены?' or 'Нет'
         if gui.Button(u8(no_label .. '###BrowserCookiesNo'), {x + 232, button_y}, {220, 32})
@@ -18401,12 +19241,12 @@ function sh_browser_bootstrap.draw_cookie_choice(x, y)
                 setup.confirm_cookie_clear = true
                 setup.cookie_choice_error = nil
             else
-                local ok, problem = pcall(setup.clear_saved_cookies)
-                if ok then
-                    setup.save_cookie_choice('no')
-                else
-                    print('[SH Browser] ' .. tostring(problem))
-                    setup.cookie_choice_error = 'Не удалось удалить куки. Закройте браузер и повторите.'
+                local ok, removed = pcall(setup.clear_saved_cookies)
+                if not ok then
+                    print('[SH Browser] ' .. tostring(removed))
+                    setup.cookie_choice_error = 'Не удалось изменить настройки или удалить куки.'
+                elseif not removed then
+                    setup.cookie_choice_error = 'Куки отключены, но часть старых файлов осталась в профиле.'
                 end
                 setup.confirm_cookie_clear = nil
             end
@@ -18549,6 +19389,12 @@ local function sh_browser_ensure()
         end
         if not sh_browser_manager then sh_browser_load_error = 'Не найдены файлы браузера. Восстановите папку State Helper/Browser.' end
     end
+end
+
+function sh_settings_search.browser_available(embedded)
+	sh_browser_ensure()
+	local state = sh_browser_manager and sh_browser_manager.state
+	return state and (not embedded or (state.pending_mode or state.mode) ~= 'external')
 end
 
 function sh_browser_input.draw_key_popup()
@@ -19247,7 +20093,7 @@ function tags_in_call()
 	end
 end
 
-function cmd_edit(nm_cmd_edit, cmd_cur)
+function cmd_edit(nm_cmd_edit, cmd_cur, apply_command)
 	local new_cmd_return
 	if imgui.BeginPopupModal(nm_cmd_edit, null, imgui.WindowFlags.AlwaysAutoResize + imgui.WindowFlags.NoMove + imgui.WindowFlags.NoTitleBar) then
 		if imgui.IsKeyPressed(27, false) then
@@ -19285,23 +20131,31 @@ function cmd_edit(nm_cmd_edit, cmd_cur)
 		gui.DrawLine({0, 50}, {381, 50}, cl.line)
 		imgui.SetCursorPos(imgui.ImVec2(10, 70))
 		imgui.Text('/')
-		new_cmd = gui.InputText({27, 71}, 300, new_cmd, u8'Назначение команды', 60, u8'Введите команду', 'en')
+		new_cmd = gui.InputText({27, 71}, 300, new_cmd, u8'Назначение команды', apply_command and 30 or 60, u8'Введите команду', apply_command and '' or 'en')
 		gui.DrawLine({0, 103}, {381, 103}, cl.line)
 		local bool_new_cmd = false
 		if #all_cmd ~= 0 then
 			for i = 1, #all_cmd do
-				if all_cmd[i] == new_cmd and new_cmd ~= cmd_cur then
+				if all_cmd[i]:lower() == new_cmd:lower() and new_cmd:lower() ~= cmd_cur:lower() then
 					bool_new_cmd = true
 					break
 				end
 			end
 		end
 		
-		if not bool_new_cmd then
+		if apply_command then new_cmd = new_cmd:lower() end
+		local invalid_name = apply_command and not sh_roleplay.command_valid(new_cmd)
+		if apply_command and new_cmd ~= '' and new_cmd ~= cmd_cur and sampIsChatCommandDefined(new_cmd) then
+			bool_new_cmd = true
+		end
+		if not bool_new_cmd and not invalid_name then
 			imgui.SetCursorPos(imgui.ImVec2(67, 110))
 			imgui.TextColored(imgui.ImVec4(0.08, 0.64, 0.11, 1.00), u8'Всё хорошо! Можете применять.')
 			if gui.Button(u8'Применить', {10, 132}, {158, 27}) then
-				if new_cmd ~= cmd_cur then
+				local close = true
+				if apply_command then
+					close = apply_command(new_cmd)
+				elseif new_cmd ~= cmd_cur then
 					new_cmd_return = new_cmd
 					for m = #all_cmd, 1, -1 do
 						if all_cmd[m] == cmd_cur then
@@ -19313,13 +20167,15 @@ function cmd_edit(nm_cmd_edit, cmd_cur)
 					if new_cmd ~= '' then table.insert(all_cmd, new_cmd) end
 				end
 				
-				lockPlayerControl(false)
-				edit_cmd = false
-				imgui.CloseCurrentPopup()
+				if close then
+					lockPlayerControl(false)
+					edit_cmd = false
+					imgui.CloseCurrentPopup()
+				end
 			end
 		else
 			imgui.SetCursorPos(imgui.ImVec2(69, 110))
-			imgui.TextColored(imgui.ImVec4(0.90, 0.22, 0.22 ,1.00), u8'Такая команда уже существует!')
+			imgui.TextColored(imgui.ImVec4(0.90, 0.22, 0.22 ,1.00), invalid_name and u8'Только латиница, цифры и _' or u8'Такая команда уже существует!')
 			if gui.Button(u8'Применить', {10, 132}, {158, 27}, false) then
 				
 			end
@@ -19961,107 +20817,41 @@ win.main = imgui.OnFrame(
 				imgui.SetCursorPos(imgui.ImVec2(247, an[4]))
 				gui.TextGradient('Обновления', 0.5, 1.00)
 				imgui.PopFont()
-				if new_version == '0' or error_update then
-					if search_for_new_version == 0 or error_update  then
-						gui.Text(290, 221, 'Установлена актуальная версия скрипта.', font[3])
-						gui.Text(324, 243, 'Можете завершать настройку.', font[3])
-					else
-						gui.Text(318, 230, 'Поиск обновлений, подождите...', font[3])
-					end
+				if sh_update.install == 'downloading' then
+					gui.Text(303, 230, 'Скачиваем обновление...', font[3])
+				elseif sh_update.install == 'failed' then
+					gui.Text(270, 221, 'Не удалось установить обновление.', font[3])
+					gui.Text(205, 243, 'Можно продолжить настройку с текущей версией.', font[3])
+				elseif sh_update.check == 'current' then
+					gui.Text(290, 221, 'Установлена актуальная версия скрипта.', font[3])
+				elseif sh_update.check == 'failed' then
+					gui.Text(278, 221, 'Не удалось проверить обновления.', font[3])
+					gui.Text(205, 243, 'Можно продолжить настройку с текущей версией.', font[3])
+				elseif sh_update.check == 'available' then
+					gui.Text(320, 221, 'Доступна новая версия скрипта.', font[3])
+					gui.Text(235, 243, 'Для завершения настройки установите обновление.', font[3])
 				else
-					if update_request == 0 then
-						gui.Text(320, 221, 'Доступна новая версия скрипта.', font[3])
-						gui.Text(235, 243, 'Для завершения настройки, установите новейшую версию.', font[3])
-					else
-						gui.Text(342, 231, 'Обновление запрошено...', font[3])
-					end
+					gui.Text(318, 230, 'Поиск обновлений, подождите...', font[3])
 				end
 				
 				gui.DrawLine({24, 391}, {824, 391}, imgui.ImVec4(0.50, 0.50, 0.50, 0.50))
 				
-				if new_version == '0' or error_update  then
-					if search_for_new_version == 0 or error_update then
+				if sh_update.install ~= 'downloading' and (sh_update.install == 'failed'
+					or sh_update.check == 'current' or sh_update.check == 'failed') then
+					do
 						if gui.Button(u8'Завершить', {715, 403}, {104, 30}) then
-							first_start = 7
-							setting.first_start = false
-							for i = 1, #cmd_defoult.all do
-								local new_cmd = deep_copy(cmd_defoult.all[i])
-								table.insert(cmd[1], new_cmd)
-								sampRegisterChatCommand(new_cmd.cmd, function(arg) 
-								cmd_start(arg, tostring(new_cmd.UID) .. new_cmd.cmd) end)
-							end
-							if setting.org <= 4 then --> Для Больниц
-								for i = 1, #cmd_defoult.hospital do
-									table.insert(cmd[1], cmd_defoult.hospital[i])
-									sampRegisterChatCommand(cmd_defoult.hospital[i].cmd, function(arg) 
-									cmd_start(arg, tostring(cmd_defoult.hospital[i].UID) .. cmd_defoult.hospital[i].cmd) end)
-								end
-								
-								if s_na == 'Phoenix' then 
-									for i = 1, #cmd[1] do
-										if cmd[1][i].cmd == 'mc' then
-											cmd[1][i] = mc_phoenix
-										end
-									end
-								end
-							elseif setting.org == 5 then --> Для ЦЛ
-								for i = 1, #cmd_defoult.driving_school do
-									table.insert(cmd[1], cmd_defoult.driving_school[i])
-									sampRegisterChatCommand(cmd_defoult.driving_school[i].cmd, function(arg) 
-									cmd_start(arg, tostring(cmd_defoult.driving_school[i].UID) .. cmd_defoult.driving_school[i].cmd) end)
-								end
-							elseif setting.org == 6 then --> Для Права
-								for i = 1, #cmd_defoult.government do
-									table.insert(cmd[1], cmd_defoult.government[i])
-									sampRegisterChatCommand(cmd_defoult.government[i].cmd, function(arg) 
-									cmd_start(arg, tostring(cmd_defoult.government[i].UID) .. cmd_defoult.government[i].cmd) end)
-								end
-							elseif setting.org == 7 or setting.org == 8 then --> Для Армии
-								for i = 1, #cmd_defoult.army do
-									table.insert(cmd[1], cmd_defoult.army[i])
-									sampRegisterChatCommand(cmd_defoult.army[i].cmd, function(arg) 
-									cmd_start(arg, tostring(cmd_defoult.army[i].UID) .. cmd_defoult.army[i].cmd) end)
-								end
-								setting.gun_func = true
-							elseif setting.org == 9 then --> Для Пожарки
-								for i = 1, #cmd_defoult.fire_department do
-									table.insert(cmd[1], cmd_defoult.fire_department[i])
-									sampRegisterChatCommand(cmd_defoult.fire_department[i].cmd, function(arg) 
-									cmd_start(arg, tostring(cmd_defoult.fire_department[i].UID) .. cmd_defoult.fire_department[i].cmd) end)
-								end
-							elseif setting.org == 10 then --> Для ТСР
-								for i = 1, #cmd_defoult.jail do
-									table.insert(cmd[1], cmd_defoult.jail[i])
-									sampRegisterChatCommand(cmd_defoult.jail[i].cmd, function(arg) 
-									cmd_start(arg, tostring(cmd_defoult.jail[i].UID) .. cmd_defoult.jail[i].cmd) end)
-								end
-								setting.gun_func = true
--- Disabled media settings archived.
-							elseif setting.org >= 11 and setting.org <= 15 then --> Для полиции
-								for i = 1, #cmd_defoult.police do
-									table.insert(cmd[1], cmd_defoult.police[i])
-									sampRegisterChatCommand(cmd_defoult.police[i].cmd, function(arg) 
-									cmd_start(arg, tostring(cmd_defoult.police[i].UID) .. cmd_defoult.police[i].cmd) end)
-								end
-								setting.gun_func = true
-							end
-							add_cmd_in_all_cmd()
-							save_cmd()
-							save()
+							sh_audit.complete_setup(true)
 						end
-					else
-						gui.Button(u8'Завершить', {715, 403}, {104, 30}, false)
 					end
+				elseif sh_update.check == 'available' and sh_update.install ~= 'downloading' then
+					if gui.Button(u8'Обновить', {715, 403}, {104, 30}) then update_download() end
 				else
-					if update_request == 0 then
-						if gui.Button(u8'Обновить', {715, 403}, {104, 30}) then
-							update_request = 25
-							update_download()
-						end
-					else
-						gui.Button(u8'Обновить', {715, 403}, {104, 30}, false)
-					end
+					gui.Button(u8'Подождите...', {715, 403}, {104, 30}, false)
 				end
+				if sh_update.install ~= 'downloading' and sh_update.check == 'failed'
+					and gui.Button(u8'Повторить проверку', {450, 403}, {175, 30}) then update_check() end
+				if sh_update.install == 'failed'
+					and gui.Button(u8'Повторить установку', {450, 403}, {175, 30}) then update_download() end
 				if gui.Button(u8'Назад', {640, 403}, {62, 30}) then
 					first_start = 6
 				end
@@ -20070,7 +20860,7 @@ win.main = imgui.OnFrame(
 		
 		if not setting.first_start and setting.winter_intro_done then
 			if tab == 'settings' then
-				hall.settings()
+				if sh_settings_search.open then sh_settings_search.draw_results() else hall.settings() end
 			elseif tab == 'cmd' then
 				hall.cmd()
 			elseif tab == 'shpora' then
@@ -20101,6 +20891,12 @@ win.main = imgui.OnFrame(
 			gui.Text((424 - calc.x / 2), 11, u8:decode(name_tab))
 			imgui.PopFont()
 			winter.main_front(tab, calc.x)
+			if tab == 'settings' then
+				sh_settings_search.draw_header()
+			else
+				sh_settings_search.open, sh_settings_search.focus, sh_settings_search.progress = false, false, 0
+				sh_settings_search.target = nil
+			end
 			element_order(setting.tab)
 			if tab == 'music' then hall.wave_toolbar() end
 			
@@ -20351,71 +21147,42 @@ win.main = imgui.OnFrame(
 				
 				imgui.SetCursorPos(imgui.ImVec2(45, 5))
 				if imgui.InvisibleButton(u8'##Сохранить команду', imgui.ImVec2(64, 32)) then
-					if bl_cmd.cmd ~= '' then
-						local bool_true_cmd = 0
-						for m = 1, #all_cmd do
-							if all_cmd[m] == bl_cmd.cmd then
-								bool_true_cmd = m
+					local candidate = deep_copy(bl_cmd)
+					local previous = cmd[1][type_cmd]
+					local previous_name = previous and previous.cmd or ''
+					local valid, problem = sh_audit.command(candidate)
+					local conflict = false
+					if valid and candidate.cmd ~= '' and candidate.cmd:lower() ~= previous_name:lower() then
+						for _, existing_name in ipairs(all_cmd) do
+							if candidate.cmd:lower() == existing_name:lower() then
+								conflict = true
 								break
 							end
 						end
-						
-						if bool_true_cmd == 0 or cmd_memory == bl_cmd.cmd then
-							local final_cmd_data = deep_copy(bl_cmd)
-
-							if type_cmd == #cmd[1] + 1 then
-								table.insert(cmd[1], final_cmd_data)
-							else
-								cmd[1][type_cmd] = final_cmd_data
-							end
-
-							if cmd_memory ~= '' and cmd_memory ~= final_cmd_data.cmd then
-								for y = 1, #all_cmd do
-									if all_cmd[y] == cmd_memory then
-										table.remove(all_cmd, y)
-										sampUnregisterChatCommand(cmd_memory)
-										break
-									end
-								end
-							end
-
-							table.insert(all_cmd, final_cmd_data.cmd)
-							if final_cmd_data.enabled ~= false then
-								local _uid = tostring(final_cmd_data.UID)
-								local _cname = final_cmd_data.cmd
-								sampRegisterChatCommand(_cname, function(arg) cmd_start(arg, _uid .. _cname) end)
-							end
-							
-							edit_tab_cmd = false
-							edit_all_cmd = false
-							an[13] = 0
-							if not save_cmd() then edit_tab_cmd = true; edit_all_cmd = true end
-						else
-							imgui.OpenPopup(u8'Ошибка сохранения команды')
-							error_save_cmd = 1
-						end
-					elseif cmd_memory ~= '' then
-						--imgui.OpenPopup(u8'Ошибка сохранения команды')
-						--error_save_cmd = 0
-						for y = 1, #all_cmd do
-							if all_cmd[y] == cmd_memory then
-								table.remove(all_cmd, y)
-								sampUnregisterChatCommand(cmd_memory)
-								if not save_cmd() then edit_tab_cmd = true; edit_all_cmd = true end
-								break
-							end
-						end
-						cmd[1][type_cmd] = bl_cmd
-						edit_tab_cmd = false
-						edit_all_cmd = false
-						an[13] = 0
-					else
-						cmd[1][type_cmd] = bl_cmd
-						edit_tab_cmd = false
-						edit_all_cmd = false
-						an[13] = 0
 					end
-					if not save_cmd() then edit_tab_cmd = true; edit_all_cmd = true end
+					if not valid then
+						sampAddChatMessage('[SH]{FFFFFF} Команда не сохранена: ' .. tostring(problem), 0xFF5345)
+					elseif conflict then
+						error_save_cmd = 1
+						imgui.OpenPopup(u8'Ошибка сохранения команды')
+					else
+						cmd[1][type_cmd] = candidate
+						if save_cmd() then
+							if previous_name ~= '' and previous.enabled ~= false then
+								sampUnregisterChatCommand(previous_name)
+							end
+							if candidate.cmd ~= '' and candidate.enabled ~= false then
+								local name = candidate.cmd
+								local identity = tostring(candidate.UID) .. name
+								sampRegisterChatCommand(name, function(arg) cmd_start(arg, identity) end)
+							end
+							add_cmd_in_all_cmd()
+							edit_tab_cmd, edit_all_cmd = false, false
+							an[13] = 0
+						else
+							cmd[1][type_cmd] = previous
+						end
+					end
 				end
 				if imgui.IsItemActive() or imgui.IsItemHovered() then
 					if an[8][3] < 0.45 then
@@ -21997,13 +22764,8 @@ function suui.try_load()
 	suui.load_check = os.clock()
 	if s_na == nil or s_na == '' then return end
 	local file_path = dir .. '/State Helper/Police/AutoSu/' .. s_na .. '.json'
-	if not doesFileExist(file_path) then return end
-	local file = io.open(file_path, 'r')
-	if not file then return end
-	local data = file:read('*a')
-	file:close()
-	local ok, decoded = pcall(decodeJson, data)
-	if ok and type(decoded) == 'table' and #decoded > 0 then
+	local decoded = sh_audit.read_police_db(file_path)
+	if decoded then
 		smartSuState.reasons = decoded
 		smartSuState.chapterStates = {}
 		smartSuState.chapterStates[1] = true
@@ -22520,64 +23282,714 @@ win.smart_su = imgui.OnFrame(
 		imgui.PopStyleVar(1)
 	end
 )
---[[
+--> ===================== УМНЫЕ ШТРАФЫ =====================
+--> Окно полностью повторяет умный розыск (suui), только вместо звёзд деньги.
+--> База: AutoTicket/<сервер>.json, формат тот же, что у УК: главы -> статьи {code, text, penalty}.
+--> penalty: "500000" - фиксированная сумма, "до 500000" - выбирается сумма, "5000000|25000000" - вариант из двух.
+local tkui = {
+	TRADE_LIMIT = 1000000,
+	hov = {},
+	selv = {},
+	chap = {},
+	picker = nil,
+	time = 0,
+	t = 0,
+	disp = 0,
+	pop = 0,
+	last_total = 0,
+	load_check = 0,
+	init_done = false,
+	pc = setmetatable({}, {__mode = 'k'}),
+	tc = setmetatable({}, {__mode = 'k'}),
+	tails = {
+		u8', нарушителю выписывается', u8' нарушителю выписывается',
+		u8', нарушитель предусматривается', u8' нарушитель предусматривается',
+		u8' предусматривается', u8', нарушителю', u8' нарушителю'
+	}
+}
+
+function tkui.reset()
+	tkui.t = 0
+	tkui.hov = {}
+	tkui.selv = {}
+	tkui.chap = {}
+	tkui.picker = nil
+	tkui.disp = 0
+	tkui.pop = 0
+	tkui.last_total = 0
+	tkui.load_check = 0
+	tkui.init_done = false
+end
+
+-- ---------- суммы ----------------------------------------------------------------
+function tkui.digits(s)
+	local d = tostring(s or ''):gsub('%D', '')
+	return tonumber(d)
+end
+
+-- 500000 -> 500 000$
+function tkui.fmt(n)
+	local s = tostring(math.floor((tonumber(n) or 0) + 0.5))
+	local out = ''
+	while #s > 3 do
+		out = ' ' .. s:sub(-3) .. out
+		s = s:sub(1, -4)
+	end
+	return s .. out .. '$'
+end
+
+-- короткая запись для кнопок: 250к, 1.5 млн
+function tkui.short(n)
+	n = tonumber(n) or 0
+	if n >= 1000000 then
+		local m = n / 1000000
+		local t = (m == math.floor(m)) and tostring(m) or string.format('%.1f', m)
+		return t .. ' млн'
+	end
+	if n >= 1000 then return tostring(math.floor(n / 1000)) .. 'к' end
+	return tostring(n)
+end
+
+function tkui.plural(n)
+	local m10, m100 = n % 10, n % 100
+	if m10 == 1 and m100 ~= 11 then return 'статья' end
+	if m10 >= 2 and m10 <= 4 and (m100 < 12 or m100 > 14) then return 'статьи' end
+	return 'статей'
+end
+
+-- четыре шага от максимума для штрафов "до N"
+function tkui.presets(max)
+	local out, seen = {}, {}
+	local step = max >= 200000 and 10000 or (max >= 40000 and 5000 or 1000)
+	for _, f in ipairs({0.25, 0.5, 0.75, 1}) do
+		local v = math.floor(max * f / step + 0.5) * step
+		if v < step then v = step end
+		if v > max then v = max end
+		if not seen[v] then
+			seen[v] = true
+			out[#out + 1] = v
+		end
+	end
+	return out
+end
+
+-- разбор поля penalty (если пусто, берём сумму из скобок в конце текста)
+function tkui.parse_pen(p, text)
+	local s = tostring(p or '')
+	local amounts = {}
+	for part in s:gmatch('[^|;/]+') do
+		local n = tkui.digits(part)
+		if n and n > 0 then amounts[#amounts + 1] = n end
+	end
+	local upto = suui.ulower(s):find('\208\180\208\190', 1, true) ~= nil
+	if #amounts == 0 then
+		local tail = tostring(text or ''):match('%(([^()]*%$[^()]*)%)%s*$')
+		if tail then
+			upto = suui.ulower(tail):find('\208\180\208\190', 1, true) ~= nil
+			for g in tail:gmatch('[%d%.]+') do
+				local n = tkui.digits(g)
+				if n and n > 0 then amounts[#amounts + 1] = n end
+			end
+		end
+	end
+	local pen = {kind = 'none', amounts = amounts, max = 0}
+	if #amounts == 0 then return pen end
+	table.sort(amounts)
+	pen.max = amounts[#amounts]
+	if upto then
+		pen.kind = 'upto'
+		pen.presets = tkui.presets(pen.max)
+	elseif #amounts > 1 then
+		pen.kind = 'choice'
+	else
+		pen.kind = 'fixed'
+	end
+	return pen
+end
+
+function tkui.pen_of(article)
+	local pen = tkui.pc[article]
+	if not pen then
+		pen = tkui.parse_pen(article.penalty, article.text)
+		tkui.pc[article] = pen
+	end
+	return pen
+end
+
+-- чистое название: без кода в начале, без "(500.000$)" и служебных слов в конце
+function tkui.title(article)
+	local cached = tkui.tc[article]
+	if cached then return cached end
+	local text = tostring(article.text or '')
+	local code = tostring(article.code or '')
+	local t = text
+	if code ~= '' and t:sub(1, #code) == code then
+		t = t:sub(#code + 1)
+	end
+	t = t:gsub('^%s+', '')
+	t = t:gsub('%s*%([^()]*%$[^()]*%)%s*$', '')
+	t = t:gsub('%s+$', '')
+	for _, tail in ipairs(tkui.tails) do
+		if #t > #tail and t:sub(-#tail) == tail then
+			t = t:sub(1, #t - #tail)
+			break
+		end
+	end
+	t = t:gsub('[,%s]+$', '')
+	if t == '' then t = text end
+	tkui.tc[article] = t
+	return t
+end
+
+-- ---------- выбор статей ---------------------------------------------------------
+function tkui.find_sel(key)
+	for i, s in ipairs(smartTicketState.selected) do
+		if s.key == key then return s, i end
+	end
+	return nil, nil
+end
+
+function tkui.recalc()
+	local sum = 0
+	for _, s in ipairs(smartTicketState.selected) do
+		sum = sum + s.amount
+	end
+	smartTicketState.totalMoney = sum
+end
+
+function tkui.set_sel(key, article, amount)
+	if not amount or amount < 1 then return end
+	local s = tkui.find_sel(key)
+	if s then
+		s.amount = amount
+	else
+		table.insert(smartTicketState.selected, {
+			key = key,
+			code = tostring(article.code or ''),
+			text = article.text,
+			amount = amount
+		})
+	end
+	tkui.recalc()
+end
+
+function tkui.remove_sel(key)
+	local _, i = tkui.find_sel(key)
+	if i then
+		table.remove(smartTicketState.selected, i)
+		tkui.recalc()
+	end
+end
+
+function tkui.reason()
+	local parts = {}
+	for _, s in ipairs(smartTicketState.selected) do
+		parts[#parts + 1] = s.code
+	end
+	return table.concat(parts, ' + ')
+end
+
+function tkui.close()
+	smartTicketState.anim.is_closing = true
+	smartTicketState.anim.is_opening = false
+end
+
+-- Выписать: с отыгровкой или только команда. Больше лимита при включённом trade команда не отправляется
+function tkui.do_issue(with_rp)
+	local st = smartTicketState
+	local id, amount = st.targetId[0], st.totalMoney
+	if not setting.police_settings.smart_ticket or setting.org < 11 or setting.org > 15
+		or not sampIsPlayerConnected(id) or sampGetPlayerNickname(id) ~= st.targetNick
+		or table.concat({sampGetCurrentServerAddress()}, ':') ~= st.targetServer then
+		suui.notify('Игрок или сервер изменился. Откройте меню повторно.')
+		return
+	end
+	if amount <= 0 then return end
+	local over = (setting.police_settings.smart_ticket_trade == true) and amount > tkui.TRADE_LIMIT
+	local sex_a = setting.sex == 2 and 'а' or ''
+	local cmds = {}
+	if with_rp then
+		cmds[#cmds + 1] = '/me достал' .. sex_a .. ' из кармана бланк штрафа и ручку, заполнил' .. sex_a .. ' данные нарушителя'
+	end
+	if over then
+		suui.notify('Сумма больше ' .. tkui.fmt(tkui.TRADE_LIMIT) .. ': примите оплату через trade / pay')
+	else
+		cmds[#cmds + 1] = string.format('/writeticket %d %d %s', id, amount, u1251:iconv(tkui.reason()))
+		if with_rp then
+			cmds[#cmds + 1] = '/do Штраф выписан и вручён нарушителю.'
+		end
+	end
+	if #cmds == 0 then return end
+	if send_smart_su_commands(cmds) then tkui.close() end
+end
+
+-- подгрузка базы, если файл появился уже после открытия окна
+function tkui.try_load()
+	if os.clock() - tkui.load_check < 1.0 then return end
+	tkui.load_check = os.clock()
+	if s_na == nil or s_na == '' then return end
+	local file_path = dir .. '/State Helper/Police/AutoTicket/' .. s_na .. '.json'
+	local decoded = sh_audit.read_police_db(file_path)
+	if decoded then
+		smartTicketState.reasons = decoded
+		smartTicketState.chapterStates = {}
+		smartTicketState.chapterStates[1] = true
+	end
+end
+
+-- ---------- главное окно ---------------------------------------------------------
 win.smart_ticket = imgui.OnFrame(
 	function() return windows.smart_ticket[0] end,
 	function(main)
-		local coud = imgui.Cond.FirstUseEver
-		local size_x, size_y = 800, 600
-		if smartTicketState.anim.is_opening or smartTicketState.anim.is_closing then
-			coud = imgui.Cond.Always
-		end
-		if smartTicketState.anim.is_opening then
-			if smartTicketState.anim.win_x[0] > sx / 2 then
-				smartTicketState.anim.win_x[0] = smartTicketState.anim.win_x[0] - (anim * 4500)
-				if smartTicketState.anim.win_x[0] <= sx / 2 then
-					smartTicketState.anim.win_x[0] = sx / 2
-					smartTicketState.anim.is_opening = false
-				end
-			end
-		elseif smartTicketState.anim.is_closing then
-			if smartTicketState.anim.win_x[0] < sx + 400 then
-				smartTicketState.anim.win_x[0] = smartTicketState.anim.win_x[0] + (anim * 4500)
-				if smartTicketState.anim.win_x[0] >= sx + 400 then
-					smartTicketState.anim.is_closing = false
-					windows.smart_ticket[0] = false
-				end
-			end
-		end
+		local W, H = 848, 448
+		local st = smartTicketState
+		local dt = suui.dt()
 
-		imgui.SetNextWindowPos(imgui.ImVec2(smartTicketState.anim.win_x[0], smartTicketState.anim.win_y[0]), coud, imgui.ImVec2(0.5, 0.5))
-		imgui.SetNextWindowSize(imgui.ImVec2(size_x, size_y))
-		imgui.Begin('SmartTicket', windows.smart_ticket, imgui.WindowFlags.NoCollapse + imgui.WindowFlags.NoTitleBar + imgui.WindowFlags.NoScrollbar + imgui.WindowFlags.NoScrollWithMouse + imgui.WindowFlags.NoResize)
+		-- анимация открытия / закрытия: плавный выезд справа + проявление
+		if st.anim.is_opening then
+			tkui.t = math.min(1, tkui.t + dt * 3.2)
+			if tkui.t >= 1 then st.anim.is_opening = false end
+		elseif st.anim.is_closing then
+			tkui.t = math.max(0, tkui.t - dt * 4.0)
+			if tkui.t <= 0 then
+				st.anim.is_closing = false
+				windows.smart_ticket[0] = false
+			end
+		end
+		local ez = suui.ease(tkui.t)
+		local win_x = suui.lerp(sx + (W / 2) + 20, sx / 2, ez)
+		st.anim.win_x[0] = win_x
+
+		tkui.time = tkui.time + dt
+
+		imgui.PushStyleVarFloat(imgui.StyleVar.Alpha, suui.clamp(ez * 1.4, 0.0, 1.0))
+		local pos_cond = (st.anim.is_opening or st.anim.is_closing) and imgui.Cond.Always or imgui.Cond.FirstUseEver
+		imgui.SetNextWindowPos(imgui.ImVec2(win_x, st.anim.win_y[0]), pos_cond, imgui.ImVec2(0.5, 0.5))
+		imgui.SetNextWindowSize(imgui.ImVec2(W, H))
+		imgui.Begin('SmartTicket', windows.smart_ticket, imgui.WindowFlags.NoCollapse + imgui.WindowFlags.NoTitleBar + imgui.WindowFlags.NoScrollbar + imgui.WindowFlags.NoScrollWithMouse + imgui.WindowFlags.NoResize + imgui.WindowFlags.NoSavedSettings)
 		bug_fix_input()
-		gui.Draw({4, 4}, {size_x - 8, size_y - 8}, cl.main, 12, 15)
-		gui.DrawLine({4, 38}, {size_x - 4, 38}, cl.line)
-		imgui.PushFont(bold_font[1])
-		local title = 'Умный штраф | Файл: ' .. (s_na ~= '' and (s_na .. '.json') or 'Не определен')
-		local calc = imgui.CalcTextSize(u8(title))
-		gui.Text((size_x / 2) - (calc.x / 2), 11, title)
-		imgui.PopFont()
-		if imgui.IsItemHovered() then gui.DrawCircle({21, 21}, 7, imgui.ImVec4(0.98, 0.30, 0.38, 1.00))
-		else gui.DrawCircle({21, 21}, 7, imgui.ImVec4(0.98, 0.40, 0.38, 1.00)) end
-		imgui.SetCursorPos(imgui.ImVec2(11, 11))
-		if imgui.InvisibleButton('##close_smart_ticket', imgui.ImVec2(20, 20)) then
-			smartTicketState.anim.is_closing = true
-			smartTicketState.anim.is_opening = false
-		end
-		local targetNick = sampGetPlayerNickname(smartTicketState.targetId[0])
-		gui.Text(16, 45, 'Выбран игрок: ' .. targetNick .. ' [' .. smartTicketState.targetId[0] .. ']', font[3])
-		gui.DrawBox({16, 70}, {size_x - 32, 70}, cl.tab, cl.line, 7, 15)
-		gui.Text(26, 80, 'Поиск:', font[3])
-		smartTicketState.searchQuery = gui.InputText({80, 80}, 690, smartTicketState.searchQuery, 'smartTicketState.searchQuery', 256, u8 'Текст из статьи...')
-		gui.DrawLine({16, 105}, {size_x - 16, 105}, cl.line)
-		gui.Text(26, 112, 'Принимать штраф через trade / pay... если он больше 1 млн:', font[3])
-		imgui.SetCursorPos(imgui.ImVec2(740, 108))
-		if gui.Switch('##smart_ticket_trade', setting.police_settings.smart_ticket_trade) then
-			setting.police_settings.smart_ticket_trade = not setting.police_settings.smart_ticket_trade; save()
+
+		-- если файл базы появился позже открытия окна
+		if not st.reasons or #st.reasons == 0 then
+			tkui.try_load()
+		elseif not tkui.init_done then
+			tkui.init_done = true
+			if st.chapterStates[1] == nil then st.chapterStates[1] = true end
 		end
 
-)]]
+		local inner_w = W - 8
+
+		-- фон окна
+		gui.Draw({4, 4}, {inner_w, H - 8}, cl.main, 12, 15)
+		winter.begin(W, H)
+
+		-- ===== ШАПКА =====
+		gui.DrawLine({4, 38}, {W - 4, 38}, cl.line)
+		imgui.SetCursorPos(imgui.ImVec2(11, 11))
+		if imgui.InvisibleButton(u8'##tk_close', imgui.ImVec2(20, 20)) then
+			tkui.close()
+		end
+		if imgui.IsItemHovered() then
+			gui.DrawCircle({21, 21}, 7, imgui.ImVec4(0.98, 0.30, 0.38, 1.00))
+		else
+			gui.DrawCircle({21, 21}, 7, imgui.ImVec4(0.98, 0.40, 0.38, 1.00))
+		end
+
+		imgui.PushFont(bold_font[1])
+		local title_w = imgui.CalcTextSize(u8'Умные штрафы').x
+		imgui.PopFont()
+		local title_x = (W - title_w) / 2
+		gui.FaText(title_x - 26, 12, fa.COINS, fa_font[4], cl.def)
+		gui.Text(title_x, 10, 'Умные штрафы', bold_font[1])
+		winter.small_front('smart_ticket', W, H, title_w, 22)
+
+		-- бейдж суммы (справа в шапке): число плавно докручивается до итога
+		local total = st.totalMoney
+		if total ~= tkui.last_total then
+			tkui.pop = 1
+			tkui.last_total = total
+		end
+		tkui.pop = math.max(0, tkui.pop - dt * 3.5)
+		if math.abs(tkui.disp - total) < 1 then
+			tkui.disp = total
+		else
+			tkui.disp = tkui.disp + (total - tkui.disp) * math.min(1, dt * 9)
+		end
+		local badge_txt = tkui.fmt(tkui.disp)
+		local bw = imgui.CalcTextSize(u8(tkui.fmt(total))).x + 44
+		local bx = W - 16 - bw
+		suui.box(bx, 8, bw, 24, cl.bg, cl.line, 8)
+		gui.FaText(bx + 10, 12, fa.COINS, fa_font[3], total > 0 and suui.gold() or suui.muted(0.8))
+		gui.Text(bx + 32, 11, badge_txt, font[3])
+
+		-- ===== РАСКЛАДКА: слева игрок/сумма/кнопки, справа поиск и статьи =====
+		local LX, LW = 16, 254
+		local RX, RWc = 286, 546
+		local RED = imgui.ImVec4(0.98, 0.40, 0.38, 1.00)
+		local function sev(m)
+			if m >= 700000 then return imgui.ImVec4(0.96, 0.40, 0.38, 1) end
+			if m >= 300000 then return imgui.ImVec4(0.97, 0.72, 0.28, 1) end
+			return imgui.ImVec4(0.38, 0.80, 0.50, 1)
+		end
+		gui.DrawLine({278, 48}, {278, H - 14}, cl.line)
+
+		-- ===== КАРТОЧКА ИГРОКА =====
+		local tid = st.targetId[0]
+		local connected = sampIsPlayerConnected(tid)
+		local nick = connected and sampGetPlayerNickname(tid) or nil
+		if not nick or nick == '' then nick = 'Игрок вышел' end
+		suui.box(LX, 48, LW, 46, cl.tab, cl.line, 10)
+		gui.Draw({LX, 48}, {4, 46}, connected and cl.def or suui.muted(0.8), 2, 15)
+		gui.DrawCircle({LX + 30, 71}, 17, suui.alpha(cl.def, 0.18))
+		gui.FaText(LX + 22, 63, fa.USER, fa_font[4], cl.def)
+		gui.Text(LX + 56, 52, nick, bold_font[1])
+		if connected then
+			suui.mtext(LX + 56, 72, 'ID ' .. tostring(tid))
+		else
+			suui.mtext(LX + 56, 72, 'покинул сервер', suui.warn(1))
+		end
+
+		-- ===== СУММА К ВЫПИСКЕ =====
+		local cnt = #st.selected
+		local ty, th = 102, 46
+		suui.box(LX, ty, LW, th, cl.tab, cl.line, 10)
+		local jump = math.sin(tkui.pop * math.pi) * 4
+		gui.DrawCircle({LX + 30, ty + 23}, 15, suui.alpha(suui.gold(1), total > 0 and 0.22 or 0.10))
+		gui.FaText(LX + 22, ty + 15 - jump, fa.COINS, fa_font[4], total > 0 and suui.gold(1) or suui.muted(0.55))
+		gui.Text(LX + 54, ty + 6, badge_txt, bold_font[1])
+		if cnt > 0 then
+			suui.mtext(LX + 54, ty + 26, tostring(cnt) .. ' ' .. tkui.plural(cnt))
+			if suui.icon_btn(u8'##tk_clearall', LX + LW - 40, ty + 11, 28, 24, fa.TRASH, 'Очистить выбор', RED) then
+				st.selected = {}
+				st.totalMoney = 0
+				tkui.picker = nil
+			end
+		else
+			suui.mtext(LX + 54, ty + 26, 'ничего не выбрано')
+		end
+
+		-- ===== ПРИЧИНА В КОМАНДЕ =====
+		local has_sel = cnt > 0
+		local alive = connected
+		local ry, rh = 156, 94
+		suui.box(LX, ry, LW, rh, cl.tab, cl.line, 10)
+		if has_sel then
+			suui.mtext(LX + 14, ry + 9, 'Причина в команде')
+			local wp0 = imgui.GetWindowPos()
+			imgui.PushClipRect(imgui.ImVec2(wp0.x + LX + 4, wp0.y + ry + 28), imgui.ImVec2(wp0.x + LX + LW - 4, wp0.y + ry + rh - 6), true)
+			imgui.SetCursorPos(imgui.ImVec2(LX + 14, ry + 30))
+			imgui.PushTextWrapPos(LX + LW - 14)
+			imgui.Text(tkui.reason())
+			imgui.PopTextWrapPos()
+			imgui.PopClipRect()
+		else
+			gui.FaText(LX + 14, ry + 14, fa.LIST_CHECK, fa_font[3], suui.muted(0.7))
+			suui.mtext(LX + 40, ry + 15, 'Выберите статьи справа')
+			suui.mtext(LX + 14, ry + 42, 'Суммы штрафов складываются.')
+		end
+
+		-- ===== ОПЛАТА ЧЕРЕЗ TRADE (переключатель) =====
+		local wy, wh = 258, 46
+		suui.box(LX, wy, LW, wh, cl.tab, cl.line, 10)
+		gui.Text(LX + 14, wy + 6, 'Оплата через trade / pay', font[3])
+		suui.mtext(LX + 14, wy + 25, 'если штраф больше 1 млн')
+		imgui.SetCursorPos(imgui.ImVec2(LX + LW - 56, wy + 12))
+		local tg, tv = gui.Switch('##tk_trade', setting.police_settings.smart_ticket_trade == true)
+		if tg then
+			setting.police_settings.smart_ticket_trade = tv
+			save()
+		end
+
+		-- ===== КНОПКИ =====
+		local over_trade = (setting.police_settings.smart_ticket_trade == true) and total > tkui.TRADE_LIMIT
+		local ok_issue = has_sel and alive and total > 0
+		local tip = (not has_sel) and 'Выберите хотя бы одну статью' or ((not alive) and 'Игрок покинул сервер' or nil)
+		local give_sub = over_trade and 'отыгровка, оплата trade' or 'с отыгровкой'
+		if suui.action_btn(u8'##tk_give', LX, 312, LW, 56, fa.CHECK, 'Выписать', give_sub, true, ok_issue, tip) then
+			tkui.do_issue(true)
+		end
+		local fast_tip = over_trade and 'Сумма больше 1 млн: примите оплату через trade / pay' or tip
+		if suui.action_btn(u8'##tk_fast', LX, 376, LW, 56, fa.PAPER_PLANE, 'Быстро', 'только /writeticket', false, ok_issue and not over_trade, fast_tip) then
+			tkui.do_issue(false)
+		end
+
+		-- ===== ПОИСК (правая колонка) =====
+		suui.box(RX, 48, RWc, 34, cl.tab, cl.line, 10)
+		gui.FaText(RX + 12, 57, fa.MAGNIFYING_GLASS, fa_font[3], cl.def)
+		st.searchQuery = gui.InputText({RX + 40, 59}, RWc - 120, st.searchQuery, 'smartTicketState.searchQuery', 256, u8'Поиск по номеру или названию статьи...')
+		local has_query = (st.searchQuery or '') ~= ''
+		if has_query then
+			if suui.icon_btn(u8'##tk_clear', RX + RWc - 72, 52, 28, 26, fa.XMARK, 'Очистить поиск', RED) then
+				st.searchQuery = ''
+			end
+		end
+		local any_open = false
+		for i = 1, #(st.reasons or {}) do
+			if st.chapterStates[i] then any_open = true break end
+		end
+		if suui.icon_btn(u8'##tk_fold', RX + RWc - 38, 52, 28, 26, any_open and fa.CARET_DOWN or fa.CARET_RIGHT, any_open and 'Свернуть все главы' or 'Развернуть все главы') then
+			for i = 1, #(st.reasons or {}) do
+				st.chapterStates[i] = not any_open
+			end
+		end
+
+		-- ===== СПИСОК СТАТЕЙ =====
+		local list_y = 90
+		local list_h = H - 18 - list_y
+		imgui.SetCursorPos(imgui.ImVec2(RX, list_y))
+		imgui.BeginChild(u8'##tk_list', imgui.ImVec2(RWc, list_h), false, imgui.WindowFlags.NoMove + imgui.WindowFlags.NoScrollWithMouse)
+		imgui.Scroller(u8'##tk_list', img_step[1][0], img_duration[1][0], imgui.HoveredFlags.AllowWhenBlockedByActiveItem)
+
+		local query = suui.ulower(st.searchQuery or '')
+		local drawn_any = false
+		local ROW_H, ROW_GAP = 42, 4
+		local HEAD_H = 42
+		local LIST_W = imgui.GetContentRegionAvail().x - 2
+		local RW = LIST_W - 12
+
+		if st.reasons and #st.reasons > 0 then
+			for index, chapterData in ipairs(st.reasons) do
+				local articles = chapterData.chapter or {}
+				local matches = {}
+				for n, article in ipairs(articles) do
+					local ok = true
+					if query ~= '' then
+						local hay = suui.ulower(tostring(article.code or '') .. ' ' .. tostring(article.text or ''))
+						ok = hay:find(query, 1, true) ~= nil
+					end
+					if ok then matches[#matches + 1] = {a = article, key = index .. ':' .. n} end
+				end
+				if #matches > 0 then
+					drawn_any = true
+					if st.chapterStates[index] == nil then st.chapterStates[index] = false end
+					local open = st.chapterStates[index] or query ~= ''
+					local ck = suui.approach(tkui.chap, index, open and 1 or 0, 5)
+
+					-- заголовок главы: номер в круге, название, прогресс выбора
+					local hp = imgui.GetCursorPos()
+					imgui.SetCursorPos(hp)
+					if imgui.InvisibleButton(u8'##tk_ch' .. index, imgui.ImVec2(LIST_W, HEAD_H)) then
+						if query == '' then
+							st.chapterStates[index] = not st.chapterStates[index]
+						end
+					end
+					local chov = imgui.IsItemHovered()
+					local hk = suui.approach(tkui.hov, 'ch' .. index, chov and 1 or 0, 9)
+					local mn, mx = imgui.GetItemRectMin(), imgui.GetItemRectMax()
+					local dl = imgui.GetWindowDrawList()
+					local picked = 0
+					for _, m in ipairs(matches) do
+						if tkui.find_sel(m.key) then picked = picked + 1 end
+					end
+					local hbg = suui.mix(cl.tab, cl.bg, math.max(hk * 0.7, ck * 0.6))
+					dl:AddRectFilled(mn, mx, suui.u32(hbg), 10)
+					dl:AddRect(mn, mx, suui.u32(suui.mix(cl.line, cl.def, ck * 0.6)), 10, 15, 1.0)
+					if picked > 0 then
+						local frac = picked / #matches
+						dl:AddRectFilled(imgui.ImVec2(mn.x + 12, mx.y - 5), imgui.ImVec2(mn.x + 12 + (LIST_W - 24) * frac, mx.y - 3), suui.u32(cl.def, 0.9), 2)
+					end
+					local bcx, bcy = mn.x + 26, (mn.y + mx.y) / 2 - 1
+					dl:AddCircleFilled(imgui.ImVec2(bcx, bcy), 15, suui.u32(cl.def, 0.14 + 0.30 * ck), 28)
+					imgui.PushFont(bold_font[1])
+					local ns = tostring(index)
+					local nsz = imgui.CalcTextSize(ns)
+					dl:AddText(imgui.ImVec2(bcx - nsz.x / 2, bcy - nsz.y / 2), suui.u32(cl.def), ns)
+					local right_txt = (picked > 0 and (tostring(picked) .. ' выбр.  |  ') or '') .. tostring(#matches) .. ' ст.'
+					imgui.PopFont()
+					local rw = imgui.CalcTextSize(u8(right_txt)).x
+					local title_w2 = LIST_W - 52 - (rw + 16) - 44
+					imgui.PushFont(bold_font[1])
+					local head_txt = suui.fit(tostring(chapterData.headerText or ''), title_w2)
+					imgui.PushStyleColor(imgui.Col.Text, cl.text)
+					imgui.SetCursorPos(imgui.ImVec2(hp.x + 52, hp.y + 11))
+					imgui.Text(head_txt)
+					imgui.PopStyleColor(1)
+					imgui.PopFont()
+					if chov and tostring(chapterData.headerText or '') ~= '' and select(2, suui.fit(tostring(chapterData.headerText or ''), title_w2)) then
+						imgui.SetTooltip('%s', tostring(chapterData.headerText))
+					end
+					local px = hp.x + LIST_W - 40 - rw - 16
+					suui.box(px, hp.y + 9, rw + 16, 24, suui.alpha(cl.def, picked > 0 and 0.16 or 0.06), picked > 0 and cl.def or cl.line, 12)
+					suui.mtext(px + 8, hp.y + 13, right_txt)
+					gui.FaText(hp.x + LIST_W - 28, hp.y + 13, open and fa.CARET_DOWN or fa.CARET_RIGHT, fa_font[3], suui.mix(suui.muted(1), cl.def, ck))
+					imgui.SetCursorPos(imgui.ImVec2(hp.x, hp.y + HEAD_H))
+					imgui.Dummy(imgui.ImVec2(0, 5))
+
+					-- статьи главы
+					if ck > 0.02 then
+						for mi, m in ipairs(matches) do
+							local article, key = m.a, m.key
+							local code = tostring(article.code or '')
+							local pen = tkui.pen_of(article)
+							local has_panel = pen.kind == 'upto' or pen.kind == 'choice'
+							local selected_item = tkui.find_sel(key)
+							local sk = suui.approach(tkui.selv, key, selected_item and 1 or 0, 8)
+							local picker = (tkui.picker == key)
+							local pk = suui.approach(tkui.hov, 'pk' .. key, picker and 1 or 0, 9)
+							local stagger = suui.clamp((ck * (#matches + 3) - mi * 0.5) / 2.5, 0, 1)
+							local ra = suui.ease(stagger)
+							if ra > 0.01 then
+								local ap = imgui.GetCursorPos()
+								local slide = (1 - ra) * 10
+								imgui.SetCursorPos(imgui.ImVec2(ap.x + slide, ap.y))
+								local disabled = pen.kind == 'none'
+								if imgui.InvisibleButton(u8'##tk_art' .. key, imgui.ImVec2(RW, ROW_H)) and not disabled then
+									if has_panel then
+										if tkui.picker == key then
+											tkui.picker = nil
+										else
+											tkui.picker = key
+										end
+									else
+										if selected_item then
+											tkui.remove_sel(key)
+										else
+											tkui.set_sel(key, article, pen.max)
+										end
+										tkui.picker = nil
+									end
+								end
+								local ahov = imgui.IsItemHovered()
+								local hv = suui.approach(tkui.hov, 'a' .. key, ahov and 1 or 0, 10)
+								local amn, amx = imgui.GetItemRectMin(), imgui.GetItemRectMax()
+								local adl = imgui.GetWindowDrawList()
+								local sevc = sev(pen.max)
+								local row_bg = suui.mix(cl.main, cl.tab, hv)
+								row_bg = suui.mix(row_bg, suui.mix(cl.bg, cl.def, 0.14), sk)
+								local bottom_y = amx.y + (46 * pk)
+								adl:AddRectFilled(amn, imgui.ImVec2(amx.x, bottom_y), suui.u32(row_bg, ra), 10)
+								adl:AddRect(amn, imgui.ImVec2(amx.x, bottom_y), suui.u32(suui.mix(cl.line, cl.def, math.max(sk, pk * 0.6)), ra), 10, 15, 1.2)
+								-- полоса тяжести слева (зелёная / жёлтая / красная по сумме)
+								adl:AddRectFilled(imgui.ImVec2(amn.x + 1, amn.y + 9), imgui.ImVec2(amn.x + 5, amn.y + ROW_H - 9), suui.u32(sevc, ra * (0.55 + 0.45 * math.max(sk, hv))), 2)
+
+								local ico = selected_item and fa.CHECK or (disabled and fa.LOCK or (has_panel and fa.ELLIPSIS or fa.PLUS))
+								local ico_col = suui.mix(suui.muted(0.9), cl.def, math.max(sk, hv))
+								gui.FaText(ap.x + slide + 16, ap.y + 13, ico, fa_font[3], suui.alpha(ico_col, ra))
+
+								-- номер статьи в акцентной плашке
+								local badge_w = 76
+								suui.box(ap.x + slide + 42, ap.y + 8, badge_w, 26, suui.alpha(cl.def, ra * (0.10 + 0.12 * math.max(sk, hv))), suui.alpha(cl.def, ra * 0.40), 8)
+								imgui.PushStyleColor(imgui.Col.Text, suui.alpha(cl.def, ra))
+								local code_fit = suui.fit(code, badge_w - 10)
+								local cw = imgui.CalcTextSize(code_fit).x
+								imgui.SetCursorPos(imgui.ImVec2(ap.x + slide + 42 + (badge_w - cw) / 2, ap.y + 13))
+								imgui.Text(code_fit)
+								imgui.PopStyleColor(1)
+
+								-- сумма справа в плашке цвета тяжести
+								local pill_txt
+								if selected_item then
+									pill_txt = tkui.fmt(selected_item.amount)
+								elseif pen.kind == 'fixed' then
+									pill_txt = tkui.fmt(pen.max)
+								elseif pen.kind == 'upto' then
+									pill_txt = 'до ' .. tkui.short(pen.max) .. '$'
+								elseif pen.kind == 'choice' then
+									pill_txt = tkui.short(pen.amounts[1]) .. ' | ' .. tkui.short(pen.amounts[#pen.amounts]) .. '$'
+								else
+									pill_txt = '-'
+								end
+								pill_txt = u8(pill_txt)
+								local stw = imgui.CalcTextSize(pill_txt).x
+								local pw = stw + 44
+								local pxs = ap.x + slide + RW - 12 - pw
+								suui.box(pxs, ap.y + 8, pw, 26, suui.alpha(sevc, ra * 0.14), suui.alpha(sevc, ra * 0.55), 13)
+								gui.FaText(pxs + 11, ap.y + 13, fa.COINS, fa_font[2], suui.alpha(suui.mix(suui.muted(0.6), suui.gold(1), math.max(sk, 0.5 + hv * 0.5)), ra))
+								imgui.PushStyleColor(imgui.Col.Text, suui.alpha(cl.text, ra))
+								imgui.SetCursorPos(imgui.ImVec2(pxs + 31, ap.y + 13))
+								imgui.Text(pill_txt)
+								imgui.PopStyleColor(1)
+
+								-- название (с обрезкой) + подсказка с полным текстом
+								local ttl = tkui.title(article)
+								local ttl_x = ap.x + slide + 128
+								local ttl_w = pxs - ttl_x - 10
+								local ttl_fit, cut = suui.fit(ttl, ttl_w)
+								imgui.PushStyleColor(imgui.Col.Text, suui.alpha(cl.text, ra))
+								imgui.SetCursorPos(imgui.ImVec2(ttl_x, ap.y + 13))
+								imgui.Text(ttl_fit)
+								imgui.PopStyleColor(1)
+								if ahov and cut then
+									imgui.SetTooltip('%s', tostring(article.text or ''))
+								end
+
+								-- панель выбора суммы: варианты "A | B" или шаги от максимума для "до N"
+								if pk > 0.02 and has_panel then
+									local py = ap.y + ROW_H - 2
+									local ph = 46 * pk
+									if ph > 30 then
+										suui.mtext(ap.x + slide + 16, py + 5, 'Сумма:')
+										local opts = (pen.kind == 'choice') and pen.amounts or pen.presets
+										local bx0 = ap.x + slide + 80
+										for _, v in ipairs(opts) do
+											local on = selected_item and selected_item.amount == v
+											imgui.SetCursorPos(imgui.ImVec2(bx0, py))
+											if imgui.InvisibleButton(u8'##tk_pen' .. key .. '_' .. v, imgui.ImVec2(80, 28)) then
+												tkui.set_sel(key, article, v)
+												tkui.picker = nil
+											end
+											local bh = imgui.IsItemHovered()
+											local bk = suui.approach(tkui.hov, 'pb' .. key .. v, bh and 1 or 0, 10)
+											local fill = on and cl.def or suui.mix(cl.bg, cl.bg2, bk)
+											suui.box(bx0, py, 80, 28, suui.alpha(fill, pk), suui.alpha(suui.mix(cl.line, cl.def, math.max(bk, on and 1 or 0)), pk), 14)
+											gui.FaText(bx0 + 9, py + 6, fa.COINS, fa_font[2], suui.alpha(on and imgui.ImVec4(1, 1, 1, 1) or suui.gold(1), pk))
+											imgui.PushStyleColor(imgui.Col.Text, suui.alpha(on and imgui.ImVec4(1, 1, 1, 1) or cl.text, pk))
+											imgui.SetCursorPos(imgui.ImVec2(bx0 + 27, py + 5))
+											imgui.Text(u8(tkui.short(v)))
+											imgui.PopStyleColor(1)
+											bx0 = bx0 + 86
+										end
+										if selected_item then
+											imgui.SetCursorPos(imgui.ImVec2(bx0 + 6, py))
+											if imgui.InvisibleButton(u8'##tk_penrm' .. key, imgui.ImVec2(84, 28)) then
+												tkui.remove_sel(key)
+												tkui.picker = nil
+											end
+											local rh2 = imgui.IsItemHovered()
+											local rk = suui.approach(tkui.hov, 'prm' .. key, rh2 and 1 or 0, 10)
+											suui.box(bx0 + 6, py, 84, 28, suui.alpha(suui.mix(cl.bg, suui.alpha(RED, 0.3), rk), pk), suui.alpha(suui.mix(cl.line, RED, rk), pk), 14)
+											gui.FaText(bx0 + 16, py + 6, fa.TRASH, fa_font[2], suui.alpha(RED, pk))
+											imgui.PushStyleColor(imgui.Col.Text, suui.alpha(cl.text, pk))
+											imgui.SetCursorPos(imgui.ImVec2(bx0 + 36, py + 5))
+											imgui.Text(u8'Убрать')
+											imgui.PopStyleColor(1)
+										end
+									end
+								end
+
+								imgui.SetCursorPos(imgui.ImVec2(ap.x, ap.y + ROW_H + (46 * pk)))
+								imgui.Dummy(imgui.ImVec2(0, ROW_GAP))
+							end
+						end
+					end
+					imgui.Dummy(imgui.ImVec2(0, 6))
+				end
+			end
+			if not drawn_any then
+				local cx0 = (LIST_W - 220) / 2
+				gui.FaText(LIST_W / 2 - 14, list_h / 2 - 40, fa.MAGNIFYING_GLASS, fa_font[6], suui.muted(0.6))
+				gui.Text(cx0 + 38, list_h / 2 + 10, 'Ничего не найдено', bold_font[1])
+				suui.mtext(cx0 + 20, list_h / 2 + 34, 'Попробуйте другой номер или слово')
+				imgui.Dummy(imgui.ImVec2(0, list_h - 20))
+			end
+		else
+			-- загрузка: три прыгающие точки
+			local t = tkui.time * 5
+			for i = 0, 2 do
+				local yy = list_h / 2 - 20 - math.max(0, math.sin(t - i * 0.7)) * 9
+				gui.DrawCircle({LIST_W / 2 - 22 + i * 22, yy}, 5, suui.alpha(cl.def, 0.5 + 0.5 * math.max(0, math.sin(t - i * 0.7))))
+			end
+			gui.Text(LIST_W / 2 - 90, list_h / 2 + 4, 'Загружаю базу статей...', bold_font[1])
+			suui.mtext(LIST_W / 2 - 150, list_h / 2 + 30, 'Если база не появляется, проверьте интернет и повторите /ticket')
+			imgui.Dummy(imgui.ImVec2(0, list_h - 20))
+		end
+		imgui.EndChild()
+
+		winter.finish()
+		imgui.End()
+		imgui.PopStyleVar(1)
+	end
+)
 
 -- Disabled media prototype archived in State Helper/Archive.
 
@@ -23137,8 +24549,16 @@ local function fast_blocked(entry)
 	return false
 end
 
-local function fast_run(entry)
-	local player = tostring(fast_id)
+local function fast_run(entry, target)
+	if not sampIsLocalPlayerSpawned() or target.server ~= table.concat({sampGetCurrentServerAddress()}, ':') then return end
+	local player = target.id and tostring(target.id) or ''
+	if target.id and (not sampIsPlayerConnected(target.id) or sampGetPlayerNickname(target.id) ~= target.nick) then
+		if entry.id or (entry.lead and #(entry.lead.arg or {}) > 0) then
+			sampAddChatMessage('[SH]{FFFFFF} Действие отменено: выбранный игрок сменился или вышел.', 0xFF5345)
+			return
+		end
+		player = ''
+	end
 	if entry.lead then
 		local command = entry.lead
 		if command.arg and #command.arg > 1 and command.cmd ~= '' then
@@ -23181,7 +24601,7 @@ local function fast_run(entry)
 	else
 		local chat = plain
 		if chat ~= '' and chat:sub(1, 1) ~= '/' then chat = '/' .. chat end
-		if entry.id and tonumber(fast_id) and tonumber(fast_id) >= 0 then
+		if entry.id and player ~= '' then
 			chat = chat .. ' ' .. player
 		end
 		if entry.send ~= false then
@@ -23880,7 +25300,7 @@ win.fast = imgui.OnFrame(
 						local now_run = os.clock()
 						if not FAST_UI.last_run or now_run - FAST_UI.last_run > 0.35 then
 							FAST_UI.last_run = now_run
-							local ok_run, err_run = pcall(fast_run, picked)
+							local ok_run, err_run = pcall(fast_run, picked.entry, picked.target)
 							if not ok_run then print('[SH] fast_run: ' .. tostring(err_run)) end
 						end
 					end)
@@ -23911,7 +25331,7 @@ win.fast = imgui.OnFrame(
 		local radius = math.min(214, sx * 0.2, sy * 0.27) * scale_k
 		local hub = 62 * math.max(0.9, scale_k)
 		local hover = 0
-		if count > 0 and aim_len >= 38 then
+		if count > 0 and aim_len >= hub and aim_len <= radius + 7 then
 			local drag_angle = math.atan2(aim_y, aim_x)
 			local ang = drag_angle + math.pi / 2
 			while ang < 0 do ang = ang + math.pi * 2 end
@@ -24113,7 +25533,7 @@ win.fast = imgui.OnFrame(
 			go_back(true)
 		elseif lmb then
 			if hover == 0 then
-				if fast_level ~= nil then go_back() end
+				if fast_level ~= nil and aim_len < hub then go_back() end
 			else
 				local entry = slots[hover] and slots[hover].ref
 				if entry == nil then
@@ -24129,7 +25549,11 @@ win.fast = imgui.OnFrame(
 					fast_pop = 0
 					fast_weights = {}
 				elseif not fast_blocked(entry) then
-					FAST_UI.pending = entry
+					local target_id = tonumber(fast_id)
+					if not target_id or target_id < 0 then target_id = nil end
+					FAST_UI.pending = {entry = entry, target = {
+						id = target_id, nick = fast_nick, server = table.concat({sampGetCurrentServerAddress()}, ':')
+					}}
 					FAST_UI.closing = os.clock()
 				end
 			end
@@ -24631,9 +26055,8 @@ function start_other_cmd(cmd_func, arguments)
 				if not windows.main[0] then
 					open_main()
 				end
-				if i == 4 and arguments:find('(%d+)') and setting.sob_id_arg then
-					local arg_id = arguments:match('(%d+)')
-					arg_id = tonumber(arg_id)
+				local arg_id = tonumber(tostring(arguments or ''):match('^%s*(%d+)%s*$'))
+				if i == 4 and arg_id and arg_id <= 1003 and setting.sob_id_arg then
 					if arg_id ~= nil and (setting.sob.min_exp ~= '' or not setting.sob.auto_exp)
 					and (setting.sob.min_law ~= '' or not setting.sob.auto_law)
 					and (setting.sob.min_narko ~= '' or not setting.sob.auto_narko) then
@@ -24814,7 +26237,10 @@ function remove_old_org_commands(selected_org, unregister_commands)
 end
 
 function add_cmd_in_all_cmd()
-	all_cmd = {'ts', 'r', 'd', 'go', 's', 'f'}
+	all_cmd = {'sh', 'ts', 'r', 'd', 'go', 's', 'f'}
+	if sh_roleplay then
+		for _, name in pairs(sh_roleplay.bound) do all_cmd[#all_cmd + 1] = name end
+	end
 	if #cmd[1] ~= 0 then
 		for i = 1, #cmd[1] do
 			table.insert(all_cmd, cmd[1][i].cmd)
@@ -24986,9 +26412,9 @@ function start_sob_cmd(rp_sob_z)
 	end
 	if thread:status() ~= 'dead' then
 		if not setting.cef_notif then
-			sampAddChatMessage('[SH] {FFFFFF}У Вас уже запущена отыгровка! Используйте {ED95A8}' .. setting.act_key[2] .. '{FFFFFF}, чтобы остановить её.', 0xFF5345)
+			sampAddChatMessage('[SH] {FFFFFF}У Вас уже запущена отыгровка! Используйте ' .. sh_roleplay.key_hint('stop') .. ', чтобы остановить её.', 0xFF5345)
 		else
-			cefnotig('{FF5345}[SH] {FFFFFF}У Вас уже запущена отыгровка! Используйте {ED95A8}' .. setting.act_key[2] .. '{FFFFFF}, чтобы остановить её.', 3000)
+			cefnotig('{FF5345}[SH] {FFFFFF}У Вас уже запущена отыгровка! Используйте ' .. sh_roleplay.key_hint('stop') .. ', чтобы остановить её.', 3000)
 		end
 		return
 	end
@@ -25016,6 +26442,139 @@ function start_sob_cmd(rp_sob_z)
 			end
 		end)
 	end
+end
+
+sh_roleplay = {waiting = false, resume = false, bound = {}}
+
+function sh_roleplay.handle_stop()
+		if not sh_roleplay.stop() then
+			sampAddChatMessage('[SH] {FFFFFF}Нет активной отыгровки.', 0xFF5345)
+		end
+end
+function sh_roleplay.handle_continue()
+		if not sh_roleplay.waiting or thread:status() == 'dead' then
+			sampAddChatMessage('[SH] {FFFFFF}Сейчас нет отыгровки, ожидающей продолжения.', 0xFF5345)
+			return
+		end
+		sh_roleplay.resume = true
+end
+
+function sh_roleplay.command_valid(name)
+	return #name <= 29 and name:match('^[a-zA-Z0-9_]*$') ~= nil
+end
+
+function sh_roleplay.command_taken(name)
+	if name == '' then return false end
+	name = name:lower()
+	for _, taken in ipairs(all_cmd) do
+		if taken:lower() == name then return true end
+	end
+	return sampIsChatCommandDefined(name)
+end
+
+function sh_roleplay.register(kind, name)
+	local handler = kind == 'stop' and sh_roleplay.handle_stop or sh_roleplay.handle_continue
+	local ok, registered = pcall(sampRegisterChatCommand, name, handler)
+	return ok and registered ~= false and sampIsChatCommandDefined(name)
+end
+
+function sh_roleplay.bind_commands()
+	for _, kind in ipairs({'stop', 'continue'}) do
+		local name = setting.roleplay_commands[kind]:lower()
+		if not sh_roleplay.command_valid(name) then name = kind end
+		if name ~= '' then
+			if not sh_roleplay.command_taken(name) and sh_roleplay.register(kind, name) then
+				sh_roleplay.bound[kind] = name
+				all_cmd[#all_cmd + 1] = name
+			else
+				sampAddChatMessage('[SH] {FFFFFF}Команда /' .. name .. ' недоступна. Выберите другую в настройках отыгровки.', 0xFF5345)
+				name = ''
+			end
+		end
+		setting.roleplay_commands[kind] = name
+	end
+end
+
+function sh_roleplay.change_command(kind, name)
+	local previous = setting.roleplay_commands[kind]
+	name = name:lower()
+	if name == previous then return true end
+	if not sh_roleplay.command_valid(name) or sh_roleplay.command_taken(name) then return false end
+	if name ~= '' and not sh_roleplay.register(kind, name) then
+		sampAddChatMessage('[SH] {FFFFFF}Не удалось назначить команду /' .. name .. '.', 0xFF5345)
+		return false
+	end
+	setting.roleplay_commands[kind] = name
+	if not save() then
+		setting.roleplay_commands[kind] = previous
+		if name ~= '' then sampUnregisterChatCommand(name) end
+		return false
+	end
+	local bound = sh_roleplay.bound[kind]
+	if bound then sampUnregisterChatCommand(bound) end
+	sh_roleplay.bound[kind] = name ~= '' and name or nil
+	add_cmd_in_all_cmd()
+	return true
+end
+
+function sh_roleplay.command_row(kind, label, y)
+	local name = setting.roleplay_commands[kind]
+	gui.Text(26, y, label, font[3])
+	local display = name ~= '' and u8('/' .. name) or u8'Отсутствует'
+	imgui.SetCursorPos(imgui.ImVec2(260, y))
+	imgui.PushFont(font[3])
+	imgui.Text(stroi.fit(display, nil, 216))
+	imgui.PopFont()
+	local caption = name ~= '' and u8'Изменить...' or u8'Назначить...'
+	local popup = u8'Назначение команды: ' .. u8(label)
+	if gui.Button(caption .. '##roleplay-command-' .. kind, {491, y - 4}, {99, 25}) then
+		lockPlayerControl(true)
+		edit_cmd = true
+		new_cmd = name
+		imgui.OpenPopup(popup)
+	end
+	if edit_cmd then
+		cmd_edit(popup, name, function(cmd_name) return sh_roleplay.change_command(kind, cmd_name) end)
+	end
+end
+
+function sh_roleplay.key_hint(kind)
+	local label = kind == 'stop' and setting.act_key[2] or setting.enter_key[2]
+	local color = kind == 'stop' and '{FF8FA2}' or '{23E64A}'
+	local name = sh_roleplay.bound[kind]
+	if name then return color .. label .. '{FFFFFF} или ' .. color .. '/' .. name .. '{FFFFFF}' end
+	return color .. label .. '{FFFFFF}'
+end
+
+function sh_roleplay.stop()
+	local active = thread:status() ~= 'dead'
+	local queued = #command_queue > 0
+	if not active and not queued then return false end
+	sh_roleplay.waiting, sh_roleplay.resume = false, false
+	command_queue = {}
+	sh_license.cancel()
+	if active then thread:terminate() end
+	dialog_act.status, dialog_act.enter = false, false
+	return true
+end
+
+function sh_roleplay.wait_for_continue(keys)
+	sh_roleplay.waiting, sh_roleplay.resume = true, false
+	while true do
+		wait(0)
+		if not sampIsChatInputActive() and not sampIsDialogActive() then
+			local pressed = #keys > 0
+			for _, key in ipairs(keys) do
+				if not isKeyDown(key) then
+					pressed = false
+					break
+				end
+			end
+			if sh_roleplay.resume or pressed then break end
+		end
+	end
+	sh_roleplay.waiting, sh_roleplay.resume = false, false
+	dialog_act.status, dialog_act.enter = false, false
 end
 
 function on_hot_key(id_pr_key)
@@ -25065,10 +26624,9 @@ function on_hot_key(id_pr_key)
 			volume_song(play.volume)
 		end
 		
-		if pressed_key == tostring(table.concat(setting.act_key[1], ' ')) and not edit_key and thread:status() ~= 'dead'
+		if pressed_key == tostring(table.concat(setting.act_key[1], ' ')) and not edit_key
 		and not sampIsChatInputActive() and not sampIsDialogActive() and not isGamePaused() then
-			sh_license.cancel(); thread:terminate()
-			dialog_act.status = false
+			sh_roleplay.stop()
 		end
 		
 		if #cmd[1] ~= 0 then
@@ -25090,7 +26648,7 @@ function on_hot_key(id_pr_key)
 				end
 			end
 		end
-		if pressed_key == tostring(table.concat(setting.police_settings.siren_key[2], ' ')) and setting.police_settings.siren and not edit_key and not windows.main[0] and not windows.smart_su[0] and anti_spam_gun[3] == 0 then
+		if pressed_key == tostring(table.concat(setting.police_settings.siren_key[2], ' ')) and setting.police_settings.siren and not edit_key and not windows.main[0] and not windows.smart_su[0] and not windows.smart_ticket[0] and anti_spam_gun[3] == 0 then
 			if isCharInAnyCar(PLAYER_PED) then
 				local vehicle = getCarCharIsUsing(PLAYER_PED)
 				local siren_is_currently_on = isCarSirenOn(vehicle)
@@ -25441,9 +26999,9 @@ end
 function auto_report_fire(text_send, bool_func_enter)
 	if thread:status() ~= 'dead' then
 		if not setting.cef_notif then
-			sampAddChatMessage('[SH] [Доклад] {FFFFFF}У Вас уже запущена отыгровка! Используйте {ED95A8}' .. setting.act_key[2] .. '{FFFFFF}, чтобы остановить её.', 0xFF5345)
+			sampAddChatMessage('[SH] [Доклад] {FFFFFF}У Вас уже запущена отыгровка! Используйте ' .. sh_roleplay.key_hint('stop') .. ', чтобы остановить её.', 0xFF5345)
 		else
-			cefnotig('{FF5345}[SH] [Доклад] {FFFFFF}У Вас уже запущена отыгровка! Используйте {ED95A8}' .. setting.act_key[2] .. '{FFFFFF}, чтобы остановить её.', 4000)
+			cefnotig('{FF5345}[SH] [Доклад] {FFFFFF}У Вас уже запущена отыгровка! Используйте ' .. sh_roleplay.key_hint('stop') .. ', чтобы остановить её.', 4000)
 		end
 		return
 	end
@@ -25456,26 +27014,12 @@ function auto_report_fire(text_send, bool_func_enter)
 			end
 			wait(300)
 			if not setting.cef_notif then
-				sampAddChatMessage('[SH] {FFFFFF}Нажмите на {23E64A}' .. setting.enter_key[2] .. '{FFFFFF} для отправки доклада или {FF8FA2}' .. setting.act_key[2] .. '{FFFFFF}, чтобы отменить отправку.', 0xFF5345)
+				sampAddChatMessage('[SH] {FFFFFF}Нажмите ' .. sh_roleplay.key_hint('continue') .. ', чтобы отправить доклад, либо ' .. sh_roleplay.key_hint('stop') .. ', чтобы отменить отправку.', 0xFF5345)
 			else
-				cefnotig('{FF5345}[SH] {FFFFFF}Нажмите на {23E64A}' .. setting.enter_key[2] .. '{FFFFFF} для отправки доклада или {FF8FA2}' .. setting.act_key[2] .. '{FFFFFF}, чтобы отменить отправку.', 4000)
+				cefnotig('Отправить доклад: ' .. sh_roleplay.key_hint('continue') .. '  ·  Остановить: ' .. sh_roleplay.key_hint('stop'), 4000)
 			end
 			play_beep()
-			while true do wait(0)
-				if not sampIsChatInputActive() and not sampIsDialogActive() then
-					local bool_return = 0
-					for key = 1, #dec_key do
-						if isKeyDown(dec_key[key]) then
-							bool_return = bool_return + 1
-						end
-					end
-					if bool_return == #dec_key then
-						dialog_act.status = false
-						dialog_act.enter = false
-						break
-					end
-				end
-			end
+			sh_roleplay.wait_for_continue(dec_key)
 		else
 			wait(700)
 		end
@@ -25543,7 +27087,7 @@ function sh_license.cancel(reason)
         sampAddChatMessage('[SH]{FFFFFF} Выдача лицензии остановлена: '..reason,0xFF5345)
     end
 	sh_license.pending = nil
-	num_give_lic, num_give_lic_term, num_give_gov = -1, 0, -1
+	num_give_lic, num_give_lic_term, sh_gov_request = -1, 0, nil
 	if sh_auto_license and sh_auto_license.pending then sh_auto_license.pending.cancelled = true; sh_auto_license.pending = nil end
 end
 function sh_license.valid(request)
@@ -25556,7 +27100,7 @@ function sh_license.begin(id, license, term)
 	id, license, term = tonumber(id), tonumber(license), tonumber(term)
 	if not id or id ~= math.floor(id) or id < 0 or id > 1003 or not sampIsPlayerConnected(id) then return false end
 	if not license or license < 0 or license > 11 or license ~= math.floor(license) or not term or term < 0 or term > 2 or term ~= math.floor(term) then return false end
-	sh_license.pending = {id = id, nick = sampGetPlayerNickname(id), license = license, term = term, phase = 'sale', expected_command = '/givelicense '..id, server = table.concat({sampGetCurrentServerAddress()}, ':'), deadline = os.clock() + 30}
+	sh_license.pending = {id = id, nick = sampGetPlayerNickname(id), license = license, term = term, phase = 'await_send', expected_command = '/givelicense '..id, server = table.concat({sampGetCurrentServerAddress()}, ':'), deadline = os.clock() + 30}
 	return true
 end
 -- Keep the existing template IDs, but resolve the actual row from the current server list.
@@ -25589,7 +27133,7 @@ function sh_license.dialog(id, style, title, text)
     sh_license.trace('dialog '..tostring(id)..': '..title,request)
     local name = to_lowercase(title:gsub('{%x+}', '')):match('^%s*(.-)%s*$')
     local row
-    if name == 'продажа лицензии' and request.phase == 'sale' then
+    if id == 26360 and name == 'продажа лицензии' and request.phase == 'sale' then
         row = sh_license.find_row(style, text, function(label)
             if not label:match('^%s*%d+%.') then return false end
             -- Test the more specific names before the generic "авто".
@@ -25603,7 +27147,7 @@ function sh_license.dialog(id, style, title, text)
         end, false)
         if row == nil then sh_license.cancel('лицензия не найдена или недоступна. Выберите её вручную'); return end
         request.phase, request.deadline = 'term', os.clock() + 30
-    elseif name == 'выбор срока лицензий' and request.phase == 'term' then
+    elseif id == 26361 and name == 'выбор срока лицензий' and request.phase == 'term' then
         local short = request.license == 10 or request.license == 11
         row = sh_license.find_row(style, text, function(label)
             if short then return label:match('5%s*дн') ~= nil end
@@ -25618,12 +27162,30 @@ function sh_license.dialog(id, style, title, text)
     sampSendDialogResponse(id, 1, row, '')
     return false
 end
+function sh_license.command(text)
+	return text:match('^%s*{dialoglic%[(%d+)%]%[(%d+)%]%[(%d+)%]}%s*$')
+end
 function sh_license.send(text)
+	if not text:find('{dialoglic[', 1, true) then
+		if text ~= '' then sampSendChat(text) end
+		return
+	end
+	local license, term, target = sh_license.command(text)
+	if not sh_license.begin(target, license, term) then
+		sampAddChatMessage('[SH]{FFFFFF} Выдача отменена: неверные параметры лицензии или игрок не в сети.', 0xFF5345)
+		return
+	end
 	local request = sh_license.pending
-	if request then request.sending = true;sh_license.trace('sending license command',request) end
-	local ok, err = pcall(sampSendChat, text)
-	if request then request.sending = false end
-	if not ok then sh_license.cancel(); error(err) end
+	request.sending = true
+	sh_license.trace('sending license command', request)
+	local ok, err = pcall(sampSendChat, request.expected_command)
+	request.sending = false
+	if not ok then
+		sh_license.cancel('не удалось отправить команду серверу')
+		print('[SH License] ' .. tostring(err))
+	elseif sh_license.pending == request then
+		request.phase = 'sale'
+	end
 end
 function sh_license.tick()
 	if sh_license.pending and not sh_license.valid(sh_license.pending) then sh_license.cancel('истекло время ожидания или изменился игрок/подключение') end
@@ -25675,7 +27237,9 @@ function sh_auto_license.prepare(command, args)
 			if (tonumber(setting.rank) or 0) < variant.rank then return nil, nil, 'Недостаточный ранг для новичкового шаблона.' end
 			local copy = deep_copy(variant)
 			local ok = sh_audit.command(copy)
-			if ok and #copy.arg == #args then return copy, request end
+			if ok and #copy.arg == 1 and copy.arg[1].name == 'arg1' and copy.arg[1].type == 2 and #args == 1 then
+				return copy, request
+			end
 		end
 	end
 	return nil, nil, 'Не найден корректный шаблон выдачи новичку. Добавьте стандартные команды ЦЛ.'
@@ -25703,9 +27267,9 @@ function cmd_start(argument, cmd_name) --> Запуск команды
 	end
 	if thread:status() ~= 'dead' then --> Если какая-то команда уже запущена, то эту команду не запускаем
 		if not setting.cef_notif then
-			sampAddChatMessage('[SH] {FFFFFF}У Вас уже запущена отыгровка! Используйте {ED95A8}' .. setting.act_key[2] .. '{FFFFFF}, чтобы остановить её.', 0xFF5345)
+			sampAddChatMessage('[SH] {FFFFFF}У Вас уже запущена отыгровка! Используйте ' .. sh_roleplay.key_hint('stop') .. ', чтобы остановить её.', 0xFF5345)
 		else
-			cefnotig('{FF5345}[SH] {FFFFFF}У Вас уже запущена отыгровка! Используйте {ED95A8}' .. setting.act_key[2] .. '{FFFFFF}, чтобы остановить её.', 3000)
+			cefnotig('{FF5345}[SH] {FFFFFF}У Вас уже запущена отыгровка! Используйте ' .. sh_roleplay.key_hint('stop') .. ', чтобы остановить её.', 3000)
 		end
 		return
 	end
@@ -25773,6 +27337,14 @@ function cmd_start(argument, cmd_name) --> Запуск команды
 			end
 		end
 	end
+	if CMD.cmd:lower() == 'givelic' then
+		if tonumber(setting.org) ~= 5 then return end
+		local id = ARG and tonumber(ARG[1])
+		if not id or id < 0 or id > 1003 or not sampIsPlayerConnected(id) then
+			sampAddChatMessage('[SH]{FFFFFF} Игрок с таким ID не найден.', 0xFF5345)
+			return
+		end
+	end
 	local function escape_pattern(text_esc)
 		return text_esc:gsub('([%^%$%(%)%%%.%[%]%*%+%-%?])', '%%%1')
 	end
@@ -25782,13 +27354,49 @@ function cmd_start(argument, cmd_name) --> Запуск команды
 		if model == nil then model, speed = sh_audit.nearest_vehicle() end
 	end
 
+	local function dialog_action(action, step, delay, expand)
+		local expected_id = tonumber(action[3])
+		local start = sh_audit.last_server_dialog
+		if expected_id == nil and (not sampIsDialogActive() or not start or start.id ~= sampGetCurrentDialogId()) then
+			sampAddChatMessage('[SH]{FFFFFF} Откройте нужный диалог или укажите его ID в действии.', 0xFF5345)
+			return false
+		end
+		if step ~= 1 then wait(delay) end
+		local current = sh_audit.last_server_dialog
+		if not sampIsDialogActive() or not current or sampGetCurrentDialogId() ~= current.id
+			or (expected_id and current.id ~= expected_id) or (not expected_id and current ~= start) then
+			sampAddChatMessage('[SH]{FFFFFF} Диалог изменился. Действие отменено.', 0xFF5345)
+			return false
+		end
+		if action[1] == 'SEND_DIALOG' then
+			if current.style ~= 1 and current.style ~= 3 then
+				sampAddChatMessage('[SH]{FFFFFF} В открытом диалоге нет поля ввода.', 0xFF5345)
+				return false
+			end
+			sampSetCurrentDialogEditboxText(u8:decode(expand(action[2])))
+		else
+			local style = current.style
+			if style ~= 2 and style ~= 4 and style ~= 5 then
+				sampAddChatMessage('[SH]{FFFFFF} В открытом диалоге нет списка.', 0xFF5345)
+				return false
+			end
+			local row = tonumber(expand(action[2]))
+			if not row or row < 1 or row % 1 ~= 0 or row > sampGetListboxItemsCount() then
+				sampAddChatMessage('[SH]{FFFFFF} Номер строки диалога вне диапазона.', 0xFF5345)
+				return false
+			end
+			sampSetCurrentDialogListItem(row - 1)
+		end
+		sampCloseCurrentDialogWithButton(1)
+		return true
+	end
+
 	local function tag_converter(text) --> Преобразовать теги в тексте, если они имеются
 		text = u8:decode(text)
 		if text:find('%b{}') then
 			local week = {'Воскресенье', 'Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота'}
 			local month = {'Январь', 'Февраль', 'Март', 'Апрель', 'Май', 'Июнь', 'Июль', 'Август', 'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь'}
 			local extracted_str = {}
-			local stop_send_chat = false
 			
 			for tag in text:gmatch('%b{}') do
 				table.insert(extracted_str, {tag, tag})
@@ -26000,25 +27608,16 @@ function cmd_start(argument, cmd_name) --> Запуск команды
 				print_scr()
 			end
 			
-			if text:find('{dialoglic%[(%d+)%]%[(%d+)%]%[(%d+)%]}') then
-				local license, term, target = text:match('{dialoglic%[(%d+)%]%[(%d+)%]%[(%d+)%]}')
-				if not sh_license.begin(target, license, term) then
-					sampAddChatMessage('[SH]{FFFFFF} Выдача отменена: неверные параметры лицензии или игрок не в сети.', 0xFF5345)
+			local service, player = text:match('^{dialoggov%[(%d+)%]%[(%d+)%]}$')
+			if service then
+				service, player = tonumber(service), tonumber(player)
+				if service > 2 or player > 1003 or not sampIsPlayerConnected(player) then
+					sampAddChatMessage('[SH] {FFFFFF}Не удалось открыть меню услуг: проверьте ID игрока.', 0xFF5345)
 					return ''
 				end
-				return u8('/givelicense ' .. target)
+				sh_gov_request = {service = service, nick = sampGetPlayerNickname(player), started = getGameTimer()}
+				return (service == 1 and '/givevisa ' or '/givepass ') .. player
 			end
-			if text:find('{dialoggov%[(%d+)%]%[(%d+)%]}') then
-				stop_send_chat = true
-				num_id_dial, num_id_player = string.match(text, '{dialoggov%[(.-)%]%[(.-)%]}')
-				if tonumber(num_id_dial) > -1 and tonumber(num_id_dial) < 3 then
-					num_give_gov = tonumber(num_id_dial)
-				else
-					sampAddChatMessage('[SH] {FF5345}[КРИТИЧЕСКАЯ ОШИБКА] {FFFFFF}Параметр {dialoggov} имеет неверное значение.', 0xFF5345)
-					return ''
-				end
-			end
-			if stop_send_chat then return u8'/givepass ' .. num_id_player end
 		end
 		
 		return u8(text)
@@ -26057,7 +27656,9 @@ function cmd_start(argument, cmd_name) --> Запуск команды
 	end
 	thread = lua_thread.create(function() --> Функция отыгровки
 		local license_request
-		if tonumber(setting.org) == 5 and (CMD.cmd == 'licauto' or CMD.cmd == 'licmauto' or tonumber(CMD.id_element) == 16 or CMD.newbie_license_template == true) then
+		local command_name = CMD.cmd:lower()
+		if tonumber(setting.org) == 5 and (command_name == 'licauto' or command_name == 'licmauto'
+			or CMD.auto_license_template == true or CMD.newbie_license_template == true) then
 			local prepared, request, error_text = sh_auto_license.prepare(CMD, ARG)
 			if not prepared then
 				sampAddChatMessage('[SH]{FFFFFF} ' .. tostring(error_text), 0xFF5345)
@@ -26078,11 +27679,13 @@ function cmd_start(argument, cmd_name) --> Запуск команды
 						end
 					end
 					if license_request and not sh_auto_license.valid(license_request) then sampAddChatMessage('[SH]{FFFFFF} Выдача отменена: игрок или подключение изменились.', 0xFF5345) return end
+					local text = u8:decode(arg_and_var_and_tag_conv(v[2]))
 					if CMD.send_end_mes or i ~= #CMD.act then
-						sh_license.send(u8:decode(arg_and_var_and_tag_conv(v[2])))
+						sh_license.send(text)
 					else
+						local _, _, target = sh_license.command(text)
 						sampSetChatInputEnabled(true)
-						sampSetChatInputText(u8:decode(arg_and_var_and_tag_conv(v[2])))
+						sampSetChatInputText(target and ('/givelicense ' .. target) or text)
 					end
 				elseif v[1] == 'SEND_CMD' then
 				if i ~= 1 then
@@ -26105,52 +27708,24 @@ function cmd_start(argument, cmd_name) --> Запуск команды
 					dialog_act.status = true
 					dialog_act.enter = true
 					if not setting.cef_notif then
-						sampAddChatMessage('[SH] {FFFFFF}Нажмите на {23E64A}' .. setting.enter_key[2] .. '{FFFFFF} для продолжения или {FF8FA2}' .. setting.act_key[2] .. '{FFFFFF}, чтобы остановить отыгровку.', 0xFF5345)
+						sampAddChatMessage('[SH] {FFFFFF}Нажмите ' .. sh_roleplay.key_hint('continue') .. ', чтобы продолжить, либо ' .. sh_roleplay.key_hint('stop') .. ', чтобы остановить отыгровку.', 0xFF5345)
 					else
-						cefnotig('{FF5345}[SH] {FFFFFF}Нажмите на {23E64A}' .. setting.enter_key[2] .. '{FFFFFF} для продолжения или {FF8FA2}' .. setting.act_key[2] .. '{FFFFFF}, чтобы остановить отыгровку.', 3000)
+						cefnotig('{FF5345}[SH] {FFFFFF}Продолжить: ' .. sh_roleplay.key_hint('continue') .. '  ·  Остановить: ' .. sh_roleplay.key_hint('stop'), 5000)
 					end
 					play_beep()
-					while true do wait(0)
-						if not sampIsChatInputActive() and not sampIsDialogActive() then
-							local bool_return = 0
-							for key = 1, #dec_key do
-								if isKeyDown(dec_key[key]) then
-									bool_return = bool_return + 1
-								end
-							end
-							if bool_return == #dec_key then
-								dialog_act.status = false
-								dialog_act.enter = false
-								break
-							end
-						end
-					end
+					sh_roleplay.wait_for_continue(dec_key)
 				elseif v[1] == 'WAIT_ENTER' then
 					wait(400)
 					windows.action[0] = true
 					dialog_act.status = true
 					dialog_act.enter = true
 					if not setting.cef_notif then
-						sampAddChatMessage('[SH] {FFFFFF}Нажмите на {23E64A}' .. setting.enter_key[2] .. '{FFFFFF} для продолжения или {FF8FA2}' .. setting.act_key[2] .. '{FFFFFF}, чтобы остановить отыгровку.', 0xFF5345)
+						sampAddChatMessage('[SH] {FFFFFF}Нажмите ' .. sh_roleplay.key_hint('continue') .. ', чтобы продолжить, либо ' .. sh_roleplay.key_hint('stop') .. ', чтобы остановить отыгровку.', 0xFF5345)
 					else
-						cefnotig('{FF5345}[SH] {FFFFFF}Нажмите на {23E64A}' .. setting.enter_key[2] .. '{FFFFFF} для продолжения или {FF8FA2}' .. setting.act_key[2] .. '{FFFFFF}, чтобы остановить отыгровку.', 3500)
+						cefnotig('{FF5345}[SH] {FFFFFF}Продолжить: ' .. sh_roleplay.key_hint('continue') .. '  ·  Остановить: ' .. sh_roleplay.key_hint('stop'), 5000)
 					end
 					play_beep()
-					while true do wait(0)
-						if not sampIsChatInputActive() and not sampIsDialogActive() then
-							local bool_return = 0
-							for key = 1, #dec_key do
-								if isKeyDown(dec_key[key]) then
-									bool_return = bool_return + 1
-								end
-							end
-							if bool_return == #dec_key then
-								dialog_act.status = false
-								dialog_act.enter = false
-								break
-							end
-						end
-					end
+					sh_roleplay.wait_for_continue(dec_key)
 				elseif v[1] == 'SEND_ME' then
 					wait(400)
 					sampAddChatMessage('[SH] {FFFFFF}' .. u8:decode(arg_and_var_and_tag_conv(v[2])), 0xFF5345)
@@ -26272,47 +27847,8 @@ function cmd_start(argument, cmd_name) --> Запуск команды
 					if_active = 1
 				elseif v[1] == 'STOP' then
 					return
-				elseif v[1] == 'SEND_DIALOG' then
-					if i ~= 1 then
-						wait(delay)
-					end
-					if sampIsDialogActive() then
-						local id, _, _, _, _, _ = sampGetCurrentDialogId()
-						sampSendDialogResponse(id, 1, -1, u8:decode(arg_and_var_and_tag_conv(v[2])))
-						mem.setint32(sampGetDialogInfoPtr()+40, bool and 1 or 0, true)
-						sampToggleCursor(bool)
-					else
-						if not setting.cef_notif then
-							sampAddChatMessage('[SH] {FFFFFF}Ошибка: Диалоговое окно не открыто.', 0xFF5345)
-						else
-							cefnotig('{FF5345}[SH] {FFFFFF}Ошибка: Диалоговое окно не открыто.', 3000)
-						end
-					end
-				elseif v[1] == 'SELECT_DIALOG_ROW' then
-					if i ~= 1 then
-						wait(delay)
-					end
-					if sampIsDialogActive() then
-						local id, _, _, _, _, _ = sampGetCurrentDialogId()
-						local row = tonumber(arg_and_var_and_tag_conv(v[2]))
-						if row then
-							sampSendDialogResponse(id, 1, row -1, '')
-							mem.setint32(sampGetDialogInfoPtr()+40, bool and 1 or 0, true)
-							sampToggleCursor(bool)
-						else
-							if not setting.cef_notif then
-								sampAddChatMessage('[SH] {FFFFFF}Ошибка: Неверный номер рядка для выбора в диалоге.', 0xFF5345)
-							else
-								cefnotig('{FF5345}[SH] {FFFFFF}Ошибка: Неверный номер рядка для выбора в диалоге.', 3000)
-							end
-						end
-					else
-						if not setting.cef_notif then
-							sampAddChatMessage('[SH] {FFFFFF}Ошибка: Диалоговое окно не открыто.', 0xFF5345)
-						else
-							cefnotig('{FF5345}[SH] {FFFFFF}Ошибка: Диалоговое окно не открыто.', 3000)
-						end
-					end
+				elseif v[1] == 'SEND_DIALOG' or v[1] == 'SELECT_DIALOG_ROW' then
+					if not dialog_action(v, i, delay, arg_and_var_and_tag_conv) then return end
 				end
 			else
 				if v[1] == 'IF' then
@@ -26866,16 +28402,25 @@ function wanted_check()
 	end
 end
 
+function sh_audit.members_limit(value)
+	return math.max(0, math.min(1000, math.floor(tonumber(value) or 10)))
+end
+
 function render_members()
 	local X, Y = setting.mb.pos.x, setting.mb.pos.y
 	local title = string.format('%s | Онлайн: %s%s', org.name, org.online, (setting.mb.afk and (' (%s в АФК)'):format(org.afk) or ''))
-	local col_title = changeColorAlpha(setting.mb.color.title, (setting.mb.vis * 2))
+	local col_title = changeColorAlpha(sh_audit.members_color("title"), (setting.mb.vis * 2))
+	local title_width = renderGetFontDrawTextLength(fontes, title)
+	local title_height = renderGetFontDrawHeight(fontes)
+	local title_y = Y - math.max(setting.mb.dist, title_height) - 9
+	local line_x = setting.mb.invers and X or X - title_width
+	renderDrawBox(line_x, Y - 4, title_width, 1, 0xFFFFFFFF)
 	if setting.mb.invers then
-		if renderFontDrawClickableText(script_cursor, fontes, title, X, Y - setting.mb.dist - 5, col_title, col_title, 4, false) then
+		if renderFontDrawClickableText(script_cursor, fontes, title, X, title_y, col_title, col_title, 4, false) then
 			sampSendChat('/members')
 		end
 	else
-		if renderFontDrawClickableText(script_cursor, fontes, title, X, Y - setting.mb.dist - 5, col_title, col_title, 3, false) then
+		if renderFontDrawClickableText(script_cursor, fontes, title, X, title_y, col_title, col_title, 3, false) then
 			sampSendChat('/members')
 		end
 	end
@@ -26887,25 +28432,32 @@ function render_members()
 			renderFontDrawClickableText(script_cursor, fontes, 'Вы не состоите в организации', X, Y, col_non, col_non,  3, false)
 		end
 	elseif #members > 0 then
+		local mb = setting.mb
+		local limit = sh_audit.members_limit(mb.max_visible)
+		local shown, hidden = 0, 0
+		local online = tonumber(org.online) or 0
+		local align = mb.invers and 4 or 3
 		for i, member in ipairs(members) do
-			if i <= tonumber(org.online) then
-				if setting.rank_members[tonumber(member.rank.count)] then
-					local color = changeColorAlpha(setting.mb.form and (member.uniform and setting.mb.color.work or setting.mb.color.default) or setting.mb.color.default, (setting.mb.vis * 2))
-					local rank = setting.mb.rank and string.format('[%s]', member.rank.count) or nil
-					local nick = member.nick .. (setting.mb.id and string.format('(%s)', member.id) or '')
-					local afk = setting.mb.afk and string.format(' (AFK: %s)', member.afk) or ''
-					local warns = setting.mb.warn and string.format(' (W: %s)', member.warns) or ''
-					local out_string
-					if setting.mb.invers then
-						out_string = ('%s%s%s%s'):format(rank and rank .. ' ' or '', nick, afk, warns)
-						renderFontDrawClickableText(script_cursor, fontes, out_string, X, Y, color, color, 4, true)
-					else
-						out_string = ('%s%s%s%s'):format(rank and rank .. ' ' or '', nick, afk, warns)
-						renderFontDrawClickableText(script_cursor, fontes, out_string, X, Y, color, color, 3, true)
-					end
-					Y = Y + setting.mb.dist
+			if i > online then break end
+			if setting.rank_members[tonumber(member.rank.count)] then
+				if limit > 0 and shown >= limit then
+					hidden = hidden + 1
+				else
+					local tint = mb.form and member.uniform and sh_audit.members_color("work") or mb.color.default
+					local color = changeColorAlpha(tint, mb.vis * 2)
+					local rank = mb.rank and ('[%s] '):format(member.rank.count) or ''
+					local nick = member.nick .. (mb.id and ('(%s)'):format(member.id) or '')
+					local afk = mb.afk and (' (AFK: %s)'):format(member.afk) or ''
+					local warns = mb.warn and (' (W: %s)'):format(member.warns) or ''
+					renderFontDrawClickableText(script_cursor, fontes, rank .. nick .. afk .. warns, X, Y, color, color, align, true)
+					shown = shown + 1
+					Y = Y + mb.dist
 				end
 			end
+		end
+		if hidden > 0 then
+			local color = changeColorAlpha(mb.color.default, mb.vis * 2)
+			renderFontDrawClickableText(false, fontes, ('Ещё в списке: %d'):format(hidden), X, Y, color, color, align, false)
 		end
 	else
 		local col_non = changeColorAlpha(setting.mb.color.default, (setting.mb.vis * 2))
@@ -27436,11 +28988,6 @@ function chat_hook_server_message(color_mes, mes)
 		end
 	end
 
-	if mescol:find('%[Информация%] {ffffff}Вы заполнили все пункты, для подтверждения распишитесь нажав кнопку {90EE90}"Заполнить"') and setting.police_settings.auto_inves then
-		sampSendClickTextdraw(2131)
-		return false
-	end
-
 	if setting.color_nick then
 		if mescol:find('говорит:') and mes_col == 'ffffff' and setting.replace_ic then
 			local playerId = mes:match('%d+')
@@ -27815,15 +29362,39 @@ local license_copy = {}
 
 local sign_pick = {}
 
+local function sign_city_key(name)
+	local key = to_lowercase(name):lower():gsub('[%s%-]', '')
+	if key == 'sanfierro' or key == 'санфиерро' then return 'sf' end
+	if key == 'lossantos' or key == 'лоссантос' then return 'ls' end
+	if key == 'lasventuras' or key == 'lavventuras' or key == 'ласвентурас' then return 'lv' end
+end
+
+local sign_city_zones = {
+	sf = {name = 'San Fierro', x0 = -2997.47, y0 = -1115.58, x1 = -1213.91, y1 = 1659.68},
+	ls = {name = 'Los Santos', x0 = 44.61, y0 = -2892.97, x1 = 2997.06, y1 = -768.03},
+	lv = {name = 'Las Venturas', x0 = 869.46, y0 = 596.35, x1 = 2997.06, y1 = 2993.87}
+}
+
+local function sign_city_distance(zone, x, y)
+	local dx = math.max(zone.x0 - x, 0, x - zone.x1)
+	local dy = math.max(zone.y0 - y, 0, y - zone.y1)
+	return dx * dx + dy * dy
+end
+
 local function sign_pick_rows(text)
-	local rows, index = {}, -1
+	local rows, index, seen = {}, -1, {}
 	for line in (tostring(text or ''):gsub('\r', ''):gsub('\n+$', '') .. '\n'):gmatch('(.-)\n') do
 		local plain = line:gsub('{%x+}', '')
-		local num, name, distance, wear, status = plain:match('^%s*%[(%d+)%]%s+([^\t]+)\t([^\t]+)\t([^\t]*)\t(.+)$')
-		if num then
-			local meters = distance:gsub('%s', ''):match('^(%d+[.,]?%d*)')
+		if index >= 0 and plain:find('%S') then
+			local num, name, distance, _, status = plain:match('^%s*%[(%d+)%]%s+([^\t]+)\t([^\t]+)\t([^\t]*)\t(.+)$')
+			local meters = distance and distance:gsub('%s', ''):match('^(%d+[.,]?%d*)')
 			meters = meters and tonumber((meters:gsub(',', '.')))
-			if meters then rows[#rows + 1] = {index = index, name = name, distance = meters, status = status} end
+			status = status and to_lowercase(status):match('^%s*(.-)%s*$')
+			if not meters or seen[num] or (status ~= 'отсутствует' and status ~= 'требует ремонта' and status ~= 'установлен') then
+				return nil, 'Не удалось прочитать строку списка знаков №' .. (index + 1) .. '.'
+			end
+			seen[num] = true
+			rows[#rows + 1] = {index = index, name = name, distance = meters, status = status}
 		end
 		index = index + 1
 	end
@@ -27831,17 +29402,14 @@ local function sign_pick_rows(text)
 end
 
 local function sign_pick_cities(text)
-	local cities, index = {}, -1
+	local cities, index, seen = {}, -1, {}
 	for line in (tostring(text or ''):gsub('\r', ''):gsub('\n+$', '') .. '\n'):gmatch('(.-)\n') do
 		local plain = line:gsub('{%x+}', '')
-		local name, installed = plain:match('^%s*([^\t]+)\t%s*(%d+)%s+из%s+%d+')
-		if installed then
-			local key = to_lowercase(name):lower():gsub('[%s%-]', '')
-			local center
-			if key == 'sanfierro' or key == 'санфиерро' then center = {x = -1980, y = 150, name = 'San Fierro'}
-			elseif key == 'lossantos' or key == 'лоссантос' then center = {x = 1480, y = -1720, name = 'Los Santos'}
-			elseif key == 'lasventuras' or key == 'ласвентурас' then center = {x = 1690, y = 1440, name = 'Las Venturas'} end
-			if center then cities[#cities + 1] = {index = index, installed = tonumber(installed), center = center} end
+		local name, installed, total = plain:match('^%s*([^\t]+)\t%s*(%d+)%s+из%s+(%d+)')
+		local key = name and sign_city_key(name)
+		if index >= 0 and key and not seen[key] then
+			seen[key] = true
+			cities[#cities + 1] = {index = index, key = key, zone = sign_city_zones[key], installed = tonumber(installed), total = tonumber(total)}
 		end
 		index = index + 1
 	end
@@ -27949,10 +29517,14 @@ function hook.onRemoveMapIcon(id)
 	sh_sign_arrival.clear('icon', id)
 end
 
-local function sign_pick_nearest()
-	local best, best_distance
+local function sign_pick_nearest(selected)
+	local best, best_distance = selected, selected and selected.distance
+	if sign_pick.rows_error then
+		sampAddChatMessage('[SH]{FFFFFF} ' .. sign_pick.rows_error, 0xFF5345)
+		return
+	end
 	for _, row in ipairs(sign_pick.rows or {}) do
-		if (to_lowercase(row.status):find('требует ремонта', 1, true) or to_lowercase(row.status):find('отсутствует', 1, true)) and (best_distance == nil or row.distance < best_distance) then
+		if (row.status == 'требует ремонта' or row.status == 'отсутствует') and (best_distance == nil or row.distance < best_distance) then
 			best, best_distance = row, row.distance
 		end
 	end
@@ -27965,9 +29537,11 @@ local function sign_pick_nearest()
 	sh_sign_arrival.arm(best)
 	sign_pick.id = nil
 	sampSendDialogResponse(id, 1, best.index, '')
-	sign_pick.closing_id = id
-	sampCloseCurrentDialogWithButton(0)
-	sign_pick.closing_id = nil
+	if sampIsDialogActive() and sampGetCurrentDialogId() == id then
+		sign_pick.closing_id = id
+		sampCloseCurrentDialogWithButton(0)
+		sign_pick.closing_id = nil
+	end
 
 end
 
@@ -27984,12 +29558,18 @@ local function sign_pick_open_city()
 	if sign_pick.scan then return end
 	sh_sign_arrival.pending = nil
 	local cities = sign_pick.cities
-	if not sign_pick.id or not cities or #cities == 0 then return end
+	if not sign_pick.id or not cities then return end
+	if #cities ~= 3 then
+		sampAddChatMessage('[SH]{FFFFFF} Список городов прочитан не полностью. Повторите поиск.', 0xFF5345)
+		return
+	end
 	local x, y = getCharCoordinates(PLAYER_PED)
 	local queue = {}
 	for _, city in ipairs(cities) do queue[#queue + 1] = city end
 	table.sort(queue, function(a, b)
-		return (x - a.center.x)^2 + (y - a.center.y)^2 < (x - b.center.x)^2 + (y - b.center.y)^2
+		local da, db = sign_city_distance(a.zone, x, y), sign_city_distance(b.zone, x, y)
+		if da == db then return a.key < b.key end
+		return da < db
 	end)
 	local op = {cancel = false, server = table.concat({sampGetCurrentServerAddress()}, ':')}
 	sign_pick.scan = op
@@ -28011,12 +29591,14 @@ local function sign_pick_open_city()
 		local function await_screen(kind, serial)
 			local deadline = os.clock() + 6
 			while alive() and os.clock() < deadline do
-				if sign_pick.id and (sign_pick.serial or 0) > serial and type(sign_pick[kind]) == 'table' then
+				if sign_pick.id and (sign_pick.serial or 0) > serial then
+					if kind == 'rows' and sign_pick.rows_error then error(sign_pick.rows_error) end
+					if type(sign_pick[kind]) ~= 'table' then error('Открылся другой список. Повторите поиск.') end
 					local snapshot = sign_pick[kind]
-					local dialog_id = sign_pick.id
+					local dialog_id, generation = sign_pick.id, sign_pick.serial
 					wait(250)
 					if not alive() then error('Поиск отменён.') end
-					if sign_pick.id ~= dialog_id or type(sign_pick[kind]) ~= 'table' then
+					if sign_pick.id ~= dialog_id or sign_pick.serial ~= generation or sign_pick[kind] ~= snapshot then
 						error('Диалог знаков изменился во время поиска. Повторите выбор.')
 					end
 					return snapshot
@@ -28028,9 +29610,13 @@ local function sign_pick_open_city()
 		end
 		local function open_city(city)
 			local current
-			for _, row in ipairs(sign_pick.cities or {}) do if row.center.name == city.center.name then current = row break end end
+			for _, row in ipairs(sign_pick.cities or {}) do if row.key == city.key then current = row break end end
 			if not current then error('Список городов изменился. Повторите поиск.') end
-			return await_screen('rows', send(1, current.index))
+			local rows = await_screen('rows', send(1, current.index))
+			if sign_pick.city ~= city.key or #rows ~= current.total then
+				error('Получен неполный список знаков или список другого города. Повторите поиск.')
+			end
+			return rows
 		end
 		local ok, err = pcall(function()
 			for _, city in ipairs(queue) do
@@ -28043,12 +29629,12 @@ local function sign_pick_open_city()
 					-- Stop at the first city with work; do not inspect more distant cities.
 					sign_pick.scan = nil
 					if not to_lowercase(candidate.status):find('отсутствует', 1, true) then
-						sampAddChatMessage('[SH]{FFFFFF} Ближайший знак: ' .. city.center.name .. ', ' .. candidate.name .. ' (' .. candidate.distance .. ' м).', 0xFF5345)
+						sampAddChatMessage('[SH]{FFFFFF} Ближайший знак: ' .. city.zone.name .. ', ' .. candidate.name .. ' (' .. candidate.distance .. ' м).', 0xFF5345)
 					end
-					sign_pick_nearest()
+					sign_pick_nearest(candidate)
 					return
 				end
-				await_screen('cities', send(0, 0))
+				if city ~= queue[#queue] then await_screen('cities', send(0, 0)) end
 			end
 			sampAddChatMessage('[SH]{FFFFFF} Во всех городах нет отсутствующих знаков или знаков, требующих ремонта.', 0xFF5345)
 		end)
@@ -28060,6 +29646,7 @@ local function sign_pick_open_city()
 	end)
 end
 function hook.onShowDialog(id, style, title, but_1, but_2, text, payload)
+	sh_audit.last_server_dialog = {id = id, style = style}
 	if sh_license.pending and sh_license.dialog(id, style, title, text) == false then return false end
 	do
 		local ok, hide = pcall(function()
@@ -28085,6 +29672,7 @@ function hook.onShowDialog(id, style, title, but_1, but_2, text, payload)
 	end
 	if id == sign_pick.id and text == sign_pick.display_text then text = sign_pick.source_text end
 	sign_pick.id, sign_pick.rows, sign_pick.cities, sign_pick.action_row, sign_pick.indices = nil, nil, nil, nil, nil
+	sign_pick.rows_error, sign_pick.city = nil, nil
 	license_copy.id, license_copy.row = nil, nil
 	if sign_trace_active then
 		sign_trace_write('DIALOG', tostring(id) .. ' | ' .. tostring(title) .. ' | ' .. tostring(text))
@@ -28096,10 +29684,12 @@ function hook.onShowDialog(id, style, title, but_1, but_2, text, payload)
 		if (id == 27077 or plain_title == 'выберите город') and text:find('Установлено знаков', 1, true) then
 			sign_pick.cities = sign_pick_cities(text)
 		elseif (id == 27078 or plain_title:find('дорожные знаки', 1, true) == 1) and text:find('Название знака', 1, true) then
-			sign_pick.rows = sign_pick_rows(text)
+			sign_pick.rows, sign_pick.rows_error = sign_pick_rows(text)
+			local city = plain_title:match('%((.-)%)')
+			sign_pick.city = city and sign_city_key(city)
 		end
-		if sign_pick.rows or sign_pick.cities then sign_pick.serial = (sign_pick.serial or 0) + 1 end
-		if sign_pick.rows then
+		if sign_pick.rows or sign_pick.rows_error or sign_pick.cities then sign_pick.serial = (sign_pick.serial or 0) + 1 end
+		if sign_pick.rows or sign_pick.rows_error then
 			sign_pick.id = id
 		elseif sign_pick.cities then
 			local columns = sign_pick.cities and '\t \t ' or '\t \t \t '
@@ -28116,8 +29706,8 @@ function hook.onShowDialog(id, style, title, but_1, but_2, text, payload)
 						indices[#lines - 1] = source_row
 						lines[#lines + 1] = line
 					end
-					source_row = source_row + 1
 				end
+				source_row = source_row + 1
 			end
 			if not sign_pick.action_row then
 				sign_pick.action_row = #lines - 1
@@ -28232,14 +29822,6 @@ function hook.onShowDialog(id, style, title, but_1, but_2, text, payload)
 		end
 	end
 
-	if (id == 26950 or id == 26951) and setting.police_settings.auto_inves then
-		local extracted_text = text:match("{90EE90}([^%{]*)")
-		if extracted_text then
-			extracted_text = extracted_text:gsub("^%s+", ""):gsub("%s+$", "")
-			sampSendDialogResponse(id, 1, 0, extracted_text)
-		end
-		return false
-	end
 	if title == "{BFBBBA}Активные предложения" and setting.show_dialog_auto then
 		if text:find('Принять предложение') then
 			local idx = 0
@@ -28423,10 +30005,34 @@ function hook.onShowDialog(id, style, title, but_1, but_2, text, payload)
 		sampSendDialogResponse(26036, 0, 2, -1)
 		return false
 	end
-	if id == 3501 and num_give_gov > -1 then
-		sampSendDialogResponse(3501, 1, num_give_gov, nil)
-		num_give_gov = -1
-		return false
+	local gov = sh_gov_request
+	if gov then
+		local elapsed = getGameTimer() - gov.started
+		if elapsed < 0 or elapsed > 8000 then
+			sh_gov_request = nil
+		elseif (style == 2 or style == 4 or style == 5)
+			and title:gsub('{%x%x%x%x%x%x}', ''):match('^%s*Работа с%s+([^%s]+)%s*$') == gov.nick then
+			sh_gov_request = nil
+			local row = style == 5 and -1 or 0
+			local selected
+			for line in text:gmatch('[^\r\n]+') do
+				if row >= 0 then
+					local label = line:gsub('{%x%x%x%x%x%x}', '')
+					local matches = gov.service == 1 and label:find('Выдать визу', 1, true)
+						or gov.service == 2 and label:find('Перевести личный транспорт в сертификат', 1, true)
+						or gov.service == 0 and label:find('дату рождения', 1, true)
+					if matches then
+						if selected ~= nil then selected = nil; break end
+						selected = row
+					end
+				end
+				row = row + 1
+			end
+			if selected ~= nil then
+				sampSendDialogResponse(id, 1, selected, nil)
+				return false
+			end
+		end
 	end
 	
 	if title:find('Список происшествий') and setting.godeath.func then
@@ -28566,9 +30172,10 @@ function hook.onSendDialogResponse(id, button_id, list_id, input)
 	end
 	if id == sign_pick.id then
 		if button_id == 1 and list_id == sign_pick.action_row then
-			local cities = sign_pick.cities ~= nil
+			local cities, generation = sign_pick.cities ~= nil, sign_pick.serial
 			lua_thread.create(function()
 				wait(0)
+				if sign_pick.id ~= id or sign_pick.serial ~= generation then return end
 				if sign_trace_active then sign_trace_write('SIGN_ACTION', cities and 'cities' or 'signs') end
 				if cities then sign_pick_open_city() else sign_pick_nearest() end
 			end)
@@ -28662,9 +30269,11 @@ function hook.onSendCommand(cmd)
 	if sh_license.pending then
         local request=sh_license.pending
         local normalized=tostring(cmd):match('^/?(.-)%s*$')
-        if request.expected_command and '/'..normalized==request.expected_command then
-            request.expected_command=nil;sh_license.trace('own command accepted',request)
-        elseif not request.sending then sh_license.cancel('отправлена другая команда') end
+        if request.sending and '/' .. normalized == request.expected_command then
+            sh_license.trace('own command accepted', request)
+        else
+            sh_license.cancel('отправлена другая команда')
+        end
     end
 	if sh_sending_split then return end
 	local message_array = {}
@@ -28894,25 +30503,31 @@ function onWindowMessage(msg, wparam, lparam)
                 consumeWindowMessage(true, true, true)
                 return
             end
-            if msg==0x201 then
+            local left_press = msg == 0x201 or msg == 0x203
+            if left_press then
                 state.web_keyboard=page
                 state.web_surrogate=nil
+                if not page then state.last_web_press = nil end
             end
             if msg == 0x200 and captured then
                 sh_browser_input.drag_to(state, x, y)
-            elseif (msg == 0x202 and captured) or (page and msg ~= 0x203 and msg ~= 0x202) then
-                local action = msg == 0x201 and 'mousePressed' or msg == 0x202 and 'mouseReleased'
+            elseif (msg == 0x202 and captured) or (page and msg ~= 0x202) then
+                local action = left_press and 'mousePressed' or msg == 0x202 and 'mouseReleased'
                     or msg == 0x20A and 'mouseWheel' or 'mouseMoved'
                 local delta = bit.rshift(wparam, 16)
                 if delta >= 32768 then delta = delta - 65536 end
-                if msg == 0x201 then
+                local click_count
+                if left_press then
                     state.web_mouse_down = true
                     state.web_drag_x, state.web_drag_y = x, y
+                    sh_browser_input.web_press(state, x, y, msg == 0x203)
+                    click_count = state.web_click_count
                 elseif msg == 0x202 then
                     sh_browser_input.drag_to(state, x, y)
-                    state.web_mouse_down = false
+                    click_count = sh_browser_input.web_release(state)
                 end
-                sh_browser_manager.pointer(action, x - r.x, y - r.y - sh_browser_input.content_top(state), msg == 0x20A and -delta or 0, state.web_mouse_down == true)
+                sh_browser_manager.pointer(action, x - r.x, y - r.y - sh_browser_input.content_top(state),
+                    msg == 0x20A and -delta or 0, state.web_mouse_down == true, click_count)
             end
             if msg~=0x200 and (inside or (msg==0x202 and captured)) then consumeWindowMessage(true,false);return end
         end
@@ -28938,6 +30553,11 @@ function onWindowMessage(msg, wparam, lparam)
 	if dialog_act.status and dialog_act.enter and not sampIsChatInputActive() and not sampIsDialogActive() and wparam == vkeys.VK_RETURN and (msg == 0x100 or msg == 0x101) then
 		consumeWindowMessage(true, false)
 	end
+	if msg == 0x100 and wparam == 0x1B and windows.main[0] and tab == 'settings' and sh_settings_search.open then
+		sh_settings_search.open, sh_settings_search.focus = false, false
+		consumeWindowMessage(true, false)
+		return
+	end
 	if msg == 0x100 and wparam == 0x1B and not isPauseMenuActive() then
 		if off_scene or scene_active then
 			consumeWindowMessage(true, false)
@@ -28952,6 +30572,10 @@ function onWindowMessage(msg, wparam, lparam)
 				consumeWindowMessage(true, false)
 				smartSuState.anim.is_closing = true
 				smartSuState.anim.is_opening = false
+			end
+			if windows.smart_ticket[0] then
+				consumeWindowMessage(true, false)
+				tkui.close()
 			end
 			if windows.stroi[0] and not stroi.moving then
 				consumeWindowMessage(true, false)
@@ -29094,6 +30718,17 @@ ANIMATE = {
 }
 
 function time()
+	local afk_window = ffi.C.GetActiveWindow()
+	local afk_close_requested = false
+	local function close_game_window()
+		if afk_window == nil then return false end
+		local pid = ffi.new('unsigned long[1]')
+		ffi.C.GetWindowThreadProcessId(afk_window, pid)
+		if pid[0] ~= ffi.C.GetCurrentProcessId() then return false end
+		pcall(save)
+		return ffi.C.PostMessageA(afk_window, 0x0010, 0, 0) ~= 0 -- WM_CLOSE
+	end
+
 	local function get_weekday(year, month, day)
 		local weekday = tonumber(os.date('%w', os.time{year = year, month = month, day = day}))
 		if weekday == 0 then
@@ -29135,10 +30770,6 @@ function time()
 			save()
 		end
 
-		if search_for_new_version > 0 then
-			search_for_new_version = search_for_new_version - 1
-		end
-		
 		if wait_mb > 0 then
 			wait_mb = wait_mb - 1
 		end
@@ -29172,13 +30803,6 @@ function time()
 			anti_spam_gun[3] = anti_spam_gun[3] - 1
 		end
 		
-		if update_request > 0 then
-			if update_request == 1 then
-				error_update = true
-			end
-			update_request = update_request -1
-		end
-		
 		if update_scr_check > 0 then
 			update_scr_check = update_scr_check - 1
 		end
@@ -29191,6 +30815,10 @@ function time()
 			replace_not_flood[1] = replace_not_flood[1] - 1
 		end
 		
+		local active_window = ffi.C.GetActiveWindow()
+		if active_window ~= nil and not isGamePaused() and not isPauseMenuActive() then
+			afk_window = active_window
+		end
 		if isGamePaused() or isPauseMenuActive() then
 			if setting.kick_afk.func and setting.kick_afk.time_kick ~= '' and (tonumber(setting.kick_afk.time_kick) or 0) > 0 then
 				if not is_afk then
@@ -29206,10 +30834,13 @@ function time()
 							close_serv = true
 							track_time = false
 						end
-					else
-						shell32.ShellExecuteA(nil, "open", "mshta.exe", 'vbscript:CreateObject("WScript.Shell").Popup("StateHelper: Игра была закрыта из-за превышения лимита AFK.",0,"StateHelper",0)(window.close)', nil, 0)
-						wait(1000)
-						shell32.ShellExecuteA(nil, "open", "taskkill.exe", "/F /IM gta_sa.exe", nil, 0)
+					elseif not afk_close_requested then
+						afk_close_requested = true
+						if not close_game_window() then
+							print('[SH] AFK: could not close the game window; disconnecting instead.')
+							close_connect()
+							close_serv, track_time = true, false
+						end
 					end
 				end
 			end
@@ -29217,6 +30848,7 @@ function time()
 			if is_afk then
 				is_afk = false
 				afk_start_time = 0
+				afk_close_requested = false
 			end
 		end
 		
@@ -29267,9 +30899,6 @@ function time()
 			setting.stat.date_week = shift_table(setting.stat.date_week)
 			setting.stat.date_week[1] = os.date('%d.%m.%y')
 			setting.stat.today = os.date('%d.%m.%y')
-			for i = 1, #setting.reminder do
-				setting.reminder[i].last_triggered_day = nil
-			end
 			save()
 		end
 		
@@ -31611,212 +33240,129 @@ function time_hud_func_and_distance_point()
 end
 
 --> Проверка обновлений
-function update_check()
-	downloadUrlToFile(raw_upd_info_url, dir .. '/State Helper/update-beta-cache.json', function(id, status, p1, p2)
-		if status == dlstatus.STATUS_ENDDOWNLOADDATA then
-			lua_thread.create(function()
-				wait(2500)
-				if doesFileExist(dir .. '/State Helper/update-beta-cache.json') then
-					local f = io.open(dir .. '/State Helper/update-beta-cache.json', 'r')
-					if not f then return end
-					local ok_info, info = pcall(decodeJson, f:read('*a'))
-					f:close()
-					if not ok_info or type(info) ~= 'table' or type(info.version) ~= 'string'
-						or not info.version:match('^%d+%.%d+%.%d+$') then return end
-					if type(info.text) ~= 'string' or info.text == '' then info.text = u8'Описание обновления недоступно.' end
-					info.size = tonumber(info.size)
-					if info.size and (info.size <= 0 or info.size == math.huge) then info.size = nil end
-					update_info = info
-					
-					local function versionToNumber(version)
-						local a, b, c = tostring(version):match('(%d+)%.(%d+)%.?(%d*)')
-						return (tonumber(a) or 0) * 1000000 + (tonumber(b) or 0) * 1000 + (tonumber(c) or 0)
-					end
-
-					local new_version_scr = versionToNumber(update_info.version)
-					local current_version = versionToNumber(scr.version)
-					if new_version_scr > current_version then
-						new_version = update_info.version
-						if not setting.first_start then
-							if not setting.auto_update then
-								play_beep()
-								if not setting.cef_notif then
-									sampAddChatMessage('[SH] {FFFFFF}Доступно обновление. Подробнее в /sh --> Вкладка Главное --> Обновление.', 0xFF5345)
-								else
-									cefnotig('{FF5345}[SH] {FFFFFF}Доступно обновление. Подробнее в /sh --> Вкладка Главное --> Обновление.', 3000)
-								end
-							else
-								play_beep()
-								if not setting.cef_notif then
-									sampAddChatMessage('[SH] {FFFFFF}Доступно обновление. Установка новой версии...', 0xFF5345)
-								else
-									cefnotig('{FF5345}[SH] {FFFFFF}Доступно обновление. Установка новой версии...', 3000)
-								end
-								update_download()
-							end
-						end
-					end
-					if update_info.vehicle and localVehicleVersion then
-						local remote_veh_ver = versionToNumber(update_info.vehicle)
-						local local_veh_ver = versionToNumber(localVehicleVersion)
-						if remote_veh_ver > local_veh_ver then
-							if not setting.cef_notif then
-								sampAddChatMessage('[SH]{FFFFFF} Обнаружена новая версия vehicle.json. Обновляю...', 0xFF5345)
-							else
-								cefnotig('{FF5345}[SH]{FFFFFF} Обнаружена новая версия vehicle.json. Обновляю...', 3000)
-							end
-							checkVehicleData(true)
-						end
-					end
-				end
-			end)
-		end
-	end)
+function sh_update.compare(left, right)
+	local function parts(version)
+		if type(version) ~= 'string' then return end
+		local a, b, c = version:match('^(%d+)%.(%d+)%.(%d+)$')
+		if a and #a <= 9 and #b <= 9 and #c <= 9 then return {tonumber(a), tonumber(b), tonumber(c)} end
+	end
+	local a, b = parts(left), parts(right)
+	if not a or not b then return end
+	for i = 1, 3 do
+		if a[i] ~= b[i] then return a[i] > b[i] and 1 or -1 end
+	end
+	return 0
 end
---> Скачивание обновления
-local sh_update_pending = false
-function update_download()
- if sh_update_pending then return end
- sh_update_pending, updates = true, nil
- lua_thread.create(function()
-		wait(2000)
-		local this_file_path = thisScript().path
-		local new_file_path = this_file_path .. '.new'
-		os.remove(new_file_path)
-		downloadUrlToFile(raw_upd_url, new_file_path, function(id, status, p1, p2)
-			if status == dlstatus.STATUSEX_ENDDOWNLOAD then
-				if updates == nil then
-					sh_update_pending = false
-					print('{FF0000}Ошибка при попытке скачать файл.') 
-					play_beep()
-					sampAddChatMessage('[SH] Произошла неизвестная ошибка при скачивании обновления.', 0xFF5345)
-					lua_thread.create(function()
-						wait(500)
-						update_error()
-					end)
-				end
+
+function update_check()
+	if sh_update.check == 'checking' or sh_update.install == 'downloading' then return end
+	sh_update.check = 'checking'
+	sh_resource.fetch(raw_upd_info_url, dir .. '/State Helper/update-beta-cache.json', 256 * 1024, 15000,
+		function(_, data, _, reason)
+			sh_update.check = 'failed'
+			if not data then print('[SH Update] Manifest: ' .. tostring(reason)); return end
+			local ok, info = pcall(decodeJson, data)
+			local newer = ok and type(info) == 'table' and sh_update.compare(info.version, scr.version)
+			if type(newer) ~= 'number' then print('[SH Update] Invalid manifest version.'); return end
+			if type(info.text) ~= 'string' or info.text == '' then info.text = u8'Описание обновления недоступно.' end
+			info.size = tonumber(info.size)
+			if info.size and (info.size <= 0 or info.size == math.huge) then info.size = nil end
+			update_info = info
+			new_version = newer > 0 and info.version or '0'
+			sh_update.check = newer > 0 and 'available' or 'current'
+			if newer > 0 and not setting.first_start then
+				local message = setting.auto_update and 'Доступно обновление. Установка новой версии...'
+					or 'Доступно обновление. Подробнее в /sh --> Вкладка Главное --> Обновление.'
+				play_beep()
+				if setting.cef_notif then cefnotig('{FF5345}[SH] {FFFFFF}' .. message, 3000)
+				else sampAddChatMessage('[SH] {FFFFFF}' .. message, 0xFF5345) end
+				if setting.auto_update then update_download() end
 			end
-			if status == dlstatus.STATUS_DOWNLOAD_ERROR then
-                sh_update_pending = false
-            end
-            if status == dlstatus.STATUS_ENDDOWNLOADDATA then
-                local candidate = io.open(new_file_path, 'rb')
-                local source = candidate and candidate:read('*a')
-                if candidate then candidate:close() end
-                local chunk, compile_error
-                if source and source:byte(1) ~= 27 then chunk, compile_error = loadstring(source, '@' .. new_file_path) end
-                local expected = new_version or (update_info and update_info.version)
-                local version = source and source:match([=[script_version%s*%(%s*['"]([^'"]+)['"]]=])
-                local named = source and source:match([=[script_name%s*%(%s*['"]State Helper['"]]=])
-                if not chunk or not named or (expected and tostring(expected) ~= version) then
-                    sh_update_pending = false
-                    print('[SH Update] Rejected downloaded source: ' .. tostring(compile_error or 'unexpected script or version'))
-                    sampAddChatMessage('[SH] {FFFFFF}Скачанное обновление не прошло проверку. Текущий скрипт сохранён.', 0xFF5345)
-                    return
-                end
-                local previous = io.open(this_file_path, 'rb')
-                local old_source = previous and previous:read('*a')
-                if previous then previous:close() end
-                local backup = this_file_path .. '.pre-update-' .. os.time()
-                local suffix = 1
-                while doesFileExist(backup) do suffix = suffix + 1; backup = this_file_path .. '.pre-update-' .. os.time() .. '-' .. suffix end
-                if not old_source or not write_file(backup, old_source) then
-                    sh_update_pending = false
-                    sampAddChatMessage('[SH] {FFFFFF}Не удалось создать резервную копию. Обновление отменено.', 0xFF5345)
-                    return
-                end
-                if not replace_file(new_file_path, this_file_path) then
-                    sh_update_pending = false
-					sampAddChatMessage('[SH] {FFFFFF}Новая версия скачана, но заменить файл не удалось. Он сохранён рядом как StateHelper.lua.new', 0xFF5345)
-					return
-				end
-				updates = true
-				print('Загрузка завершена успешно.')
-				if not setting.first_start then
-					if not setting.cef_notif then
-						sampAddChatMessage('[SH] {FFFFFF}Новая версия загружена успешно! Перезагрузка скрипта...', 0xFF5345)
-					else
-						cefnotig('{FF5345}[SH] {FFFFFF}Новая версия загружена успешно! Перезагрузка скрипта...', 3000)
-					end
-				end
-				windows.main[0] = false
-				if setting.first_start then
-					setting.first_start = false
-					for i = 1, #cmd_defoult.all do
-						table.insert(cmd[1], cmd_defoult.all[i])
-					end
-					if setting.org <= 4 then --> Для Больниц
-						for i = 1, #cmd_defoult.hospital do
-							table.insert(cmd[1], cmd_defoult.hospital[i])
-						end
-						
-						if s_na == 'Phoenix' then 
-							for i = 1, #cmd[1] do
-								if cmd[1][i].cmd == 'mc' then
-									cmd[1][i] = mc_phoenix
-								end
-							end
-						end
-					elseif setting.org == 5 then --> Для ЦЛ
-						for i = 1, #cmd_defoult.driving_school do
-							table.insert(cmd[1], cmd_defoult.driving_school[i])
-						end
-					elseif setting.org == 6 then --> Для Права
-						for i = 1, #cmd_defoult.government do
-							table.insert(cmd[1], cmd_defoult.government[i])
-						end
-					elseif setting.org == 7 or setting.org == 8 then --> Для Армии
-						for i = 1, #cmd_defoult.army do
-							table.insert(cmd[1], cmd_defoult.army[i])
-						end
-						setting.gun_func = true
-					elseif setting.org == 9 then --> Для Пожарки
-						for i = 1, #cmd_defoult.fire_department do
-							table.insert(cmd[1], cmd_defoult.fire_department[i])
-						end
-					elseif setting.org == 10 then --> Для ТСР
-						for i = 1, #cmd_defoult.jail do
-							table.insert(cmd[1], cmd_defoult.jail[i])
-						end
-						setting.gun_func = true
-					--elseif setting.org == 11 then --> Для СМИ
-					--	for i = 1, #cmd_defoult.smi do
-					--		table.insert(cmd[1], cmd_defoult.smi[i])
-					--	end
-					elseif setting.org >= 11 and setting.org <= 15 then --> Для полиции
-						for i = 1, #cmd_defoult.police do
-							table.insert(cmd[1], cmd_defoult.police[i])
-						end
-						setting.gun_func = true
-					end
-					add_cmd_in_all_cmd()
-					save_cmd()
-					save()
-				end
-				showCursor(false)
-				reloadScripts()
-				showCursor(false)
+			local function vehicle_version(value)
+				local version = tostring(value)
+				if version:match('^%d+$') then return version .. '.0.0' end
+				if version:match('^%d+%.%d+$') then return version .. '.0' end
+				return version
+			end
+			if sh_update.compare(vehicle_version(info.vehicle), vehicle_version(localVehicleVersion)) == 1 then
+				local message = 'Обнаружена новая версия vehicle.json. Обновляю...'
+				if setting.cef_notif then cefnotig('{FF5345}[SH] {FFFFFF}' .. message, 3000)
+				else sampAddChatMessage('[SH] {FFFFFF}' .. message, 0xFF5345) end
+				checkVehicleData(true)
 			end
 		end)
-	end)
 end
-function update_error()
-	local erTx =
-[[
-{FFFFFF}Похоже, что-то мешает скачиванию обновлению.
-Это может быть как антивирус, так и анти-стиллер, который блокирует скачивание.
-Если у Вас отключен антивирус, отсутствует анти-стиллер, то видимо что-то другое
-блокирует скачивание. Поэтому нужно будет скачать файл отдельно.
 
-Пожалуйста, обратитесь к разработчику скрипта ВКонтакте.
-Страницу можно найти, перейдя по ссылке:
-{A1DF6B}vk.com/marseloy{FFFFFF}
-Скачайте lua файл и переместите с заменой в папку moonloader.
+function sh_update.failed(message, reason)
+	sh_update.install = 'failed'
+	print('[SH Update] ' .. tostring(reason or message))
+	sampAddChatMessage('[SH] {FFFFFF}' .. message, 0xFF5345)
+end
 
-Ссылка на страницу ВКонтакте уже скопирована автоматически.
-]]
-	sampShowDialog(2001, '{FF0000}Ошибка обновления', erTx, 'Закрыть', '', 0)
-	setClipboardText('vk.com/marseloy')
+function update_download()
+	if sh_update.install == 'downloading' or sh_update.install == 'installed' or sh_update.check ~= 'available' then return end
+	local manifest = update_info
+	local this_file_path = thisScript().path
+	local url = raw_upd_url
+	if manifest.artifact_commit ~= nil then
+		local commit = manifest.artifact_commit
+		if type(commit) ~= 'string' or #commit ~= 40 or not commit:match('^%x+$') then
+			sh_update.failed('Манифест обновления содержит неверный адрес файла.')
+			return
+		end
+		url = raw_upd_url:gsub('/beta/', '/' .. commit .. '/', 1)
+	end
+	sh_update.install = 'downloading'
+	sh_resource.fetch(url, this_file_path .. '.new', 8 * 1024 * 1024, 90000,
+		function(_, source, staged, reason)
+			sh_update.install = 'failed'
+			if not source then
+				sh_update.failed('Не удалось скачать обновление. Повторите установку.', reason)
+				return
+			end
+			local chunk, compile_error
+			if source:byte(1) ~= 27 then chunk, compile_error = loadstring(source, '@' .. this_file_path) end
+			local version = source:match([=[script_version%s*%(%s*['"]([^'"]+)['"]]=])
+			local named = source:match([=[script_name%s*%(%s*['"]State Helper['"]]=])
+			local integrity_ok = true
+			if manifest.size_bytes ~= nil and tonumber(manifest.size_bytes) ~= #source then integrity_ok = false end
+			if manifest.sha256 ~= nil then
+				local digest = type(manifest.sha256) == 'string' and manifest.sha256:lower()
+				local ok, verified = pcall(sh_resource.verify_sha256, source, #source, digest)
+				integrity_ok = integrity_ok and ok and verified
+			end
+			if not chunk or not named or manifest.version ~= version or not integrity_ok then
+				sh_update.failed('Обновление не прошло проверку. Текущий скрипт сохранён.', compile_error)
+				return
+			end
+			local previous = io.open(this_file_path, 'rb')
+			local old_source = previous and previous:read('*a')
+			if previous then previous:close() end
+			local prefix = this_file_path .. '.pre-update-' .. os.time()
+			local backup, suffix = prefix, 1
+			while doesFileExist(backup) do
+				suffix = suffix + 1
+				backup = prefix .. '-' .. suffix
+			end
+			if not old_source or not write_file(backup, old_source) then
+				sh_update.failed('Не удалось создать резервную копию. Обновление отменено.')
+				return
+			end
+			if not replace_file(staged, this_file_path) then
+				sh_update.failed('Не удалось заменить файл скрипта. Повторите установку.')
+				return
+			end
+			sh_update.install = 'installed'
+			if not setting.first_start then
+				local message = 'Новая версия загружена успешно! Перезагрузка скрипта...'
+				if setting.cef_notif then cefnotig('{FF5345}[SH] {FFFFFF}' .. message, 3000)
+				else sampAddChatMessage('[SH] {FFFFFF}' .. message, 0xFF5345) end
+			end
+		windows.main[0] = false
+		if setting.first_start then sh_audit.complete_setup(false) end
+		showCursor(false)
+		scr:reload()
+		end)
 end
 function apply_settings(name_file, description_file, array_arg)
  local path = dir .. '/State Helper/' .. name_file
@@ -34042,7 +35588,7 @@ local cmd_defoult_json_for_hospital = {
       "Всем спасибо за внимание."
     ]
   ],
-  "desc": "Лекция: Правила пользов. рацией",
+  "desc": "Правила пользов. рацией",
   "var": {},
   "delay": 2.5,
   "send_end_mes": true,
@@ -34121,7 +35667,7 @@ local cmd_defoult_json_for_hospital = {
       "смоченную нашатырным спиртом."
     ]
   ],
-  "desc": "Лекция: ПМП при обмороке",
+  "desc": "ПМП при обмороке",
   "var": {},
   "delay": 2.5,
   "send_end_mes": true,
@@ -34180,7 +35726,7 @@ local cmd_defoult_json_for_hospital = {
       "На этом у меня всё, благодарю за внимание и, надеюсь, за понимание."
     ]
   ],
-  "desc": "Лекция: Прав. общ. с гражданами",
+  "desc": "Прав. общ. с гражданами",
   "var": {},
   "delay": 2.5,
   "send_end_mes": true,
@@ -34243,7 +35789,7 @@ local cmd_defoult_json_for_hospital = {
       "На этом лекция закончена."
     ]
   ],
-  "desc": "Лекция: ОПП при ожогах",
+  "desc": "ОПП при ожогах",
   "var": {},
   "delay": 2.5,
   "send_end_mes": true,
@@ -34318,7 +35864,7 @@ local cmd_defoult_json_for_hospital = {
       "На этом лекция закончена."
     ]
   ],
-  "desc": "Лекция: ОПП при утоплении",
+  "desc": "ОПП при утоплении",
   "var": {},
   "delay": 2.5,
   "send_end_mes": true,
@@ -34514,6 +36060,7 @@ local cmd_defoult_json_for_driving_school = {
   ],
   "delay": 2.5,
   "id_element": 16,
+  "auto_license_template": true,
   "cmd": "licauto",
   "key": [
     "",
@@ -35915,7 +37462,7 @@ local cmd_defoult_json_for_driving_school = {
       "Спасибо за прослушивание лекции."
     ]
   ],
-  "desc": "Лекция: Служебный транспорт",
+  "desc": "Служебный транспорт",
   "arg": {},
   "delay": 2.5,
   "var": {},
@@ -35978,7 +37525,7 @@ local cmd_defoult_json_for_driving_school = {
       "Лекция окончена, благодарю за внимание."
     ]
   ],
-  "desc": "Лекция: Субординация",
+  "desc": "Субординация",
   "arg": {},
   "delay": 2.5,
   "var": {},
@@ -36085,7 +37632,7 @@ local cmd_defoult_json_for_driving_school = {
       "Лекция окончена, всех благодарю за уделённое внимание."
     ]
   ],
-  "desc": "Лекция: ПДД",
+  "desc": "ПДД",
   "arg": {},
   "delay": 2.5,
   "var": {},
@@ -36148,7 +37695,7 @@ local cmd_defoult_json_for_driving_school = {
       "Лекция окончена, спасибо за внимание."
     ]
   ],
-  "desc": "Лекция: Запреты в рацию",
+  "desc": "Запреты в рацию",
   "arg": {},
   "delay": 2.5,
   "var": {},
@@ -36203,7 +37750,7 @@ local cmd_defoult_json_for_driving_school = {
       "На этом у меня всё, спасибо за внимание."
     ]
   ],
-  "desc": "Лекция: Основные правила",
+  "desc": "Основные правила",
   "arg": {},
   "delay": 2.5,
   "var": {},
@@ -36358,6 +37905,35 @@ local cmd_defoult_json_for_driving_school = {
   "newbie_license_template": true
 }
 ]],
+[22] = [[
+{
+  "folder": 4,
+  "var": [],
+  "rank": 1,
+  "act": [
+    [
+      "SEND",
+      "/givelicense {arg1}"
+    ]
+  ],
+  "desc": "Открыть меню выдачи лицензий",
+  "arg": [
+    {
+      "desc": "ID игрока",
+      "name": "arg1",
+      "type": 2
+    }
+  ],
+  "delay": 0,
+  "id_element": 1,
+  "cmd": "givelic",
+  "key": [
+    "",
+    []
+  ],
+  "send_end_mes": true
+}
+]],
 }
 
 --> Отыгровки для сотрудников Правительства
@@ -36394,11 +37970,11 @@ local cmd_defoult_json_for_government = {
   "act": [
     [
       "SEND",
-      "/do Бланк для замены информации в паспорте находится под столом."
+      "/do Бланк для замены информации в паспорте находится в сумке."
     ],
     [
       "SEND",
-      "/me засунув руку под стол, взял{sex[][а]} бланк, после чего протянул{sex[][а]} его человеку напротив"
+      "/me достал{sex[][а]} из сумки бланк и ручку, затем протянул{sex[][а]} их человеку напротив"
     ],
     [
       "SEND",
@@ -36442,11 +38018,11 @@ local cmd_defoult_json_for_government = {
     ],
     [
       "SEND",
-      "/do Бланк для оформления визы находится под столом."
+      "/do Бланк для оформления визы находится в сумке."
     ],
     [
       "SEND",
-      "/me засунув руку под стол, взял{sex[][а]} бланк, после чего протянул{sex[][а]} его человеку напротив"
+      "/me достал{sex[][а]} из сумки бланк и ручку, затем протянул{sex[][а]} их человеку напротив"
     ],
     [
       "SEND",
@@ -36483,11 +38059,11 @@ local cmd_defoult_json_for_government = {
   "act": [
     [
       "SEND",
-      "/do Бланк для получения сертификата находится под столом."
+      "/do Бланк для получения сертификата находится в сумке."
     ],
     [
       "SEND",
-      "/me засунув руку под стол, взял{sex[][а]} бланк, после чего протянул{sex[][а]} его человеку напротив"
+      "/me достал{sex[][а]} из сумки бланк и ручку, затем протянул{sex[][а]} их человеку напротив"
     ],
     [
       "SEND",
@@ -36611,11 +38187,11 @@ local cmd_defoult_json_for_government = {
   "act": [
     [
       "SEND",
-      "/do Бланк для выдачи лицензии находится под столом."
+      "/do Бланк для выдачи лицензии находится в сумке."
     ],
     [
       "SEND",
-      "/me засунув руку под стол, взял{sex[][а]} бланк, после чего заполнил{sex[][а]} его нужной информацией"
+      "/me достал{sex[][а]} из сумки бланк и ручку, затем заполнил{sex[][а]} необходимые поля"
     ],
     [
       "SEND",
@@ -36848,7 +38424,7 @@ local cmd_defoult_json_for_government = {
       "Спасибо за внимание."
     ]
   ],
-  "desc": "Лекция: Отъезд по личным делам",
+  "desc": "Отъезд по личным делам",
   "id_element": 7,
   "delay": 2.5,
   "send_end_mes": true,
@@ -36899,7 +38475,7 @@ local cmd_defoult_json_for_government = {
       "Спасибо за внимание, лекция окончена."
     ]
   ],
-  "desc": "Лекция: Субординация",
+  "desc": "Субординация",
   "id_element": 8,
   "delay": 2.5,
   "send_end_mes": true,
@@ -36938,7 +38514,7 @@ local cmd_defoult_json_for_government = {
       "Запомните: Не знание Устава не освобождает вас от ответственности."
     ]
   ],
-  "desc": "Лекция: Знание Устава",
+  "desc": "Знание Устава",
   "id_element": 5,
   "delay": 2.5,
   "send_end_mes": true,
@@ -36997,7 +38573,7 @@ local cmd_defoult_json_for_government = {
       "Спасибо за прослушивание лекции. Все свободны."
     ]
   ],
-  "desc": "Лекция: О служебном Т/С",
+  "desc": "О служебном Т/С",
   "id_element": 10,
   "delay": 2.5,
   "send_end_mes": true,
@@ -37060,7 +38636,7 @@ local cmd_defoult_json_for_government = {
       "Надеюсь, вы все усвоили, спасибо за прослушивание лекции."
     ]
   ],
-  "desc": "Лекция: О применении оружия",
+  "desc": "О применении оружия",
   "id_element": 11,
   "delay": 2.5,
   "send_end_mes": true,
@@ -37111,7 +38687,7 @@ local cmd_defoult_json_for_government = {
       "На этом лекция окончена."
     ]
   ],
-  "desc": "Лекция: Дресс-Код",
+  "desc": "Дресс-Код",
   "id_element": 8,
   "delay": 2.5,
   "send_end_mes": true,
@@ -37121,6 +38697,47 @@ local cmd_defoult_json_for_government = {
     []
   ],
   "arg": {}
+}
+]],
+[17] = [[
+{
+  "folder": 4,
+  "rank": 2,
+  "id_element": 4,
+  "delay": 2.0,
+  "send_end_mes": true,
+  "cmd": "social",
+  "desc": "Выдать социальную карту",
+  "key": [
+    "",
+    []
+  ],
+  "var": [],
+  "arg": [
+    {
+      "desc": "id игрока",
+      "name": "arg1",
+      "type": 2
+    }
+  ],
+  "act": [
+    [
+      "SEND",
+      "/do Бланк социальной карты и ручка находятся в сумке."
+    ],
+    [
+      "SEND",
+      "/me достал{sex[][а]} из сумки бланк и ручку, затем заполнил{sex[][а]} бланк"
+    ],
+    [
+      "SEND",
+      "/me передал{sex[][а]} оформленную социальную карту человеку напротив"
+    ],
+    [
+      "SEND",
+      "/givesocial {arg1}"
+    ]
+  ]
 }
 ]]
 }
@@ -37239,7 +38856,7 @@ local cmd_defoult_json_for_army = {
       "Ну, а на этом лекция на тему \"Субординация\" окончена."
     ]
   ],
-  "desc": "Лекция: Субординация",
+  "desc": "Субординация",
   "var": {},
   "delay": 2.5,
   "send_end_mes": true,
@@ -37294,7 +38911,7 @@ local cmd_defoult_json_for_army = {
       "Лекция на тему \"Построение\" окончена. Спасибо за внимание"
     ]
   ],
-  "desc": "Лекция: Построение",
+  "desc": "Построение",
   "var": {},
   "delay": 2.5,
   "send_end_mes": true,
@@ -37361,7 +38978,7 @@ local cmd_defoult_json_for_army = {
       "Лекция на тему \"Строевая подготовка\" окончена!"
     ]
   ],
-  "desc": "Лекция: Строевая подготовка",
+  "desc": "Строевая подготовка",
   "var": {},
   "delay": 2.5,
   "send_end_mes": true,
@@ -37440,7 +39057,7 @@ local cmd_defoult_json_for_army = {
       "Лекция на тему \"Поведение и общение с гражданскими на КПП\" окончена!"
     ]
   ],
-  "desc": "Лекция: Поведение на КПП",
+  "desc": "Поведение на КПП",
   "var": {},
   "delay": 2.5,
   "send_end_mes": true,
@@ -37511,7 +39128,7 @@ local cmd_defoult_json_for_army = {
       "Лекция на тему \"Правила поведения на тренировке\" окончена. "
     ]
   ],
-  "desc": "Лекция: Правила на тренировке",
+  "desc": "Правила на тренировке",
   "var": {},
   "delay": 2.5,
   "send_end_mes": true,
@@ -37626,7 +39243,7 @@ local cmd_defoult_json_for_fire_department = {
       "На этом наша лекция подошла к концу, всем спасибо за внимание."
     ]
   ],
-  "desc": "Лекция: Огнетушители",
+  "desc": "Огнетушители",
   "arg": {},
   "delay": 2.5,
   "var": {},
@@ -37709,7 +39326,7 @@ local cmd_defoult_json_for_fire_department = {
       "На этом наша лекция подошла к концу, всем спасибо за внимание."
     ]
   ],
-  "desc": "Лекция: Сигнализация",
+  "desc": "Сигнализация",
   "arg": {},
   "delay": 2.5,
   "var": {},
@@ -37760,7 +39377,7 @@ local cmd_defoult_json_for_fire_department = {
       "На этом наша лекция подошла к концу, всем спасибо за внимание."
     ]
   ],
-  "desc": "Лекция: Субординация",
+  "desc": "Субординация",
   "arg": {},
   "delay": 2.5,
   "var": {},
@@ -37827,7 +39444,7 @@ local cmd_defoult_json_for_fire_department = {
       "На этом наша лекция подошла к концу, всем спасибо за внимание."
     ]
   ],
-  "desc": "Лекция: Правила рации",
+  "desc": "Правила рации",
   "arg": {},
   "delay": 2.5,
   "var": {},
@@ -37898,7 +39515,7 @@ local cmd_defoult_json_for_fire_department = {
       "На этом наша лекция подошла к концу, всем спасибо за внимание."
     ]
   ],
-  "desc": "Лекция: Искуственное дыхание",
+  "desc": "Искуственное дыхание",
   "arg": {},
   "delay": 2.5,
   "var": {},
@@ -37934,7 +39551,7 @@ local cmd_defoult_json_for_jail = {
       "/rjail За нарушений порядка вы можете получить наказание."
     ]
   ],
-  "desc": "Лекция для заключённых: Напоминание соблюдение правил",
+  "desc": "Напоминание соблюдение правил",
   "id_element": 3,
   "delay": 2.5,
   "send_end_mes": true,
@@ -37981,7 +39598,7 @@ local cmd_defoult_json_for_jail = {
       "/rjail Хорошего время провождения. "
     ]
   ],
-  "desc": "Лекция для заключённых: Дисциплина",
+  "desc": "Дисциплина",
   "id_element": 7,
   "delay": 2.5,
   "send_end_mes": true,
@@ -38028,7 +39645,7 @@ local cmd_defoult_json_for_jail = {
       "/rjail Приятного отдыха!"
     ]
   ],
-  "desc": "Лекция для заключённых: Свидания заключенных",
+  "desc": "Свидания заключенных",
   "id_element": 7,
   "delay": 2.5,
   "send_end_mes": true,
@@ -38079,7 +39696,7 @@ local cmd_defoult_json_for_jail = {
       "Лекция на тему \"Построение окончена\". Спасибо за внимание"
     ]
   ],
-  "desc": "Лекция: Построение",
+  "desc": "Построение",
   "var": {},
   "delay": 2.5,
   "send_end_mes": true,
@@ -38122,7 +39739,7 @@ local cmd_defoult_json_for_jail = {
       "На этом наша лекция подошла к концу."
     ]
   ],
-  "desc": "Лекция: Субординация",
+  "desc": "Субординация",
   "var": {},
   "delay": 2.5,
   "send_end_mes": true,
@@ -38173,7 +39790,7 @@ local cmd_defoult_json_for_jail = {
       "На этом лекция заканчивается. Спасибо за внимание!"
     ]
   ],
-  "desc": "Лекция: Правила нахождение в строю",
+  "desc": "Правила нахождение в строю",
   "var": {},
   "delay": 2.5,
   "send_end_mes": true,
@@ -38228,7 +39845,7 @@ local cmd_defoult_json_for_jail = {
       "Лекция на тему \"Как правильно действовать при ЧС\" окончена"
     ]
   ],
-  "desc": "Лекция: Правила действий при ЧС",
+  "desc": "Правила действий при ЧС",
   "var": {},
   "delay": 2.5,
   "send_end_mes": true,
@@ -38295,7 +39912,7 @@ local cmd_defoult_json_for_jail = {
       "Лекция на тему \"Основы поставок боеприпасов\" окончена"
     ]
   ],
-  "desc": "Лекция: Основы поставок боеприпасов",
+  "desc": "Основы поставок боеприпасов",
   "var": {},
   "delay": 2.5,
   "send_end_mes": true,
@@ -41295,6 +42912,7 @@ end
  
 function onScriptTerminate(script, game_quit)
 	if script ~= thisScript() then return end
+	music_stream_shutdown()
 	sh_browser_close()
 	if game_quit then return end  -- нормальный выход / перезагрузка игры
 	pcall(save)
@@ -41719,68 +43337,56 @@ function copy_license_policy()
 	sampAddChatMessage('[SH]{FFFFFF} Цены всех 12 лицензий обновлены.', 0x23E64A)
 end
 
-function download_wanted_reasons()
-	if s_na == '' then return end
-	local url = 'https://raw.githubusercontent.com/kysteno4ek/StateHelper/main/data/AutoSu/' .. s_na .. '.json'
-	local auto_su_dir = dir .. '/State Helper/Police/AutoSu/'
-	if not doesDirectoryExist(auto_su_dir) then
-		createDirectory(auto_su_dir)
+function sh_audit.decode_police_db(data)
+	if type(data) ~= 'string' then return end
+	data = data:gsub('^\239\187\191', '')
+	local ok, chapters = pcall(json.decode, data)
+	if not ok or type(chapters) ~= 'table' or #chapters == 0 then return end
+	for _, chapter in ipairs(chapters) do
+		if type(chapter) ~= 'table' or type(chapter.chapter) ~= 'table' then return end
 	end
-	local file_path = auto_su_dir .. s_na .. '.json' 
-	if not doesFileExist(file_path) then
-		sh_resource.download(url, file_path, function(id, status)
-			if status == dlstatus.STATUS_ENDDOWNLOADDATA then
-			--	sampAddChatMessage('[SH]{FFFFFF} ', 0x23E64A)
-			elseif status == dlstatus.STATUS_DOWNLOAD_ERROR then
-				if not setting.cef_notif then
-					sampAddChatMessage('[SH]{FFFFFF} Не удалось скачать файл с розыском для вашего сервера.', 0xFF5345)
-				else
-					cefnotig("{FF5345}[SH]{FFFFFF} Не удалось скачать файл с розыском для вашего сервера.", 2000)
-				end
-			end
-		end)
-	end
+	return chapters
 end
---[[
+
+function sh_audit.read_police_db(path)
+	local file = io.open(path, 'rb')
+	if not file then return end
+	local data = file:read(2 * 1024 * 1024 + 1)
+	file:close()
+	if data and #data <= 2 * 1024 * 1024 then return sh_audit.decode_police_db(data) end
+end
+
+function sh_audit.download_police_db(kind, label)
+	if not s_na or not s_na:match('^%a+$') then
+		suui.notify('Не удалось определить сервер для загрузки базы ' .. label .. '.')
+		return
+	end
+	local root = dir .. '/State Helper/Police/'
+	local folder = root .. kind .. '/'
+	if not doesDirectoryExist(root) then createDirectory(root) end
+	if not doesDirectoryExist(folder) then createDirectory(folder) end
+	local path = folder .. s_na .. '.json'
+	sh_audit.police_downloads = sh_audit.police_downloads or {}
+	if sh_audit.police_downloads[path] or sh_audit.read_police_db(path) then return end
+	sh_audit.police_downloads[path] = true
+	local url = 'https://raw.githubusercontent.com/kysteno4ek/StateHelper/beta/data/' .. kind .. '/' .. s_na .. '.json'
+	sh_resource.download(url, path, function(_, status)
+		if status == dlstatus.STATUS_ENDDOWNLOADDATA or status == dlstatus.STATUS_DOWNLOAD_ERROR then
+			sh_audit.police_downloads[path] = nil
+		end
+		if status == dlstatus.STATUS_DOWNLOAD_ERROR then
+			suui.notify('Не удалось загрузить базу ' .. label .. ' для этого сервера.')
+		end
+	end, function(data) return sh_audit.decode_police_db(data) ~= nil end)
+end
+
+function download_wanted_reasons()
+	sh_audit.download_police_db('AutoSu', 'УК')
+end
+
 function download_ticket_reasons()
-	if s_na == '' then return end
-	local url = 'https://raw.githubusercontent.com/wears22080/StateHelper/refs/heads/main/StateHelper%203.0/cops/AutoTicket/' .. s_na .. '.json'
-	local auto_ticket_dir = dir .. '/State Helper/Police/AutoTicket/'
-	if not doesDirectoryExist(auto_ticket_dir) then
-		createDirectory(auto_ticket_dir)
-	end
-	local file_path = auto_ticket_dir .. s_na .. '.json'
-	if not doesFileExist(file_path) then
-		downloadUrlToFile(url, file_path, function(id, status)
-			if status == dlstatus.STATUS_ENDDOWNLOADDATA then
-				-- 976+
-			elseif status == dlstatus.STATUS_DOWNLOAD_ERROR then
-				if not setting.cef_notif then
-					sampAddChatMessage('[SH]{FFFFFF} Не удалось скачать файл с штрафами для вашего сервера.', 0xFF5345)
-				else
-					cefnotig('{FF5345}[SH]{FFFFFF} Не удалось скачать файл с штрафами для вашего сервера.', 2000)
-				end
-			end
-		end)
-	end
-end]]
---[[
-function send_ticket_commands(id, amount, code)
-	local commands_to_send = {}
-	local use_writeticket = true
-	local penaltyValue = tonumber(amount) or 0
-	if setting.police_settings.smart_ticket_trade and penaltyValue > 500000 then
-		use_writeticket = false
-	end
-	if use_writeticket then
-		table.insert(commands_to_send, string.format('/writeticket %d %d %s', id, penaltyValue, u1251:iconv(code)))
-	end
-	--> отыгровка
-	table.insert(commands_to_send, '/me ')
-	table.insert(commands_to_send, '/me ')
-	
-	send_smart_su_commands(commands_to_send)
-end]]
+	sh_audit.download_police_db('AutoTicket', 'АК')
+end
 
 function parsePenaltyRangeOrTake(penaltyStr)
 	local result = { type = 'unknown' }
@@ -42018,37 +43624,10 @@ function smart_su_func(arg)
 		return
 	end
 	smartSuState.reasons = {}
-	local auto_su_dir = dir .. '/State Helper/Police/AutoSu/'
-	if not doesDirectoryExist(auto_su_dir) then
-		createDirectory(auto_su_dir)
-	end
-	local file_path = auto_su_dir .. s_na .. '.json'
-	if doesFileExist(file_path) then
-		local file = io.open(file_path, 'r')
-		if file then
-			local data = file:read('*a')
-			file:close()
-			local success, decoded_data = pcall(decodeJson, data)
-			if success and type(decoded_data) == 'table' then
-				smartSuState.reasons = decoded_data
-			else
-				if not setting.cef_notif then
-					sampAddChatMessage('[SH]{FFFFFF} Ошибка чтения файла ' .. s_na .. '.json. Файл может быть поврежден.', 0xFF5345)
-				else
-					cefnotig('{FF5345}[SH]{FFFFFF} Ошибка чтения файла ' .. s_na .. '.json. Файл может быть поврежден.', 2000)
-				end
-				smartSuState.reasons = {}
-			end
-		end
-	else
-		if not setting.cef_notif then
-			sampAddChatMessage('[SH]{FFFFFF} Файл розыска ' .. s_na .. '.json не найден. Скачивание...', 0xFF5345)
-		else
-			cefnotig('{FF5345}[SH]{FFFFFF} Файл розыска ' .. s_na .. '.json не найден. Скачивание...', 2000)
-		end
-		download_wanted_reasons()
-		smartSuState.reasons = {}
-	end
+	local file_path = dir .. '/State Helper/Police/AutoSu/' .. s_na .. '.json'
+	local reasons = sh_audit.read_police_db(file_path)
+	smartSuState.reasons = reasons or {}
+	if not reasons then download_wanted_reasons() end
 	smartSuState.targetId[0] = id
 	smartSuState.selected = {}
 	smartSuState.totalStars = 0
@@ -42061,56 +43640,31 @@ function smart_su_func(arg)
 	smartSuState.anim.is_opening = true
 	smartSuState.anim.is_closing = false
 end
---[[
 function smart_ticket_func(arg)
-	local id = tonumber(arg)
-	if id == nil or not sampIsPlayerConnected(id) then
-		if not setting.cef_notif then
-			sampAddChatMessage('[SH]{FFFFFF} Используйте {a8a8a8}/ticket [id игрока]', 0xFF5345)
-		else
-			cefnotig('{FF5345}[SH]{FFFFFF} Используйте {a8a8a8}/ticket [id игрока]', 2000)
-		end
+	if not setting.police_settings.smart_ticket or setting.org < 11 or setting.org > 15 then return end
+	local id = tonumber((arg or ''):match('^%s*(%d+)%s*$'))
+	if not id or id > 1003 or not sampIsPlayerConnected(id) then
+		suui.notify('Используйте {a8a8a8}/ticket [id игрока]')
 		return
 	end
-	local auto_ticket_dir = dir .. '/State Helper/Police/AutoTicket/'
-	if not doesDirectoryExist(auto_ticket_dir) then
-		createDirectory(auto_ticket_dir)
-	end
-	local file_path = auto_ticket_dir .. s_na .. '.json'
-	if doesFileExist(file_path) then
-		local file = io.open(file_path, 'r')
-		if file then
-			local data = file:read('*a')
-			file:close()
-			local success, decoded_data = pcall(decodeJson, data)
-			if success then
-				smartTicketState.reasons = decoded_data
-			else
-				if not setting.cef_notif then
-					sampAddChatMessage('[SH]{FFFFFF} Ошибка чтения файла штрафов ' .. s_na .. '.json. Файл может быть поврежден.', 0xFF5345)
-				else
-					cefnotig('{FF5345}[SH]{FFFFFF} Ошибка чтения файла штрафов ' .. s_na .. '.json. Файл может быть поврежден.', 2000)
-				end
-				smartTicketState.reasons = {}
-			end
-		end
-	else 
-		if not setting.cef_notif then
-			sampAddChatMessage('[SH]{FFFFFF} Файл штрафов ' .. s_na .. '.json не найден. Скачивание...', 0xFF5345)
-		else
-			cefnotig('{FF5345}[SH]{FFFFFF} Файл штрафов ' .. s_na .. '.json не найден. Скачивание...', 3000)
-		end
-		download_ticket_reasons()
-		smartTicketState.reasons = {}
-	end
-	smartTicketState.targetId[0] = id
-	smartTicketState.searchQuery = ''
-	smartTicketState.chapterStates = {}
+	local st = smartTicketState
+	st.reasons = {}
+	local file_path = dir .. '/State Helper/Police/AutoTicket/' .. s_na .. '.json'
+	local reasons = sh_audit.read_police_db(file_path)
+	st.reasons = reasons or {}
+	if not reasons then download_ticket_reasons() end
+	st.targetId[0] = id
+	st.targetNick = sampGetPlayerNickname(id)
+	st.targetServer = table.concat({sampGetCurrentServerAddress()}, ':')
+	st.selected = {}
+	st.totalMoney = 0
+	st.searchQuery = ''
+	st.chapterStates = {}
+	tkui.reset()
 	windows.smart_ticket[0] = true
-	smartTicketState.anim.is_opening = true
-	smartTicketState.anim.is_closing = false
+	st.anim.is_opening = true
+	st.anim.is_closing = false
 end
-]]
 function changeWantedPosition()
 	if setting.police_settings.wanted_list.func then
 		pos_new_wanted = lua_thread.create(function()
