@@ -1126,7 +1126,6 @@ setting = {
 	browser_cookies = 'ask',
 	auto_update = false,
 	name_rus = '',
-	share_usage_nickname = false,
 	sex = 1,
 	org = 5,
 	job_title = u8'Не определено',
@@ -6559,7 +6558,7 @@ function sh_usage_start()
 
 	local function send_usage(endpoint, data, finish)
 		local headers = {['Content-Type'] = 'text/plain'}
-		if setting.share_usage_nickname == true and not setting.first_start and endpoint ~= 'register' then
+		if not setting.first_start and (endpoint == 'launch' or endpoint == 'heartbeat') then
 			local nickname = type(setting.name_rus) == 'string' and setting.name_rus:match('^%s*(.-)%s*$')
 			if nickname and #nickname > 0 and #nickname <= 60 and not nickname:find('[%z%c]') then
 				headers['X-StateHelper-Nickname'] = nickname:gsub('[^A-Za-z0-9_.~-]', function(char)
@@ -9222,15 +9221,6 @@ function hall.settings()
 			local calc_jt = imgui.CalcTextSize(setting.job_title .. ' [' .. setting.rank ..']')
 			gui.Text(587 - calc_jt.x, 225, u8:decode(setting.job_title .. ' [' .. setting.rank ..']'), font[3])
 		end
-		new_draw(270, 62)
-		gui.Text(26, 279, 'Передавать ник на сайт StateHelper', font[3])
-		imgui.SetCursorPos(imgui.ImVec2(561, 275))
-		if gui.Switch('##ShareUsageNickname', setting.share_usage_nickname == true) then
-			local previous = setting.share_usage_nickname
-			setting.share_usage_nickname = not previous
-			if not save() then setting.share_usage_nickname = previous end
-		end
-		gui.TextInfo({26, 300}, {'Ник из личной информации передаётся вместе со статистикой, если она включена.'})
 	elseif tab_settings == 2 then
 		gui.Text(25, 12, 'Получаемые сообщения', bold_font[1])
 		new_draw(37, 108)
