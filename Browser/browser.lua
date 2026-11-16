@@ -26,7 +26,9 @@ return function(env)
   local temporary=path(name)..'.lua.tmp';local file=io.open(temporary,'wb');if not file then return false end
   local written=file:write(body);local closed=file:close()
   if not written or not closed then os.remove(temporary);return false end
-  return kernel.MoveFileExA(temporary,path(name),9)~=0
+  if kernel.MoveFileExA(temporary,path(name),9)~=0 then return true end
+  os.remove(temporary)
+  return false
  end
  local function exists(name)local file=io.open(path(name),'rb');if not file then return false end;file:close();return true end
  local function deps()return exists('ready.json') and exists('Microsoft.Web.WebView2.Core.dll') and exists('Microsoft.Web.WebView2.WinForms.dll') and exists('WebView2Loader.dll') end
@@ -52,16 +54,22 @@ return function(env)
   if not authority or authority:find('@',1,true) or authority:find('[\\<>"\']') then return nil end
   return value
  end
- state.sites={{name=u8'Форум Arizona',url='https://forum.arizona-rp.com/',kind='forum'},{name='YouTube',url='https://www.youtube.com/',kind='youtube'}}
- local stored=read('sites.json')
- if stored and stored.version==1 and type(stored.sites)=='table' then
-  for _,site in ipairs(stored.sites) do
-   if #state.sites>=32 then break end
-   if type(site)=='table' and type(site.name)=='string' and #site.name>0 and #site.name<=96 and not site.name:find('[%z\1-\31\127]') and valid_url(site.url) then
-    state.sites[#state.sites+1]={name=site.name,url=valid_url(site.url),kind='custom'}
+ local builtins={{name=u8'Форум Arizona',url='https://forum.arizona-rp.com/',kind='forum'},{name='YouTube',url='https://www.youtube.com/',kind='youtube'}}
+ local function load_sites()
+  local sites={builtins[1],builtins[2]}
+  local stored=read('sites.json')
+  if stored and stored.version==1 and type(stored.sites)=='table' then
+   for _,site in ipairs(stored.sites) do
+    if #sites>=32 then break end
+    if type(site)=='table' and type(site.name)=='string' and #site.name>0 and #site.name<=96 and not site.name:find('[%z\1-\31\127]') then
+     local url=valid_url(site.url)
+     if url then sites[#sites+1]={name=site.name,url=url,kind='custom'} end
+    end
    end
   end
+  state.sites=sites
  end
+ load_sites()
  local function save_sites(sites)
   local custom={}
   for i=3,#sites do custom[#custom+1]={name=sites[i].name,url=sites[i].url} end
@@ -78,6 +86,51 @@ return function(env)
   if #state.queue>=128 then return false end
   state.seq=state.seq+1;state.queue[#state.queue+1]={seq=state.seq,action=action,url=url};state.last_write=-10
   return true
+ end
+ local max_tabs=6
+ local function tab_layout(width)
+  local tabs=type(state.status.tabs)=='table' and state.status.tabs or {}
+  local tab_width=math.min(180,math.floor((width-48)/math.max(1,#tabs))-4)
+  return tabs,tab_width,8+#tabs*(tab_width+4)
+ end
+ local function draw_tabs(dl,r,mouse_x,mouse_y)
+  local tabs,tab_width,add_x=tab_layout(r.w)
+  local function pos(x,y) return imgui.ImVec2(r.x+x,r.y+y) end
+  local x_mouse,y_mouse=(mouse_x or -1)-r.x,(mouse_y or -1)-r.y
+  local top,bottom=34,60
+  dl:AddRectFilled(pos(0,32),pos(r.w,64),0xFF2D2925)
+  for index,tab in ipairs(tabs) do
+   local x=8+(index-1)*(tab_width+4)
+   local hover=y_mouse>=top and y_mouse<bottom and x_mouse>=x and x_mouse<x+tab_width
+   dl:AddRectFilled(pos(x,top),pos(x+tab_width,bottom),tab.id==state.status.active_tab and 0xFF52483E or hover and 0xFF463D34 or 0xFF39332D,5)
+   local title=type(tab.title)=='string' and tab.title or u8'Новая вкладка'
+   dl:PushClipRect(pos(x+7,top),pos(x+tab_width-24,bottom),true)
+   dl:AddText(pos(x+8,40),0xFFF0E8E0,title)
+   dl:PopClipRect()
+   dl:AddText(pos(x+tab_width-18,40),0xFFF0E8E0,'x')
+  end
+  if #tabs>0 and #tabs<max_tabs then
+   dl:AddRectFilled(pos(add_x,top),pos(add_x+26,bottom),0xFF484035,5)
+   local cx,cy=add_x+13,(top+bottom)*0.5
+   dl:AddLine(pos(cx-3,cy),pos(cx+3,cy),0xFFF0E8E0,1.2)
+   dl:AddLine(pos(cx,cy-3),pos(cx,cy+3),0xFFF0E8E0,1.2)
+  end
+ end
+ local function tab_click(x,y,width)
+  if y<34 or y>=60 then return end
+  local tabs,tab_width,add_x=tab_layout(width)
+  for index,tab in ipairs(tabs) do
+   local left=8+(index-1)*(tab_width+4)
+   if x>=left and x<left+tab_width then
+    state.address_edit=false
+    command(x>=left+tab_width-23 and 'tab_close' or 'tab_select',tostring(tab.id))
+    return
+   end
+  end
+  if #tabs>0 and #tabs<max_tabs and x>=add_x and x<add_x+26 then
+   state.address_edit=false
+   command('tab_new')
+  end
  end
  local function reset_input_queue()
   state.pending_move=nil
@@ -102,11 +155,14 @@ return function(env)
   end
   if not deps() then state.message='Сначала скачайте необходимые файлы.';return end
   local parent=ffi.C.GetActiveWindow();local owner=ffi.new('unsigned long[1]')
-  if parent==0 or user.GetWindowThreadProcessId(ffi.cast('void*',parent),owner)==0 or tonumber(owner[0])~=pid then state.message='Откройте браузер из активного окна игры.';return end
+  if parent==0 or user.GetWindowThreadProcessId(parent,owner)==0 or tonumber(owner[0])~=pid then state.message='Откройте браузер из активного окна игры.';return end
   state.status_seen=false;state.heartbeat=nil;state.last_status_at=nil
   reset_input_queue();state.input_ack=0;state.parent=tonumber(parent);state.queue={};state.seq=0;state.status={};state.message='Запускаем браузер...'
   os.remove(path('status.json'));os.remove(path('host-error.json'))
-  write('control.json',{parent_pid=pid,visible=false,x=20,y=40,w=800,h=500,commands={}})
+  if not write('control.json',{parent_pid=pid,visible=false,x=20,y=40,w=800,h=500,commands={}}) then
+   state.message='Не удалось создать файл связи с браузером.'
+   return
+  end
   local cookie_mode=env.keep_cookies() and 'keep-cookies' or 'private'
   if launch('--host '..state.parent..' '..pid..' '..mode..' '..cookie_mode,mode=='external' and 1 or 0) then state.mode=mode;state.started=true;state.started_at=os.clock();state.last_write=-10 end
  end
@@ -196,12 +252,14 @@ return function(env)
   local width,height=context.width or 1280,context.height or 800
   local rect=state.overlay_rect or {x=math.max(8,width-816),y=40,w=math.min(800,width-24),h=math.min(500,height-64)}
   if show and context.chat_mouse then
+   local tab_height=type(state.status.tabs)=='table' and 32 or 0
    local x,y,down=context.mouse_x or 0,context.mouse_y or 0,context.mouse_down==true
    if down and not state.pointer_down then
     local lx,ly=x-rect.x,y-rect.y
     if lx>=0 and lx<rect.w and ly>=0 and ly<rect.h then
      if ly<32 and lx>=rect.w-35 then close('close_button');return
-     elseif not state.status.fullscreen and ly>=32 and ly<78 then
+     elseif not state.status.fullscreen and tab_height>0 and ly>=32 and ly<64 then tab_click(lx,ly,rect.w)
+      elseif not state.status.fullscreen and ly>=32+tab_height and ly<78+tab_height then
       if lx>=8 and lx<42 and state.status.can_back then state.address_edit=false;command('back')
       elseif lx>=48 and lx<82 and state.status.can_forward then state.address_edit=false;command('forward')
       elseif lx>=88 and lx<122 then state.address_edit=false;command('reload')
@@ -237,6 +295,7 @@ return function(env)
   url=valid_url(url)
   if not url then state.message='Укажите корректный адрес сайта.';return end
   if not deps() then state.requested_url=url;state.setup=true;return end
+  state.message=''
   start(state.mode)
   if state.pending_mode then state.pending_url=url
   elseif state.started then command('navigate',url);if state.mode=='external' then command('focus') end;state.dismiss_after_seq=state.seq end
@@ -254,20 +313,32 @@ return function(env)
   state.address_edit=false;open_site(url)
  end
  local labels={connection_wait='Ожидаем связь с окном браузера.',ready='',loading='Открываем сайт...',navigation_error='Не удалось загрузить страницу.',runtime_missing='Для браузера требуется WebView2 Runtime.',initialization_error='Не удалось открыть браузер.',blocked_url='Этот адрес не поддерживается.',download_blocked='Загрузка файлов с сайтов пока недоступна.',process_failed='Окно браузера можно открыть повторно.',command_error='Не удалось открыть сайт.',control_error='Нет связи с окном браузера.'}
+ local site_changed='Плитка уже изменена в браузере. Откройте её заново.'
+ local function find_original(original)
+  if not original then return nil end
+  for i=3,#state.sites do
+   local site=state.sites[i]
+   if site.name==original.name and site.url==original.url then return i end
+  end
+ end
  local function submit_site()
   local editor=state.editor
+  load_sites()
+  local index=editor.original and find_original(editor.original)
+  if editor.original and not index then state.edit_error=site_changed;return end
   local name=editor.name:match('^%s*(.-)%s*$')
   local url=valid_url(editor.url)
   if #name==0 or #name>96 or name:find('[%z\1-\31\127]') then state.edit_error='Введите короткое название сайта.';return end
   if not url then state.edit_error='Введите адрес сайта: например, https://example.com';return end
-  if not editor.index and #state.sites>=32 then state.edit_error='Можно сохранить до 30 своих сайтов.';return end
+  if not editor.original and #state.sites>=32 then state.edit_error='Можно сохранить до 30 своих плиток.';return end
   local sites={};for i,site in ipairs(state.sites) do sites[i]=site end
-  sites[editor.index or (#sites+1)]={name=name,url=url,kind='custom'}
+  sites[index or (#sites+1)]={name=name,url=url,kind='custom'}
   if save_sites(sites) then state.editor=nil;state.edit_error=nil;state.message='' end
  end
  local function delete_site()
-  local index=state.editor and state.editor.index
-  if not index or index<=2 then return end
+  load_sites()
+  local index=state.editor and find_original(state.editor.original)
+  if not index then state.edit_error=site_changed;return end
   local sites={};for i,site in ipairs(state.sites) do if i~=index then sites[#sites+1]=site end end
   if save_sites(sites) then state.editor=nil;state.edit_error=nil;state.message='' end
  end
@@ -326,16 +397,20 @@ return function(env)
    imgui.SetCursorPos(imgui.ImVec2(x+(w-size.x)/2,y+35-size.y/2));imgui.TextColored(imgui.ImVec4(1,1,1,1),letter);imgui.PopFont()
   end
   imgui.PushFont(font[3])
-  local label=shorten(add and u8'Добавить сайт' or site.name,w-16)
+  local label=shorten(add and u8'Добавить плитку' or site.name,w-16)
   local size=imgui.CalcTextSize(label)
   imgui.SetCursorPos(imgui.ImVec2(x+(w-size.x)/2,y+68))
   imgui.TextColored(add and imgui.ImVec4(1,1,1,1) or imgui.ImVec4(0.12,0.12,0.14,1),label)
   imgui.PopFont()
   if clicked then
-   if add then state.editor={name='',url=''};state.edit_error=nil
+   if add then
+    local address=state.query_buf and valid_url(ffi.string(state.query_buf)) or nil
+    if address and not address:match('^https?://[^/%?#]+%.') and not address:match('^https?://localhost[:/]') then address=nil end
+    state.editor={name='',url=address or valid_url(state.status.url) or ''}
+    state.edit_error=nil
    elseif site.search_engine then select_search(site.search_engine)
    else open_site(site.url) end
-  elseif edit then state.editor={index=index,name=site.name,url=site.url};state.edit_error=nil end
+  elseif edit then state.editor={original={name=site.name,url=site.url},name=site.name,url=site.url};state.edit_error=nil end
  end
  local function draw_setup(font,bold)
   local runtime=state.status.code=='runtime_missing' or state.install_kind=='runtime'
@@ -354,17 +429,27 @@ return function(env)
   if not state.installing and gui.Button(u8'Вернуться к сайтам',{24,240},{220,30}) then state.setup=false;state.install_kind=nil end
   gui.Text(24,307,state.message,font[2])
  end
- local function draw_editor(font,bold)
+ local function draw_editor(cl,font,bold)
   local editor=state.editor
-  gui.Text(24,20,editor.index and 'Изменить сайт' or 'Добавить сайт',bold[1])
-  gui.Text(24,74,'Название',font[3])
-  editor.name=gui.InputText({160,76},590,editor.name,u8'Название сайта##BrowserSite',128,u8'Например: мой сайт')
-  gui.Text(24,126,'Адрес сайта',font[3])
-  local enter;editor.url,enter=gui.InputText({160,128},590,editor.url,u8'Адрес сайта##BrowserSite',2048,u8'https://example.com')
-  if gui.Button(u8'Сохранить сайт',{24,190},{190,36}) or enter then submit_site() end
-  if gui.Button(u8'Отмена##BrowserSite',{226,190},{150,36}) then state.editor=nil;state.edit_error=nil end
-  if editor.index and gui.Button(u8'Удалить сайт',{576,190},{190,36}) then delete_site() end
-  if state.edit_error then gui.Text(24,255,state.edit_error,font[3]) end
+  local editing=editor.original~=nil
+  gui.DrawBox({154,38},{532,276},cl.tab,cl.line,10,15)
+  gui.Text(176,55,editing and 'Изменить плитку' or 'Добавить плитку',bold[1])
+  gui.DrawLine({174,84},{666,84},cl.line)
+
+  gui.Text(178,99,'Название',font[3])
+  editor.name=gui.InputText({182,125},476,editor.name,u8'Название сайта##BrowserSite',128,u8'Например, форум')
+  gui.Text(178,155,'Адрес сайта',font[3])
+  local enter
+  editor.url,enter=gui.InputText({182,181},476,editor.url,u8'Адрес сайта##BrowserSite',2049,u8'https://example.com')
+  if state.edit_error then gui.Text(178,209,state.edit_error,font[3]) end
+  gui.DrawLine({174,238},{666,238},cl.line)
+
+  local remove=editing and gui.Button(u8'Удалить',{176,257},{104,32})
+  local cancel=gui.Button(u8'Отмена##BrowserSite',{391,257},{104,32})
+  local save=gui.Button(u8'Сохранить плитку',{505,257},{159,32})
+  if remove then delete_site()
+  elseif cancel then state.editor=nil;state.edit_error=nil
+  elseif save or enter then submit_site() end
  end
  local function draw_yandex_shortcuts(font,bold)
   local dl=imgui.GetWindowDrawList()
@@ -417,7 +502,7 @@ return function(env)
    imgui.PushFont(bold[3]);local size=imgui.CalcTextSize(u8'Я')
    imgui.SetCursorPos(imgui.ImVec2(x+26-size.x/2,y+26-size.y/2));imgui.TextColored(imgui.ImVec4(1,1,1,1),u8'Я');imgui.PopFont()
   end
-  if not state.query_buf then state.query_buf=ffi.new('char[512]') end
+  if not state.query_buf then state.query_buf=ffi.new('char[2049]') end
   imgui.PushFont(google and (env.search_font or font[3]) or font[3])
   imgui.PushStyleColor(imgui.Col.FrameBg,imgui.ImVec4(0,0,0,0))
   imgui.PushStyleColor(imgui.Col.FrameBgHovered,imgui.ImVec4(0,0,0,0))
@@ -430,8 +515,8 @@ return function(env)
   local active=imgui.IsItemActive()
   imgui.PopItemWidth();imgui.PopStyleVar(2);imgui.PopStyleColor(4)
   if state.query_buf[0]==0 and not active then
-   local placeholder=google and u8'Поиск в Google' or u8'Найдётся всё';local size=imgui.CalcTextSize(placeholder)
-   imgui.SetCursorPos(imgui.ImVec2(x+(w-size.x)/2,y+(h-size.y)/2));imgui.TextColored(imgui.ImVec4(0.60,0.61,0.64,1),placeholder)
+   local placeholder=google and u8'Адрес или поиск в Google' or u8'Адрес или поиск в Яндексе';local size=imgui.CalcTextSize(placeholder)
+   imgui.SetCursorPos(imgui.ImVec2(x+56,y+(h-size.y)/2));imgui.TextColored(imgui.ImVec4(0.60,0.61,0.64,1),placeholder)
   end
   imgui.PopFont()
   imgui.SetCursorPos(imgui.ImVec2(x+w-116,y+7))
@@ -443,11 +528,7 @@ return function(env)
   dl:AddLine(point(w-24,21),point(w-19,26),color(1,1,1),1.7)
   dl:AddLine(point(w-24,31),point(w-19,26),color(1,1,1),1.7)
   if enter or clicked then
-   local query=ffi.string(state.query_buf):match('^%s*(.-)%s*$')
-   if query~='' then
-    local encoded=query:gsub('[^A-Za-z0-9%-_%.~]',function(char)return string.format('%%%02X',string.byte(char))end)
-    open_site((google and 'https://www.google.com/search?q=' or 'https://yandex.ru/search/?text=')..encoded)
-   end
+   submit_address(ffi.string(state.query_buf))
   end
  end
  local function select_mode(mode)
@@ -482,31 +563,38 @@ return function(env)
    tile({name=u8'Яндекс',kind='yandex',search_engine='yandex'},1,260,138,font,bold_font,false)
    tile({name='Google',kind='google',search_engine='google'},2,424,138,font,bold_font,false)
    if state.message~='' then gui.Text(24,300,state.message,font[3]) end
-  elseif state.editor then draw_editor(font,bold_font)
+  elseif state.editor then draw_editor(cl,font,bold_font)
   elseif state.setup or state.installing then draw_setup(font,bold_font)
   else
    draw_search(font,bold_font)
-   imgui.SetCursorPos(imgui.ImVec2(12,214));imgui.BeginChild('##BrowserSitesGrid',imgui.ImVec2(816,124),false,0)
+   if not state.sites_checked or os.clock()-state.sites_checked>0.5 then
+    state.sites_checked=os.clock()
+    load_sites()
+   end
+   imgui.SetCursorPos(imgui.ImVec2(12,222))
+   imgui.BeginChild('##BrowserSitesGrid',imgui.ImVec2(816,116),false,0)
    local count=#state.sites
    for i=1,count+1 do
-    local row=math.floor((i-1)/5);local columns=math.min(5,count+1-row*5)
-    local left=(816-(columns*148+(columns-1)*12))/2
-    tile(state.sites[i],i,left+((i-1)%5)*160,8+row*108,font,bold_font,i==count+1)
+    local columns=math.min(5,count+1-math.floor((i-1)/5)*5)
+    local x=(816-(columns*148+(columns-1)*12))/2+((i-1)%5)*160
+    tile(state.sites[i],i,x,6+math.floor((i-1)/5)*108,font,bold_font,i==count+1)
    end
-   imgui.SetCursorPos(imgui.ImVec2(0,8+math.ceil((count+1)/5)*108));imgui.Dummy(imgui.ImVec2(1,1))
    imgui.EndChild()
-   if state.status.code and (state.status.code:find('error',1,true) or state.status.code=='connection_wait') then gui.Text(22,334,labels[state.status.code] or state.message,font[2]) end
+   local status=state.status.code
+   local error_text=status and (status:find('error',1,true) or status=='connection_wait') and labels[status]
+   local message=error_text or state.message
+   if message~='' and message~='Файлы скачаны.' and message~='Браузер закрыт.' then gui.Text(22,346,message,font[2]) end
   end
   imgui.EndChild()
  end
- local function pointer(kind,x,y,delta,down)
+ local function pointer(kind,x,y,delta,down,click_count)
   if not state.started or state.mode=='external' then return end
-  local payload=json.encode({type=kind,x=x,y=y,delta=delta,down=down})
+  local payload=json.encode({type=kind,x=x,y=y,delta=delta,down=down,click_count=click_count})
   if kind=='mouseMoved' then state.pending_move=payload;return end
   if state.pending_move and #state.queue<8 then command('pointer',state.pending_move) end
   state.pending_move=nil
   if not command('pointer',payload) then input_failed();return end
   state.input_wait_at=state.input_wait_at or os.clock()
  end
- return {install=install,submit_address=submit_address,pointer=pointer,draw=draw,draw_settings=draw_settings,poll=poll,close=close,toggle_input=toggle_input,open_site=open_site,select_mode=select_mode,state=state}
+ return {install=install,submit_address=submit_address,pointer=pointer,draw=draw,draw_tabs=draw_tabs,draw_settings=draw_settings,poll=poll,close=close,toggle_input=toggle_input,open_site=open_site,select_mode=select_mode,state=state}
 end
