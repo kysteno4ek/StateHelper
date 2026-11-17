@@ -3,7 +3,7 @@ local math = math
 script_name('State Helper')
 script_authors('Kane')
 script_description('Script for employees of state organizations on the Arizona Role Playing Game')
-script_version('3.5.3')
+script_version('3.5.5')
 script_properties('work-in-pause')
 
 local ffi = require 'ffi'
@@ -334,6 +334,19 @@ function sh_resource.valid(data, extension)
 	end
 	return false
 end
+function sh_resource.read_bounded(path, max_size)
+	local file = io.open(path, 'rb')
+	if not file then return end
+	local size = file:seek('end')
+	if not size or size == 0 or size > max_size or not file:seek('set', 0) then
+		file:close()
+		return
+	end
+	local ok, data = pcall(file.read, file, size)
+	file:close()
+	if ok and data and #data == size then return data end
+end
+
 function sh_resource.fetch(url, path, max_size, timeout, complete, progress)
 	sh_resource.sequence = sh_resource.sequence + 1
 	local staged = path .. '.download-' .. os.time() .. '-' .. sh_resource.sequence
@@ -354,10 +367,8 @@ function sh_resource.fetch(url, path, max_size, timeout, complete, progress)
 		if status == dlstatus.STATUS_DOWNLOAD_ERROR then
 			finish(id, nil, 'download error', p1, p2)
 		elseif status == dlstatus.STATUS_ENDDOWNLOADDATA or status == dlstatus.STATUSEX_ENDDOWNLOAD then
-			local file = io.open(staged, 'rb')
-			local data = file and file:read(max_size + 1)
-			if file then file:close() end
-			if data and #data > 0 and #data <= max_size then
+			local data = sh_resource.read_bounded(staged, max_size)
+			if data then
 				finish(id, data, nil, p1, p2)
 			elseif status == dlstatus.STATUSEX_ENDDOWNLOAD then
 				finish(id, nil, 'file missing, empty or too large', p1, p2)
@@ -1659,6 +1670,122 @@ function sh_audit.split_show(command)
 	end
 	return result
 end
+function sh_audit.migrate_medical_roleplay()
+	if setting.org < 1 or setting.org > 4 or setting.first_start or sh_audit.command_storage_unavailable then return end
+	local legacy = {
+		cur = {
+			{ '/cure {id}', '/me оказал{sex[][а]} первую медицинскую помощь пострадавшему' },
+			{
+				"/cure {id}",
+				"/me легким движением руки открыл{sex[][а]} мед. сумку, после чего достал{sex[][а]} платок",
+				"/me аккуратно приложил{sex[][а]} платок ко рту пострадавшего, после чего сделал{sex[][а]} глубокий вдох",
+				"/do В лёгких много воздуха.",
+				"/me встал{sex[][а]} на колени, после чего прислонил{sex[ся][ась]} к пациенту",
+				"/me {sex[подвел][подвела]} губы ко рту пострадавшего, после чего начал{sex[][а]} делать искусственное дыхание",
+				"/me отвел{sex[][а]} губы от рта пострадавшего, после чего сделал{sex[][а]} глубокий вдох",
+				"/me подвел{sex[][а]} губы ко рту пострадавшего, после чего начал{sex[][а]} делать искусственное дыхание",
+				"/todo Сейчас аккуратно поднимайтесь*помогая встать",
+			},
+		},
+		narko = {{
+			"Очень замечательно, что Вы решили излечиться от укропозависимости.",
+			"Стоимость одного сеанса составит {pricenarko}$",
+			"Метод лечения современный, называется \"Нейроочищение\". Он полностью сотрёт информацию об укропе с Вашего мозга.",
+			"Вы согласны? Если да, то ложитесь на кушетку и мы приступим.",
+			false,
+			"/do На столе лежат стерильные перчатки и медицинская маска.",
+			"/me взяв со стола средства индивидуальной защиты, надел{sex[][а]} их на себя",
+			"/todo А теперь максимально расслабьтесь*подвигая спец. аппарат ближе к пациенту",
+			"/me взял{sex[][а]} шлем от аппарата, после чего надел{sex[][а]} его на голову пациента",
+			"/me включил{sex[][а]} устройство, затем, подождав пять секунд, выключил{sex[][а]} его",
+			"/do Аппарат успешно завершил работу.",
+			"/me снял{sex[][а]} шлем с пациента и повесил{sex[][а]} его обратно на аппарат",
+			"/healbad {id}",
+			"/todo Вот и всё! Тяга к запрещённым веществам должна исчезнуть*снимая с себя маску с перчатками",
+		}, {
+			"Стоимость одного сеанса составит {pricenarko}$. Вы согласны на лечение?", false, "/me {sex[провёл][провела]} сеанс лечения укропозависимости", "/healbad {id}", "Сеанс завершён. При необходимости обратитесь к врачу повторно.",
+		}, {
+			"Сеанс стоит {pricenarko}$. Вы согласны?", false, "/me {sex[провёл][провела]} сеанс лечения", "/healbad {id}",
+		}, {
+			"Сеанс стоит {pricenarko}$. Вы согласны?",
+			false,
+			"/me достал{sex[][а]} из медицинской сумки перчатки и надел{sex[][а]} их",
+			"/me осмотрел{sex[][а]} пациента и уточнил{sex[][а]}, как он себя чувствует",
+			"/me подготовил{sex[][а]} оборудование и {sex[провёл][провела]} сеанс лечения",
+			"/me убрал{sex[][а]} оборудование и повторно проверил{sex[][а]} самочувствие пациента",
+			"/healbad {id}",
+		}, {
+			"Сеанс стоит {pricenarko}$. Вы согласны?",
+			false,
+			"/me достал{sex[][а]} из медицинской сумки перчатки и надел{sex[][а]} их",
+			"/me осмотрел{sex[][а]} пациента и уточнил{sex[][а]}, как он себя чувствует",
+			"/me закрепил{sex[][а]} датчики на запястьях пациента и {sex[провёл][провела]} сеанс лечения",
+			"/me снял{sex[][а]} датчики с запястий пациента и помог{sex[][ла]} ему встать",
+			"/healbad {id}",
+		}, {
+			"Сеанс стоит {pricenarko}$. Вы согласны?",
+			false,
+			"/me достал{sex[][а]} из медицинской сумки перчатки и надел{sex[][а]} их",
+			"/me осмотрел{sex[][а]} пациента и уточнил{sex[][а]}, как он себя чувствует",
+			"/me достал{sex[][а]} из медицинского кейса шприц и аккуратно {sex[ввёл][ввела]} пациенту препарат",
+			"/me убрал{sex[][а]} использованный шприц в контейнер и помог{sex[][ла]} пациенту встать",
+			"/healbad {id}",
+		}},
+		strah = {{
+			"Очень замечательно, что Вы решили оформить медицинскую страховку.",
+			"С ней Вы сможете лечиться за счёт государства.",
+			"/me достаёт из под стола пустой бланк, после чего начинает его заполнять",
+			"/me заполнив бланк, передаёт его человеку напротив и говорит:",
+			"Это бумажная копия, сейчас впишу Вас в базу данных.",
+			"/me вбивает человека напротив в компьютер, находящийся на столе",
+			"/do Обратившийся внесён в базу данных страхования.",
+			"/todo Поздравляю! Вы официально застрахованы!*заканчивая оформление",
+			"/givemedinsurance {id}",
+		}},
+	}
+	local heal = {hl = true, hlactor = true, hme = true}
+	local removed = u8'/do Медицинская сумка весит на левом плече.'
+	local defaults, pending = {}, {}
+	for _, command in ipairs(cmd_defoult.hospital) do defaults[command.cmd] = command.act end
+	local function matches(actions, template)
+		if #actions ~= #template then return false end
+		for i, text in ipairs(template) do
+			local action = actions[i]
+			if text then
+				if action[1] ~= 'SEND' or action[2] ~= u8(text) then return false end
+			elseif action[1] ~= 'WAIT_ENTER' or #action ~= 1 then
+				return false
+			end
+		end
+		return true
+	end
+	for _, command in ipairs(cmd[1]) do
+		local name, actions = command.cmd, command.act
+		local replacement
+		if legacy[name] and defaults[name] then
+			for _, template in ipairs(legacy[name]) do
+				if matches(actions, template) then
+					replacement = deep_copy(defaults[name])
+					break
+				end
+			end
+		elseif heal[name] then
+			local kept = {}
+			for _, action in ipairs(actions) do
+				if action[1] ~= 'SEND' or action[2] ~= removed then kept[#kept + 1] = action end
+			end
+			if #kept < #actions then replacement = kept end
+		end
+		if replacement then
+			pending[#pending + 1] = {command, actions}
+			command.act = replacement
+		end
+	end
+	if #pending > 0 and not save_cmd() then
+		for _, change in ipairs(pending) do change[1].act = change[2] end
+	end
+end
+
 function sh_audit.migrate_government_roleplay()
 	if tonumber(setting.org) ~= 6 or setting.first_start or sh_audit.command_storage_unavailable then return end
 	local templates = {car = true, lic = true, pass = true, social = true, visa = true}
@@ -2110,7 +2237,8 @@ function save_cmd(during_setup)
 	if not sh_audit.command_path_safe(base) or not sh_audit.recover_commands(base) then
 		return fail('unfinished command transaction or unsafe directory')
 	end
-	local seen_uids = {}
+	if type(cmd[1]) ~= 'table' or not sh_audit.categories(cmd[2]) then return fail('invalid command categories') end
+	local seen_uids, current_paths = {}, {}
 	for _, c in ipairs(cmd[1]) do
 		local valid, problem = sh_audit.command(c)
 		if not valid then return fail(problem) end
@@ -2127,18 +2255,21 @@ function save_cmd(during_setup)
 		local name = c.cmd ~= '' and c.cmd or tostring(c.UID)
 		if not sh_audit.safe_command_name(name) then return fail('invalid command file name') end
 		local path, duplicate = directory .. name .. '.json', 2
-		while current[path] do path = directory .. name .. ' (' .. duplicate .. ').json'; duplicate = duplicate + 1 end
+		while current_paths[path:lower()] do path = directory .. name .. ' (' .. duplicate .. ').json'; duplicate = duplicate + 1 end
+		current_paths[path:lower()] = true
 		local ok, data = pcall(encodeJson, c); if not ok then return fail(data) end
 		current[path], plan[path] = true, data
 	end
 	local ok, categories = pcall(encodeJson, cmd[2]); if not ok then return fail(categories) end
 	plan[base .. 'categories.json'] = categories
-	for path in pairs(cmd_loaded_files) do if not current[path] then plan[path] = false end end
+	for path in pairs(cmd_loaded_files) do if not current_paths[path:lower()] then plan[path] = false end end
 	for path in pairs(plan) do
 		if not sh_audit.command_path_safe(path) or not sh_audit.command_path_safe(path .. '.pending')
 			or not sh_audit.command_path_safe(path .. '.pending.tmp') then return fail('unsafe command file') end
 		local file = io.open(path, 'rb')
-		if file then before[path] = file:read('*a'); file:close()
+		if file then
+			before[path] = file:read('*a'); file:close()
+			if before[path] == nil then return fail('cannot read old file: ' .. path) end
 		elseif doesFileExist(path) then return fail('cannot read old file: ' .. path)
 		else before[path] = false end
 	end
@@ -2882,10 +3013,15 @@ function cefnotig(samp_text, duration_ms)
 	local textColor = light and '#1a1a1a' or '#f2f2f2'
 	local borderColor = light and '#c7c7c7' or '#2e2e2e'
 	local color = setting.color_def or {0, 0.48, 1}
-	local function channel(i)
-		return math.floor(math.max(0, math.min(1, tonumber(color[i]) or 0)) * 255 + 0.5)
+	local function shade(mix, target)
+		local function channel(i)
+			local value = math.max(0, math.min(1, tonumber(color[i]) or 0))
+			return math.floor((value + (target - value) * mix) * 255 + 0.5)
+		end
+		return string.format('#%02x%02x%02x', channel(1), channel(2), channel(3))
 	end
-	local accent = string.format('#%02x%02x%02x', channel(1), channel(2), channel(3))
+	local accent = shade(0, 0)
+	local highlight = light and shade(0.20, 0) or shade(0.38, 1)
 	local message = tostring(samp_text or '')
 	message = message:gsub('^%s*{%x%x%x%x%x%x}%s*%[SH%]%s*', ''):gsub('^%s*%[SH%]%s*', '')
 	message = '{FF5345}[SH] {FFFFFF}' .. message
@@ -2931,7 +3067,7 @@ function cefnotig(samp_text, duration_ms)
 		setTimeout(()=>{let c=document.getElementById('%s');if(c)c.remove()},%d);
 	]],
 	300, 300, 
-	elementId, json.encode(content), accent, light and accent or "#8fc5ff", bgColor, borderColor, 400, elementId, 400, duration_ms - 400, elementId, duration_ms
+	elementId, json.encode(content), accent, highlight, bgColor, borderColor, 400, elementId, 400, duration_ms - 400, elementId, duration_ms
 	)
 	evalanon(js_code)
 end
@@ -3766,6 +3902,7 @@ function main()
 	migrate_lecture_commands()
 	sh_audit.migrate_commands()
 	sh_audit.migrate_government_roleplay()
+	sh_audit.migrate_medical_roleplay()
 	do
 		local changed = false
 		for _, command in ipairs(cmd[1]) do
@@ -4164,6 +4301,7 @@ end
 			ghetto_notify_func()
 			auto_z()
 			swanted_tick()
+			if stroi.ui.dirty then stroi.flush(false) end
 			automask_tick()
 			autoheal_tick()
 			autojack_tick()
@@ -5418,14 +5556,14 @@ function gui.InputText(pos_draw, size_input, arg_text, name_input, buf_size_inpu
 	end
 	local col_stand_imvec4 = cl.bg
 	local ret_true = false
-	flag_input = imgui.InputTextFlags.EnterReturnsTrue
+	flag_input = bit.bor(flag_input or 0, imgui.InputTextFlags.EnterReturnsTrue)
 	if filter_buf == nil then filter_buf = '' end
 	if filter_buf:find('num') then
 		if flag_input == nil then flag_input = 0 end
-		flag_input = flag_input + imgui.InputTextFlags.CharsDecimal
+		flag_input = bit.bor(flag_input, imgui.InputTextFlags.CharsDecimal)
 	elseif filter_buf:find('rus') or filter_buf:find('en') or filter_buf:find('ernh') or filter_buf:find('ern') or filter_buf:find('esp') then
 		if flag_input == nil then flag_input = 0 end
-		flag_input = flag_input + imgui.InputTextFlags.CallbackCharFilter
+		flag_input = bit.bor(flag_input, imgui.InputTextFlags.CallbackCharFilter)
 	end
 
 	gui.Draw({pos_draw[1] - 3, pos_draw[2] - 5}, {size_input + 10, 23}, col_stand_imvec4, 0, 15)
@@ -6558,12 +6696,11 @@ function sh_usage_start()
 
 	local function send_usage(endpoint, data, finish)
 		local headers = {['Content-Type'] = 'text/plain'}
-		if not setting.first_start and (endpoint == 'launch' or endpoint == 'heartbeat') then
-			local nickname = type(setting.name_rus) == 'string' and setting.name_rus:match('^%s*(.-)%s*$')
-			if nickname and #nickname > 0 and #nickname <= 60 and not nickname:find('[%z%c]') then
-				headers['X-StateHelper-Nickname'] = nickname:gsub('[^A-Za-z0-9_.~-]', function(char)
-					return ('%%%02X'):format(char:byte())
-				end)
+		if endpoint ~= 'register' then
+			local found, player_id = sampGetPlayerIdByCharHandle(PLAYER_PED)
+			local nickname = found and sampGetPlayerNickname(player_id)
+			if type(nickname) == 'string' and #nickname <= 24 and nickname:match('^[A-Za-z0-9_.%[%]()$@=%-]+$') then
+				headers['X-StateHelper-Player-Nick'] = nickname
 			end
 		end
 		local ok = pcall(sh_winhttps_request, 'POST', 'statehelper.top', '/api/' .. endpoint, {
@@ -7186,7 +7323,7 @@ end
 function cover_flush()
 	for i = #cover_trash, 1, -1 do
 		if os.clock() - cover_trash[i].time > 3 then
-			pcall(imgui.DestroyTexture, cover_trash[i].tex)
+			pcall(imgui.ReleaseTexture, cover_trash[i].tex)
 			table.remove(cover_trash, i)
 		end
 	end
@@ -7195,7 +7332,7 @@ end
 function cover_drop_pending()
 	local p = play.cover_pending
 	if p and p.tex and p.tex ~= image_no_label then
-		pcall(imgui.DestroyTexture, p.tex)
+		pcall(imgui.ReleaseTexture, p.tex)
 	end
 	play.cover_pending = nil
 end
@@ -7214,7 +7351,7 @@ function music_cover(info, num_i)
 	local token = mus.play_token
 	local function apply(tex)
 		if token ~= mus.play_token then
-			if tex and tex ~= image_no_label then pcall(imgui.DestroyTexture, tex) end
+			if tex and tex ~= image_no_label then pcall(imgui.ReleaseTexture, tex) end
 			return
 		end
 		play.cover_pending = {tex = tex or image_no_label, num_i = num_i, token = token}
@@ -8359,6 +8496,7 @@ sh_settings_search = {
 		[22] = 'Действия',
 		[23] = 'Доп. функции',
 		[24] = 'Браузер',
+		[25] = 'Умный строй',
 	},
 	entries = {
 		{1, 'Никнейм на русском', ''},
@@ -8520,15 +8658,16 @@ function sh_settings_search.mark(text)
 	if type(text) ~= 'string' or text:sub(1, #label) ~= label then return end
 	local window = imgui.GetWindowPos()
 	local geometry = state.geometry
-	if window.x ~= geometry.x or window.y ~= geometry.y then return end
+	if window.x ~= (geometry.capture_x or geometry.x) or window.y ~= (geometry.capture_y or geometry.y) then return end
 	local pos = imgui.GetCursorScreenPos()
-	state.highlight_y = state.highlight_y or (pos.y + imgui.GetFontSize() * 0.5)
+	local anchors = geometry.anchors
+	anchors[#anchors + 1] = pos.y + imgui.GetFontSize() * 0.5
 end
 
 function sh_settings_search.record_geometry(kind, x, y, width, height)
 	local geometry = sh_settings_search.geometry
 	local window = imgui.GetWindowPos()
-	if window.x ~= geometry.x or window.y ~= geometry.y then return end
+	if window.x ~= (geometry.capture_x or geometry.x) or window.y ~= (geometry.capture_y or geometry.y) then return end
 	local list = geometry[kind]
 	if kind == 'lines' then list[#list + 1] = y
 	else list[#list + 1] = {x = x, y = y, w = width, h = height} end
@@ -8547,30 +8686,47 @@ function sh_settings_search.highlight_bounds(geometry, y)
 		if line < y and line > top then top = line end
 		if line > y and line < bottom then bottom = line end
 	end
-	return card.x + 2, top + 2, card.x + card.w - 2, bottom - 2
+	return card.x + 2, top + 2, card.x + card.w - 2, bottom - 2, true
 end
 
 function sh_settings_search.paint_highlight()
 	local state = sh_settings_search
-	if not state.highlight_y or not state.geometry then return end
-	local left, top, right, bottom = sh_settings_search.highlight_bounds(state.geometry, state.highlight_y)
+	local geometry = state.geometry
+	if not geometry or not geometry.anchors[1] then return end
+	local left, top, right, bottom
+	for _, y in ipairs(geometry.anchors) do
+		local x1, y1, x2, y2, in_card = sh_settings_search.highlight_bounds(geometry, y)
+		if not left or in_card then left, top, right, bottom = x1, y1, x2, y2 end
+		if in_card then break end
+	end
 	if bottom <= top then return end
+
+	local height = imgui.GetWindowHeight()
+	local window_bottom = geometry.y + height
+	local visible = top >= geometry.y and bottom <= window_bottom
+	if not visible and bottom - top > height then
+		visible = top <= geometry.y and bottom >= window_bottom
+	end
 	if state.scroll_pending then
-		local current = imgui.GetScrollY()
-		local center = (top + bottom) * 0.5
-		local desired = math.max(0, current + center - state.geometry.y - imgui.GetWindowHeight() * 0.5)
-		local destination = math.min(desired, imgui.GetScrollMaxY())
-		state.scroll_frames = (state.scroll_frames or 0) + 1
-		if state.scroll_frames > 1 and math.abs(current - destination) < 1 then
+		if visible then
 			state.scroll_pending = false
 		else
-			imgui.SetScrollY(destination)
+			local current = imgui.GetScrollY()
+			local content_bottom = bottom - geometry.y + current
+			-- The frame that opens a different settings tab can still report the
+			-- previous tab's scroll range. Register the actual card's end as content.
+			if content_bottom > imgui.GetScrollMaxY() + height then
+				local cursor = imgui.GetCursorPos()
+				imgui.SetCursorPos(imgui.ImVec2(0, content_bottom + 6))
+				imgui.Dummy(imgui.ImVec2(1, 1))
+				imgui.SetCursorPos(cursor)
+			end
+			local local_target = (top + bottom) * 0.5 - geometry.y
+			imgui.SetScrollFromPosY(local_target, 0.5)
+			return
 		end
 	end
-	if state.scroll_pending or edit_key or edit_cmd then return end
-	local geometry = state.geometry
-	local window_bottom = geometry.y + imgui.GetWindowHeight()
-	if bottom <= geometry.y or top >= window_bottom then return end
+	if edit_key or edit_cmd or bottom <= geometry.y or top >= window_bottom then return end
 	if not state.visible_since then
 		state.visible_since = os.clock()
 		state.expires = state.visible_since + 4
@@ -8660,7 +8816,7 @@ function sh_settings_search.draw_results()
 		if clicked then
 			state.open, state.focus, state.progress = false, false, 0
 			state.target, state.expires, state.visible_since = entry, os.clock() + 10, nil
-			state.scroll_pending, state.sidebar_pending, state.scroll_frames = true, true, 0
+			state.scroll_pending, state.sidebar_pending = true, true
 			tab_settings = entry[1]
 			bool_reset_tab_scroll = false
 			imgui.Scroller.id_bool_scroll[u8'Суть вкладки главное'] = nil
@@ -8686,7 +8842,10 @@ function hall.settings()
 		num_pos_plus_tab_set = num_pos_plus_tab_set + num_return_tab_set
 		imgui.SetCursorPos(imgui.ImVec2(0, 66 + ((num_pos_plus_tab_set - 1) * 32)))
 		if imgui.InvisibleButton(u8'##Кнопка перехода во вкладку ' .. num_return_tab_set, imgui.ImVec2(220, 29)) then
+			if tab_settings == 25 and num_return_tab_set ~= 25 then stroi.leave_editor() end
 			tab_settings = num_return_tab_set
+			sh_settings_search.target = nil
+			sh_settings_search.scroll_pending, sh_settings_search.sidebar_pending = false, false
 			bool_reset_tab_scroll = true
 			if tab_settings == 13 then
 				up_child_sub = 0
@@ -8707,6 +8866,10 @@ function hall.settings()
 			imgui.SetScrollHereY(0.5)
 			sh_settings_search.sidebar_pending = false
 		end
+		if num_return_tab_set == 25 and stroi.ui.sidebar_pending then
+			imgui.SetScrollHereY(0.5)
+			stroi.ui.sidebar_pending = false
+		end
 		if num_return_tab_set == tab_settings then
 			gui.Draw({10, 66 + ((num_pos_plus_tab_set - 1) * 32)}, {200, 29}, cl.def, 4, 15)
 		end
@@ -8714,7 +8877,13 @@ function hall.settings()
 		
 		imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.95, 0.95, 0.95, 1.00))
 		imgui.PushFont(fa_font[2])
-		imgui.SetCursorPos(imgui.ImVec2(18 + sdvig_icon[1], 73 + sdvig_icon[2] + ((num_pos_plus_tab_set - 1) * 32)))
+		if num_return_tab_set == 25 then
+			local size = imgui.CalcTextSize(icon_tab_set)
+			imgui.SetCursorPos(imgui.ImVec2(14 + (21 + sdvig_draw - size.x) * 0.5,
+				70 + ((num_pos_plus_tab_set - 1) * 32) + (20 - size.y) * 0.5))
+		else
+			imgui.SetCursorPos(imgui.ImVec2(18 + sdvig_icon[1], 73 + sdvig_icon[2] + ((num_pos_plus_tab_set - 1) * 32)))
+		end
 		imgui.Text(icon_tab_set)
 		imgui.PopFont()
 		imgui.PopStyleColor(1)
@@ -8771,16 +8940,16 @@ function hall.settings()
 		new_tab_setting(imgui.ImVec4(1.00, 0.18, 0.33, 1.00), fa.TRUCK_MEDICAL, 'Доп. функции', 6, 0 + pos_tab_pl, {-1.5, 0})
 	elseif setting.org == 9 then
 		new_tab_setting(imgui.ImVec4(1.00, 0.18, 0.15, 1.00), fa.FIRE, 'Вызовы', 6, 0 + pos_tab_pl, {1, 0})
-		new_tab_setting(imgui.ImVec4(0.50, 0.50, 0.50, 1.00), fa.WRENCH, 'Доп. функции', 23, (7 - 23) + pos_tab_pl, {0, 0})
-		pos_tab_pl = pos_tab_pl + 1
 	elseif setting.org >= 11 and setting.org <= 15 then
 		new_tab_setting(imgui.ImVec4(0.50, 0.50, 0.50, 1.00), fa.WRENCH, 'Доп. функции', 6, 0 + pos_tab_pl, {0, 0})
 	elseif setting.org == 10 then
 		new_tab_setting(imgui.ImVec4(0.50, 0.50, 0.50, 1.00), fa.WRENCH, 'Доп. функции', 6, 0 + pos_tab_pl, {0, 0})
 	else
-		new_tab_setting(imgui.ImVec4(0.50, 0.50, 0.50, 1.00), fa.WRENCH, 'Доп. функции', 23, (6 - 23) + pos_tab_pl, {0, 0})
+		pos_tab_pl = pos_tab_pl - 1
 	end
 	
+	new_tab_setting(imgui.ImVec4(0.50, 0.50, 0.50, 1.00), fa.USERS, 'Умный строй', 25, (7 - 25) + pos_tab_pl)
+	pos_tab_pl = pos_tab_pl + 1
 	new_tab_setting(imgui.ImVec4(0.00, 0.40, 1.00, 1.00), fa.PAPER_PLANE, 'Уведомления', 7, 0.5 + pos_tab_pl)
 	new_tab_setting(imgui.ImVec4(1.00, 0.18, 0.33, 1.00), fa.COMMENT_DOTS, 'Акцент', 8, 0.5 + pos_tab_pl)
 	new_tab_setting(imgui.ImVec4(0.56, 0.56, 0.58, 1.00), fa.TOGGLE_ON, 'Другие функции', 9, 0.5 + pos_tab_pl, {-1, 0})
@@ -8809,13 +8978,9 @@ function hall.settings()
 	imgui.EndChild()
 	hovered_bool_not_child = imgui.IsItemHovered()
 	
-	local stroi_pin = 0
-	if tab_settings == 6 and (setting.org <= 4 or setting.org == 10) then
-		stroi_pin = stroi.settings_item(242, 55) + 16
-	end
-	imgui.SetCursorPos(imgui.ImVec2(226, 39 + stroi_pin))
+	imgui.SetCursorPos(imgui.ImVec2(226, 39))
 	--if tab_settings == 4 then size_y_child = 335 end
-	imgui.BeginChild(u8'Суть вкладки главное', imgui.ImVec2(618, 369 - stroi_pin), false, imgui.WindowFlags.NoScrollWithMouse + (tab_settings == 13 and imgui.WindowFlags.NoScrollbar or 0))
+	imgui.BeginChild(u8'Суть вкладки главное', imgui.ImVec2(618, 369), false, imgui.WindowFlags.NoScrollWithMouse + (tab_settings == 13 and imgui.WindowFlags.NoScrollbar or 0))
 	local target = sh_settings_search.target
 	if not (target and target[1] == tab_settings and sh_settings_search.scroll_pending and os.clock() < sh_settings_search.expires) then
 		imgui.Scroller(u8'Суть вкладки главное', img_step[1][0], img_duration[1][0])
@@ -9040,11 +9205,10 @@ function hall.settings()
 		imgui.EndPopup()
 	end
 	sh_settings_search.scope = tab_settings
-	sh_settings_search.highlight_y = nil
 	local search_target = sh_settings_search.target
 	if search_target and search_target[1] == tab_settings and os.clock() < sh_settings_search.expires then
 		local window = imgui.GetWindowPos()
-		sh_settings_search.geometry = {x = window.x, y = window.y, cards = {}, lines = {}}
+		sh_settings_search.geometry = {x = window.x, y = window.y, cards = {}, lines = {}, anchors = {}}
 	end
 	if tab_settings == 1 then
 		gui.Text(25, 12, 'Основное', bold_font[1])
@@ -10140,6 +10304,10 @@ function hall.settings()
 		new_draw(16, 37)
 		if members_settings_anim == nil then members_settings_anim = setting.mb.func and 1 or 0 end
 		members_settings_anim = math.max(0, math.min(1, members_settings_anim + (setting.mb.func and 1 or -1) * anim * 6))
+		local search_geometry = sh_settings_search.geometry
+		if search_geometry and sh_settings_search.scroll_pending and setting.mb.func then
+			members_settings_anim = 1
+		end
 		
 		gui.Text(26, 26, 'Мемберс организации на Вашем экране', font[3])
 		imgui.SetCursorPos(imgui.ImVec2(561, 21))
@@ -10151,6 +10319,10 @@ function hall.settings()
 		if members_settings_anim > 0 then
 			imgui.SetCursorPos(imgui.ImVec2(0, 60))
 			imgui.BeginChild('##members_settings_details', imgui.ImVec2(618, (1047 + 21 - 60) * members_settings_anim), false, imgui.WindowFlags.NoScrollbar + imgui.WindowFlags.NoScrollWithMouse)
+			if search_geometry then
+				local child_pos = imgui.GetWindowPos()
+				search_geometry.capture_x, search_geometry.capture_y = child_pos.x, child_pos.y
+			end
 			local slide_y = -60 - 12 * (1 - members_settings_anim)
 			gui.Text(25, 72 + slide_y, 'Содержимое', bold_font[1])
 			new_draw(97 + slide_y, 215)
@@ -10325,6 +10497,7 @@ function hall.settings()
 				imgui.SetCursorPos(imgui.ImVec2(49 + ((num_rank - 1) * 55), 895 + slide_y))
 				if imgui.InvisibleButton(u8'##Переключить отображение ранга ' .. num_rank, imgui.ImVec2(25, 25)) then
 					setting.rank_members[num_rank] = not setting.rank_members[num_rank]
+					sh_audit.members_filter_dirty()
 				end
 			end
 			
@@ -10348,6 +10521,9 @@ function hall.settings()
 
 			imgui.SetCursorPos(imgui.ImVec2(16, 1047 + slide_y))
 			imgui.Dummy(imgui.ImVec2(1, 16))
+			if search_geometry then
+				search_geometry.capture_x, search_geometry.capture_y = nil, nil
+			end
 			imgui.EndChild()
 		end
 	elseif tab_settings == 6 then
@@ -10379,7 +10555,9 @@ function hall.settings()
 			gui.TextInfo({26, 45}, {'Вам станет удобнее работать с вызовами игроков через /godeath'})
 			
 			local calls_progress = gui.RevealProgress('medical_calls', setting.godeath.func)
-			if gui.BeginReveal(calls_progress, 80, 330) then
+			local color_progress = gui.RevealProgress('medical_call_color', setting.godeath.two_text)
+			local calls_height = 255 + 54 * color_progress
+			if gui.BeginReveal(calls_progress, 80, calls_height) then
 				local function accent_col(num_acc, color_acc, color_acc_act)
 					imgui.SetCursorPos(imgui.ImVec2(407 + (num_acc * 43), 371))
 					local p = imgui.GetCursorScreenPos()
@@ -10448,7 +10626,6 @@ function hall.settings()
 					save()
 				end
 
-				local color_progress = gui.RevealProgress('medical_call_color', setting.godeath.two_text)
 				if gui.BeginReveal(color_progress, 350, 45) then
 					new_draw(354, 35)
 					gui.Text(26, 363, 'Цвет текста вызова', font[3])
@@ -10460,20 +10637,41 @@ function hall.settings()
 					gui.EndReveal()
 				end
 				
-				imgui.Dummy(imgui.ImVec2(0, 18))
 				gui.EndReveal()
 			end
-			local heal_y = 80 + 330 * calls_progress + 19
-			new_draw(heal_y, 53)
+			local heal_y = 81 + (calls_height + 11) * calls_progress
+			local heal_progress = gui.RevealProgress('autoheal_confirmation', setting.autoheal.func)
+			local heal_height = 53 + 36 * heal_progress
+			new_draw(heal_y, heal_height)
 			gui.Text(26, heal_y + 9, 'Авто Heal', font[3])
 			imgui.SetCursorPos(imgui.ImVec2(561, heal_y + 5))
 			if gui.Switch(u8'##autoheal_func', setting.autoheal.func) then
 				setting.autoheal.func = not setting.autoheal.func
 				save()
 			end
-			gui.TextInfo({26, heal_y + 28}, {'Триггер на слова в чате: игрок просит лечение - предложит /heal (Enter).'})
-			imgui.SetCursorPos(imgui.ImVec2(0, heal_y + 53))
-			imgui.Dummy(imgui.ImVec2(0, 21))
+			gui.TextInfo({26, heal_y + 28}, {'Предлагает выполнить /heal, когда игрок просит лечение в чате.'})
+			local key = autoheal.confirm_key()
+			local popup = u8'Клавиша подтверждения Авто Heal'
+			if gui.BeginReveal(heal_progress, heal_y + 53, 36) then
+				gui.DrawLine({16, heal_y + 53}, {602, heal_y + 53}, cl.line)
+				local key_label = #key[2] > 0 and u8:decode(key[1]) or 'Не назначена'
+				gui.Text(26, heal_y + 63, 'Клавиша подтверждения — ' .. key_label, font[3])
+				if gui.Button(u8'Изменить...##autoheal_key', {491, heal_y + 58}, {99, 25}) and setting.autoheal.func then
+					current_key = {'', {}}
+					lockPlayerControl(true)
+					edit_key = true
+					imgui.OpenPopup(popup)
+				end
+				gui.EndReveal()
+			end
+			local result = key_edit(popup, key, true)
+			if result[1] then
+				setting.autoheal.key = result[2]
+				setting.autoheal.key_custom = true
+				save()
+			end
+			imgui.SetCursorPos(imgui.ImVec2(0, heal_y + heal_height))
+			imgui.Dummy(imgui.ImVec2(0, 16))
 		elseif setting.org == 9 then
 			new_draw(16, 53)
 
@@ -10732,7 +10930,7 @@ function hall.settings()
 				gui.EndReveal()
 			end
 		elseif setting.org >= 11 and setting.org <= 15 then
-			local stroi_off = stroi.settings_item(16, 16) + 16
+			local stroi_off = 0
 			new_draw(16 + stroi_off, 53)
 		 	gui.Text(26, 25 + stroi_off, 'Умный розыск', font[3])
 			imgui.SetCursorPos(imgui.ImVec2(561, 21 + stroi_off))
@@ -11370,10 +11568,8 @@ function hall.settings()
 			imgui.Dummy(imgui.ImVec2(0, 12))
 		end
 	
-	elseif tab_settings == 23 then
-		local stroi_height = stroi.settings_item(16, 16)
-		imgui.SetCursorPos(imgui.ImVec2(0, 32 + stroi_height))
-		imgui.Dummy(imgui.ImVec2(0, 21))
+	elseif tab_settings == 25 then
+		stroi.draw_embedded(602, 369)
 	elseif tab_settings == 7 then
 		new_draw(16, 53)
 		
@@ -13024,7 +13220,7 @@ function hall.cmd()
 			imgui.PopFont()
 			if (edit_name_folder and NUM == #cmd[2]) or (edit_all_cmd and NUM > 7) then
 				imgui.PushFont(font[3])
-				local txt_inp_buf = imgui.new.char[40](cmd[2][NUM][1])
+				local txt_inp_buf = imgui.new.char[math.max(40, #cmd[2][NUM][1] + 1)](cmd[2][NUM][1])
 				imgui.PushStyleColor(imgui.Col.FrameBg, imgui.ImVec4(0.30, 0.30, 0.30, 1.00))
 				imgui.SetCursorPos(imgui.ImVec2(53, 20 + POS))
 				imgui.PushItemWidth(140)
@@ -13981,7 +14177,7 @@ if imgui.BeginPopupModal(u8'Подтверждение удаления команды2' .. i, null, imgui.W
 							insert_tag_popup[1] = 0
 							insert_tag_popup[2] = ''
 						end
-						local txt_inp_buf = imgui.new.char[600](bl_cmd.act[i][2])
+						local txt_inp_buf = imgui.new.char[math.max(600, #bl_cmd.act[i][2] + 1)](bl_cmd.act[i][2])
 						imgui.PushStyleColor(imgui.Col.FrameBg, imgui.ImVec4(0.30, 0.30, 0.30, 0.00))
 						imgui.SetCursorPos(imgui.ImVec2(27 + if_disp, 326 + pxl))
 						imgui.PushItemWidth(662 - if_disp)
@@ -14035,7 +14231,7 @@ if imgui.BeginPopupModal(u8'Подтверждение удаления команды2' .. i, null, imgui.W
 							insert_tag_popup[1] = 0
 							insert_tag_popup[2] = ''
 						end
-						local txt_inp_buf = imgui.new.char[600](bl_cmd.act[i][2])
+						local txt_inp_buf = imgui.new.char[math.max(600, #bl_cmd.act[i][2] + 1)](bl_cmd.act[i][2])
 						imgui.PushStyleColor(imgui.Col.FrameBg, imgui.ImVec4(0.30, 0.30, 0.30, 0.00))
 						imgui.SetCursorPos(imgui.ImVec2(27 + if_disp, 326 + pxl))
 						imgui.PushItemWidth(662 - if_disp)
@@ -14084,7 +14280,7 @@ if imgui.BeginPopupModal(u8'Подтверждение удаления команды2' .. i, null, imgui.W
 							insert_tag_popup[1] = 0
 							insert_tag_popup[2] = ''
 						end
-						local txt_inp_buf = imgui.new.char[600](bl_cmd.act[i][2])
+						local txt_inp_buf = imgui.new.char[math.max(600, #bl_cmd.act[i][2] + 1)](bl_cmd.act[i][2])
 						imgui.PushStyleColor(imgui.Col.FrameBg, imgui.ImVec4(0.30, 0.30, 0.30, 0.00))
 						imgui.SetCursorPos(imgui.ImVec2(27 + if_disp, 326 + pxl))
 						imgui.PushItemWidth(662 - if_disp)
@@ -14152,7 +14348,7 @@ if imgui.BeginPopupModal(u8'Подтверждение удаления команды2' .. i, null, imgui.W
 						end
 						
 						imgui.PushFont(font[3])
-						local txt_inp_buf = imgui.new.char[600](bl_cmd.act[i][2])
+						local txt_inp_buf = imgui.new.char[math.max(600, #bl_cmd.act[i][2] + 1)](bl_cmd.act[i][2])
 						imgui.PushStyleColor(imgui.Col.FrameBg, imgui.ImVec4(0.30, 0.30, 0.30, 0.00))
 						imgui.SetCursorPos(imgui.ImVec2(27 + if_disp, 326 + pxl))
 						imgui.PushItemWidth(662 - if_disp)
@@ -14217,7 +14413,7 @@ if imgui.BeginPopupModal(u8'Подтверждение удаления команды2' .. i, null, imgui.W
 					local count = math.min(#bl_cmd.act[i][3], max_variants)
 					for vr = 1, count do
 						if not optimization then
-							local txt_inp_buf = imgui.new.char[60](bl_cmd.act[i][3][vr])
+							local txt_inp_buf = imgui.new.char[math.max(60, #bl_cmd.act[i][3][vr] + 1)](bl_cmd.act[i][3][vr])
 							imgui.SetCursorPos(imgui.ImVec2(50 + if_disp, 362 + pxl))
 							imgui.PushItemWidth(763 - if_disp)
 							imgui.InputText('##BOOL_DIALOG' .. i .. vr, txt_inp_buf, ffi.sizeof(txt_inp_buf))
@@ -14440,7 +14636,7 @@ if imgui.BeginPopupModal(u8'Подтверждение удаления команды2' .. i, null, imgui.W
 						end
 						
 						imgui.PushFont(font[3])
-						local txt_inp_buf = imgui.new.char[600](bl_cmd.act[i][2])
+						local txt_inp_buf = imgui.new.char[math.max(600, #bl_cmd.act[i][2] + 1)](bl_cmd.act[i][2])
 						imgui.PushStyleColor(imgui.Col.FrameBg, imgui.ImVec4(0.30, 0.30, 0.30, 0.00))
 						imgui.SetCursorPos(imgui.ImVec2(27 + if_disp, 326 + pxl))
 						imgui.PushItemWidth(786 - if_disp)
@@ -14517,7 +14713,7 @@ if imgui.BeginPopupModal(u8'Подтверждение удаления команды2' .. i, null, imgui.W
 							insert_tag_popup[1] = 0
 							insert_tag_popup[2] = ''
 						end
-						local txt_inp_buf = imgui.new.char[600](bl_cmd.act[i][2])
+						local txt_inp_buf = imgui.new.char[math.max(600, #bl_cmd.act[i][2] + 1)](bl_cmd.act[i][2])
 						imgui.PushStyleColor(imgui.Col.FrameBg, imgui.ImVec4(0.30, 0.30, 0.30, 0.00))
 						imgui.SetCursorPos(imgui.ImVec2(27 + if_disp, 326 + pxl))
 						imgui.PushItemWidth(662 - if_disp)
@@ -18726,7 +18922,7 @@ end
 function sh_browser_input.window_blocked()
     local cursor_busy = not windows.fast[0] and not windows.action[0] and not sampIsChatInputActive() and not sh_browser_cursor_owned
         and type(sampGetCursorMode) == 'function' and sampGetCursorMode() ~= 0
-    return windows.main[0] or windows.smart_su[0] or windows.smart_ticket[0] or windows.stroi[0]
+    return windows.main[0] or windows.smart_su[0] or windows.smart_ticket[0] 
         or windows.shpora[0] or windows.reminder[0] or cursor_busy or sampIsDialogActive()
         or isGamePaused() or scene_active or edit_key or edit_cmd
 end
@@ -20204,8 +20400,9 @@ function cmd_edit(nm_cmd_edit, cmd_cur, apply_command)
 	return new_cmd_return
 end
 
-function key_edit(name_popup_key, key_cur)
+function key_edit(name_popup_key, key_cur, contextual)
 	local saved_keys = key_cur[2] or {}
+	local result
 	if imgui.BeginPopupModal(name_popup_key, null, imgui.WindowFlags.AlwaysAutoResize + imgui.WindowFlags.NoMove + imgui.WindowFlags.NoTitleBar) then
 		if imgui.IsKeyPressed(27, false) then
 			lockPlayerControl(false)
@@ -20307,7 +20504,12 @@ function key_edit(name_popup_key, key_cur)
 		end
 		
 		if gui.Button(u8'Применить', {0, 144}, {185, 29}) then
-			if not compare_array_disable_order(key_cur[2], current_key[2]) then
+			if contextual then
+				lockPlayerControl(false)
+				edit_key = false
+				imgui.CloseCurrentPopup()
+				result = {true, {current_key[1], current_key[2]}}
+			elseif not compare_array_disable_order(key_cur[2], current_key[2]) then
 				local is_hot_key_done = false
 				local num_hot_key_remove = 0
 				local remove_sd = false
@@ -20348,24 +20550,23 @@ function key_edit(name_popup_key, key_cur)
 						lockPlayerControl(false)
 						edit_key = false
 						imgui.CloseCurrentPopup()
-						return {true, key_cur}
+						result = {true, key_cur}
 					end
 				else
-					table.remove(all_keys, num_hot_key_remove)
+					if num_hot_key_remove > 0 then table.remove(all_keys, num_hot_key_remove) end
 					rkeys.unRegisterHotKey(key_cur[2])
 					key_cur = {'', {}}
 					lockPlayerControl(false)
 					edit_key = false
 					imgui.CloseCurrentPopup()
-					return {true, key_cur}
+					result = {true, key_cur}
 				end
 			else
 				lockPlayerControl(false)
 				edit_key = false
 				imgui.CloseCurrentPopup()
-				return {false, key_cur}
+				result = {false, key_cur}
 			end
-			save()
 		end
 		if gui.Button(u8'Очистить', {194, 144}, {186, 29}) then
 			current_key = {'', {}}
@@ -20375,7 +20576,7 @@ function key_edit(name_popup_key, key_cur)
 		imgui.EndPopup()
 	end
 	
-	return {false, key_cur}
+	return result or {false, key_cur}
 end
 
 function draw_gradient_border(time, speed_border)
@@ -20826,19 +21027,26 @@ win.main = imgui.OnFrame(
 				imgui.SetCursorPos(imgui.ImVec2(247, an[4]))
 				gui.TextGradient('Обновления', 0.5, 1.00)
 				imgui.PopFont()
+				local function update_status(text, y)
+					local face = bold_font[1]
+					imgui.PushFont(face)
+					local width = imgui.CalcTextSize(u8(text)).x
+					imgui.PopFont()
+					gui.Text((848 - width) * 0.5, y, text, face)
+				end
 				if sh_update.install == 'downloading' then
 					gui.Text(303, 230, 'Скачиваем обновление...', font[3])
 				elseif sh_update.install == 'failed' then
 					gui.Text(270, 221, 'Не удалось установить обновление.', font[3])
 					gui.Text(205, 243, 'Можно продолжить настройку с текущей версией.', font[3])
 				elseif sh_update.check == 'current' then
-					gui.Text(290, 221, 'Установлена актуальная версия скрипта.', font[3])
+					update_status('Установлена актуальная версия скрипта.', 225)
 				elseif sh_update.check == 'failed' then
 					gui.Text(278, 221, 'Не удалось проверить обновления.', font[3])
 					gui.Text(205, 243, 'Можно продолжить настройку с текущей версией.', font[3])
 				elseif sh_update.check == 'available' then
-					gui.Text(320, 221, 'Доступна новая версия скрипта.', font[3])
-					gui.Text(235, 243, 'Для завершения настройки установите обновление.', font[3])
+					update_status('Доступна новая версия скрипта.', 214)
+					update_status('Для завершения настройки установите обновление.', 241)
 				else
 					gui.Text(318, 230, 'Поиск обновлений, подождите...', font[3])
 				end
@@ -24673,12 +24881,19 @@ local function fast_builtin_command(cmd_name, allowed)
 end
 
 local function fast_section_defs()
+	local government = fast_org_key() == 'government'
+	local documents = {'showpassrp', 'showmcrp', 'showlicrp', 'showworkrp', 'pass', 'mc', 'visa', 'lic', 'wed', 'givemilitary', 'giveplate'}
+	local duty = {'z', 'za', 'cam', 'mb', 'exp', 'agenda', 'freely', 'car', 'visit', 'uvalgos'}
+	if government then
+		documents = {'showpassrp', 'showmcrp', 'showlicrp', 'showworkrp', 'mc', 'givemilitary', 'giveplate'}
+		for _, command in ipairs({'pass', 'visa', 'wed', 'lic'}) do duty[#duty + 1] = command end
+	end
 	return {
-		{id = 'doc', name = 'Документы', icon = 'doc', cmds = {'showpassrp', 'showmcrp', 'showlicrp', 'showworkrp', 'pass', 'mc', 'visa', 'lic', 'wed', 'givemilitary', 'giveplate'}},
+		{id = 'doc', name = 'Документы', icon = 'doc', cmds = documents},
 		{id = 'cuff', name = 'Задержание', icon = 'cuff', cmds = {'cuff', 'uncuff', 'frisk', 'gotome', 'ungotome', 'pull', 'take', 'incar', 'miranda', 'unmask', 'untie', 'unbag', 'ungag', 'bot', 'arrest', 'clear', 'meg', 'bk', 'zp', 'bribe', 'punish', 'unpunish', 'carcer', 'setcarcer', 'uncarcer', 'getjail'}},
 		{id = 'med', name = 'Медицина', icon = 'plus', cmds = {'hl', 'hlactor', 'narko', 'ant', 'cur', 'cure', 'strah', 'mt', 'osm', 'rec', 'hme'}},
 		{id = 'lic', name = 'Лицензии', icon = 'card', cmds = {'licauto', 'licmoto', 'licfly', 'licswim', 'licfish', 'lichunt', 'licdig', 'licgun', 'licmec', 'lictaxi', 'liccrypto', 'licstocks', 'price'}},
-		{id = 'duty', name = 'Служба', icon = 'dot', cmds = {'z', 'za', 'cam', 'mb', 'exp', 'agenda', 'freely', 'car', 'visit', 'uvalgos'}},
+		{id = 'duty', name = 'Служба', icon = 'dot', cmds = duty},
 		{id = 'lek', name = 'Лекции', icon = 'lines', cmds = {'lekmz1', 'lekmz2', 'lekmz3', 'lekmz4', 'lekmz5', 'lekcl1', 'lekcl2', 'lekcl3', 'lekcl4', 'lekcl5', 'lekgov1', 'lekgov2', 'lekgov3', 'lekgov4', 'lekgov5', 'lekgov6', 'lekarmy1', 'lekarmy2', 'lekarmy3', 'lekarmy4', 'lekarmy5', 'lekfd1', 'lekfd2', 'lekfd3', 'lekfd4', 'lekfd5', 'lekzeks1', 'lekzeks2', 'lekzeks3', 'lektsr1', 'lektsr2', 'lektsr3', 'lektsr4', 'lektsr5'}},
 		{id = 'lead', name = 'Руководство', icon = 'star', cmds = {'inv', 'rank', 'uval', 'mutechat', 'unmutechat', 'warnorg', 'unwarnorg'}}
 	}
@@ -24706,12 +24921,15 @@ local function fast_join_target(pref, section_id, org_key)
 	return ''
 end
 
+local fast_government_labels = {pass = 'Изменить дату рождения', visa = 'Оформить визу'}
+
 local function fast_section_commands(section, allowed)
 	local list = {}
 	for _, cmd_name in ipairs(section.cmds) do
 		local command = fast_builtin_command(cmd_name, allowed)
 		if command then
-			list[#list + 1] = {cmd = cmd_name, name = fast_action_name(command.desc or command.cmd), lead = command}
+			local label = fast_org_key() == 'government' and fast_government_labels[cmd_name]
+			list[#list + 1] = {cmd = cmd_name, name = label and u8(label) or fast_action_name(command.desc or command.cmd), lead = command}
 		end
 	end
 	return list
@@ -24810,7 +25028,7 @@ function FAST_UI.seed()
 				kind = 'cmd', name = it.name, cmd = it.cmd,
 				id = (c.arg ~= nil and #c.arg > 0) and true or false,
 				send = not (c.arg ~= nil and #c.arg > 1),
-				icon = FAST_UI.CMD_ICON[plain] or dir_icon
+				icon = (plain == 'freely' and fast_org_key() == 'government' and 'duty') or FAST_UI.CMD_ICON[plain] or dir_icon
 			}
 		end
 		out[#out + 1] = dir
@@ -24857,6 +25075,52 @@ function FAST_UI.migrate_show(slot, key)
 	return true
 end
 
+function FAST_UI.migrate_government_services(slot)
+	local f = setting.fast
+	if f.government_services_layout then return false end
+	local documents, duty
+	local function update_defaults(list)
+		for _, entry in ipairs(list) do
+			if entry.kind == 'dir' and type(entry.items) == 'table' then
+				update_defaults(entry.items)
+			elseif entry.kind == 'cmd' then
+				local command = fast_text(entry.cmd):gsub('^/', ''):lower()
+				local label = fast_government_labels[command]
+				if label then
+					entry.name = u8(label)
+				elseif command == 'freely' and (entry.icon == 'ban' or entry.icon == nil) then
+					entry.icon = 'duty'
+				end
+			end
+		end
+	end
+	update_defaults(slot)
+	for _, entry in ipairs(slot) do
+		if entry.kind == 'dir' and type(entry.items) == 'table' then
+			if entry.name == u8'Документы' then documents = entry end
+			if entry.name == u8'Служба' then duty = entry end
+		end
+	end
+	if documents then
+		local services = {pass = true, visa = true, wed = true, lic = true}
+		local i = 1
+		while i <= #documents.items do
+			local entry = documents.items[i]
+			if entry.kind == 'cmd' and services[fast_text(entry.cmd):gsub('^/', ''):lower()] then
+				if not duty then
+					duty = {kind = 'dir', name = u8'Служба', icon = 'duty', items = {}}
+					slot[#slot + 1] = duty
+				end
+				duty.items[#duty.items + 1] = table.remove(documents.items, i)
+			else
+				i = i + 1
+			end
+		end
+	end
+	f.government_services_layout = true
+	return true
+end
+
 function FAST_UI.tree()
 	local f = setting.fast
 	if type(f.by_org) ~= 'table' then f.by_org = {} end
@@ -24878,7 +25142,9 @@ function FAST_UI.tree()
 		f.by_org[key] = slot
 		save()
 	end
-	if FAST_UI.migrate_show(slot, key) then save() end
+	local migrated = FAST_UI.migrate_show(slot, key)
+	if key == 'government' and FAST_UI.migrate_government_services(slot) then migrated = true end
+	if migrated then save() end
 	-- Add new finance licenses once to an already customized CL wheel.
 	if key == 'driving_school' and not f.finance_licenses_added then
 		local licenses
@@ -27052,17 +27318,9 @@ function auto_report_fire(text_send, bool_func_enter)
 			if text_sub:find('%{myrank%}') then
 				text_sub = text_sub:gsub('%{myrank%}', setting.job_title)
 			end
-			if text_sub:find('{sex%[(.-)%]%[(.-)%]}') then
-				local gender_male, gender_fem = text_sub:match('{sex%[(.-)%]%[(.-)%]}')
-				local pattern_gender = ''
-				if setting.sex == 1 then
-					pattern_gender = gender_male
-				else
-					pattern_gender = gender_fem
-				end
-				
-				text_sub = text_sub:gsub('{sex%[(.-)%]%[(.-)%]}', pattern_gender)
-			end
+			text_sub = text_sub:gsub('{sex%[(.-)%]%[(.-)%]}', function(male, female)
+				return setting.sex == 1 and male or female
+			end)
 			
 			return text_sub
 		end
@@ -27895,33 +28153,10 @@ function getNearestID()
 end
 
 function sex_decode(text_ret)
-	local function escape_pattern(text_esc)
-		return text_esc:gsub('([%^%$%(%)%%%.%[%]%*%+%-%?])', '%%%1')
-	end
 	text_ret = u8:decode(text_ret)
-	local extracted_str = {}
-	for tag in text_ret:gmatch('%b{}') do
-		table.insert(extracted_str, {tag, tag})
-	end
-	
-	if text_ret:find('{sex%[(.-)%]%[(.-)%]}') and #extracted_str ~= 0 then
-		for i = 1, #extracted_str do
-			local gender_male, gender_fem = text_ret:match('{sex%[(.-)%]%[(.-)%]}')
-			if setting.sex == 1 then
-				extracted_str[i][2] = gender_male
-			else
-				extracted_str[i][2] = gender_fem
-			end
-			
-			for t = 1, #extracted_str do
-				local pattern = escape_pattern(extracted_str[t][1])
-				if text_ret:find(pattern) then
-					text_ret = text_ret:gsub(pattern, extracted_str[t][2])
-				end
-			end
-		end
-	end
-	
+	text_ret = text_ret:gsub('{sex%[(.-)%]%[(.-)%]}', function(male, female)
+		return setting.sex == 1 and male or female
+	end)
 	return u8(text_ret)
 end
 
@@ -27929,16 +28164,10 @@ end
 members = {}
 cloth = false
 lastDialogWasActive = 0
-dont_show_me_members = false
 script_cursor = false
 fontes = renderCreateFont('Trebuchet MS', setting.mb.size, setting.mb.flag)
-members_wait = {
-	members = false,
-	next_page = {
-		bool = false,
-		i = 0
-	}
-}
+members_wait = {members = false}
+local list_schedule = {after = 0}
 org = {
 	name = 'Организация',
 	online = 0,
@@ -27975,9 +28204,9 @@ function render_wanted()
 	end
 
 	if #wanted_players > 0 then
+		local color = changeColorAlpha(setting.police_settings.wanted_list.color.default, setting.police_settings.wanted_list.vis * 2)
 		for i, wanted in ipairs(wanted_players) do
 			if not (setting.police_settings.wanted_list.interior and wanted.dist == 'в интерьере') then
-				local color = changeColorAlpha(setting.police_settings.wanted_list.color.default, (setting.police_settings.wanted_list.vis * 2))
 				local out_string
 				if setting.police_settings.wanted_list.hide_distance then
 					out_string = string.format('%s [%s] (%s ур.)', wanted.nick, wanted.id, wanted.level)
@@ -28048,13 +28277,15 @@ function swanted_toggle()
 end
 
 function swanted_refresh()
-	if wanted_wait.checking then return end
+	if wanted_wait.checking or members_wait.members or stroi.read_members or os.time() < list_schedule.after then return false end
 	swanted_last = os.clock()
 	wanted_wait.checking = true
 	wanted_wait.page = 1
 	emp_wanted_players = {}
 	sampSendChat('/wanted 1')
 	wanted_wait.timeout = os.clock() + 5
+	list_schedule.after = os.time() + 2
+	return true
 end
 
 function swanted_tick()
@@ -28169,8 +28400,30 @@ end
 autoheal = {queue = {}, cur = nil, wait_until = 0, running = false, cool = 0}
 autoheal_prefix = {'лек', 'хил', 'вылечи', 'излечи', 'таблетк'}
 
+function autoheal.confirm_key()
+	local config = setting.autoheal
+	local key = config.key
+	if type(key) == 'table' and type(key[1]) == 'string' and type(key[2]) == 'table' then
+		if config.key_custom or key[1] ~= 'Enter' or #key[2] ~= 1 or key[2][1] ~= vkeys.VK_RETURN then return key end
+	end
+	return {'G', {vkeys.VK_G}}
+end
+
+function autoheal.matches_key(wparam, keys)
+	local trigger = false
+	for _, key in ipairs(keys) do
+		if key == wparam then
+			trigger = true
+		elseif not isKeyDown(key) then
+			return false
+		end
+	end
+	return trigger
+end
+
 function autoheal_ok()
 	return setting.autoheal and setting.autoheal.func and setting.org >= 1 and setting.org <= 4
+		and #autoheal.confirm_key()[2] > 0
 end
 
 local function autoheal_lower(str)
@@ -28246,7 +28499,8 @@ function autoheal_tick()
 	if not p then return end
 	autoheal.cur = p
 	autoheal.wait_until = now + 20
-	automask_say('Игрок {ED95A8}' .. p.nick:gsub('_', ' ') .. '[' .. p.id .. ']{FFFFFF} просит лечение. Нажмите {ED95A8}Enter{FFFFFF}, чтобы вылечить (/heal ' .. p.id .. ').' .. (#autoheal.queue > 0 and (' В очереди ещё: ' .. #autoheal.queue) or ''))
+	local key = autoheal.confirm_key()
+	automask_say('Игрок {ED95A8}' .. p.nick:gsub('_', ' ') .. '[' .. p.id .. ']{FFFFFF} просит лечение. Нажмите {ED95A8}' .. u8:decode(key[1]) .. '{FFFFFF}, чтобы вылечить (/heal ' .. p.id .. ').' .. (#autoheal.queue > 0 and (' В очереди ещё: ' .. #autoheal.queue) or ''))
 end
 
 function swanted_position()
@@ -28415,66 +28669,115 @@ function sh_audit.members_limit(value)
 	return math.max(0, math.min(1000, math.floor(tonumber(value) or 10)))
 end
 
+local members_hud = {revision = 0}
+
+function sh_audit.members_hud_dirty()
+	members_hud.revision = members_hud.revision + 1
+end
+
+function sh_audit.members_filter_dirty()
+	members_hud.rank_source = nil
+end
+
 function render_members()
-	local X, Y = setting.mb.pos.x, setting.mb.pos.y
-	local title = string.format('%s | Онлайн: %s%s', org.name, org.online, (setting.mb.afk and (' (%s в АФК)'):format(org.afk) or ''))
-	local col_title = changeColorAlpha(sh_audit.members_color("title"), (setting.mb.vis * 2))
-	local title_width = renderGetFontDrawTextLength(fontes, title)
-	local title_height = renderGetFontDrawHeight(fontes)
-	local title_y = Y - math.max(setting.mb.dist, title_height) - 9
-	local line_x = setting.mb.invers and X or X - title_width
-	renderDrawBox(line_x, Y - 4, title_width, 1, 0xFFFFFFFF)
-	if setting.mb.invers then
-		if renderFontDrawClickableText(script_cursor, fontes, title, X, title_y, col_title, col_title, 4, false) then
-			sampSendChat('/members')
+	local mb = setting.mb
+	local limit = sh_audit.members_limit(mb.max_visible)
+	local color_title = sh_audit.members_color('title')
+	local color_work = mb.form and sh_audit.members_color('work') or mb.color.default
+	if members_hud.rank_source ~= setting.rank_members then
+		members_hud.rank_source = setting.rank_members
+		local mask = 0
+		for i = 1, 11 do
+			if setting.rank_members[i] then mask = bit.bor(mask, bit.lshift(1, i - 1)) end
 		end
-	else
-		if renderFontDrawClickableText(script_cursor, fontes, title, X, title_y, col_title, col_title, 3, false) then
-			sampSendChat('/members')
-		end
+		members_hud.rank_mask = mask
 	end
-	if org.name == 'Гражданин' then
-		local col_non = changeColorAlpha(setting.mb.color.default, (setting.mb.vis * 2))
-		if setting.mb.invers then
-			renderFontDrawClickableText(script_cursor, fontes, 'Вы не состоите в организации', X, Y, col_non, col_non,  4, false)
-		else
-			renderFontDrawClickableText(script_cursor, fontes, 'Вы не состоите в организации', X, Y, col_non, col_non,  3, false)
+	local rank_mask = members_hud.rank_mask
+	local cache = members_hud.cache
+	local afk_count = mb.afk and org.afk or nil
+	local countdown = #members == 0 and wait_mb or nil
+	if not cache or cache.revision ~= members_hud.revision or cache.source ~= members
+		or cache.name ~= org.name or cache.online ~= org.online or cache.afk_count ~= afk_count
+		or cache.countdown ~= countdown or cache.rank_mask ~= rank_mask or cache.limit ~= limit
+		or cache.show_rank ~= mb.rank or cache.show_id ~= mb.id or cache.show_afk ~= mb.afk or cache.show_warn ~= mb.warn
+		or cache.title_tint ~= color_title or cache.work_tint ~= color_work or cache.default_tint ~= mb.color.default
+		or cache.visibility ~= mb.vis or cache.font ~= fontes or cache.size ~= mb.size or cache.flag ~= mb.flag then
+		local title = ('%s | Онлайн: %s%s'):format(org.name, org.online, mb.afk and (' (%s в АФК)'):format(org.afk) or '')
+		cache = {
+			revision = members_hud.revision, source = members, name = org.name, online = org.online, afk_count = afk_count,
+			countdown = countdown, rank_mask = rank_mask, limit = limit,
+			show_rank = mb.rank, show_id = mb.id, show_afk = mb.afk, show_warn = mb.warn,
+			title_tint = color_title, work_tint = color_work, default_tint = mb.color.default,
+			visibility = mb.vis, font = fontes, size = mb.size, flag = mb.flag,
+			title = title, title_width = renderGetFontDrawTextLength(fontes, title),
+			height = renderGetFontDrawHeight(fontes), rows = {},
+			title_color = changeColorAlpha(color_title, mb.vis * 2),
+			normal_color = changeColorAlpha(mb.color.default, mb.vis * 2)
+		}
+		local work_color = changeColorAlpha(color_work, mb.vis * 2)
+		local function add(text, color, marker)
+			cache.rows[#cache.rows + 1] = {text, renderGetFontDrawTextLength(fontes, text), color, marker}
 		end
-	elseif #members > 0 then
-		local mb = setting.mb
-		local limit = sh_audit.members_limit(mb.max_visible)
-		local shown, hidden = 0, 0
-		local online = tonumber(org.online) or 0
-		local align = mb.invers and 4 or 3
-		for i, member in ipairs(members) do
-			if i > online then break end
-			if setting.rank_members[tonumber(member.rank.count)] then
-				if limit > 0 and shown >= limit then
-					hidden = hidden + 1
-				else
-					local tint = mb.form and member.uniform and sh_audit.members_color("work") or mb.color.default
-					local color = changeColorAlpha(tint, mb.vis * 2)
-					local rank = mb.rank and ('[%s] '):format(member.rank.count) or ''
-					local nick = member.nick .. (mb.id and ('(%s)'):format(member.id) or '')
-					local afk = mb.afk and (' (AFK: %s)'):format(member.afk) or ''
-					local warns = mb.warn and (' (W: %s)'):format(member.warns) or ''
-					renderFontDrawClickableText(script_cursor, fontes, rank .. nick .. afk .. warns, X, Y, color, color, align, true)
-					shown = shown + 1
-					Y = Y + mb.dist
+		if org.name == 'Гражданин' then
+			add('Вы не состоите в организации', cache.normal_color)
+		elseif #members == 0 then
+			add('Мемберс обновится через ' .. wait_mb .. ' сек.', cache.normal_color)
+		else
+			local hidden, online = 0, tonumber(org.online) or 0
+			for i = 1, math.min(#members, online) do
+				local member = members[i]
+				if setting.rank_members[tonumber(member.rank.count)] then
+					if limit > 0 and #cache.rows >= limit then
+						hidden = hidden + 1
+					else
+						local rank = mb.rank and ('[%s] '):format(member.rank.count) or ''
+						local nick = member.nick .. (mb.id and ('(%s)'):format(member.id) or '')
+						local afk = mb.afk and (' (AFK: %s)'):format(member.afk) or ''
+						local warns = mb.warn and (' (W: %s)'):format(member.warns) or ''
+						add(rank .. nick .. afk .. warns, member.uniform and work_color or cache.normal_color, true)
+					end
 				end
 			end
+			if hidden > 0 then add(('Ещё в списке: %d'):format(hidden), cache.normal_color) end
 		end
-		if hidden > 0 then
-			local color = changeColorAlpha(mb.color.default, mb.vis * 2)
-			renderFontDrawClickableText(false, fontes, ('Ещё в списке: %d'):format(hidden), X, Y, color, color, align, false)
+		members_hud.cache = cache
+	end
+	local x, y = mb.pos.x, mb.pos.y
+	local title_x = mb.invers and x or x - cache.title_width
+	local title_y = y - math.max(mb.dist, cache.height) - 9
+	local cx, cy
+	if script_cursor then cx, cy = getCursorPos() end
+
+	if y - 4 >= 0 and y - 4 < sy and title_x < sx and title_x + cache.title_width > 0 then
+		renderDrawBox(title_x, y - 4, cache.title_width, 1, 0xFFFFFFFF)
+	end
+	if title_y < sy and title_y + cache.height > 0 and title_x < sx and title_x + cache.title_width > 0 then
+		renderFontDrawText(fontes, cache.title, title_x, title_y, cache.title_color)
+		if cx and cx > title_x and cx < title_x + cache.title_width and cy > title_y and cy < title_y + cache.height and isKeyJustPressed(0x01) then
+			sh_audit.members_request_start(true)
 		end
-	else
-		local col_non = changeColorAlpha(setting.mb.color.default, (setting.mb.vis * 2))
-		if setting.mb.invers then
-			renderFontDrawClickableText(script_cursor, fontes, 'Мемберс обновится через ' .. wait_mb .. ' сек.', X, Y, col_non, col_non,  4, false)
-		else
-			renderFontDrawClickableText(script_cursor, fontes, 'Мемберс обновится через ' .. wait_mb .. ' сек.', X, Y, col_non, col_non,  3, false)
+	end
+	local pad = 2
+	local first_row = 1
+	if mb.dist > 0 and y + cache.height <= -pad then
+		first_row = math.floor((-pad - y - cache.height) / mb.dist) + 2
+		y = y + (first_row - 1) * mb.dist
+	end
+	for i = first_row, #cache.rows do
+		local row = cache.rows[i]
+		if y >= sy + pad then break end
+		if y + cache.height > -pad then
+			local left = mb.invers and x or x - row[2]
+			if left < sx + pad and left + row[2] > -pad then
+				renderFontDrawText(fontes, row[1], left, y, row[3])
+			end
+			if cx and row[4] and not mb.invers and cx > left and cx < x and cy > y and cy < y + cache.height then
+				local offset = math.floor(math.sin(os.clock() * 10) * 3 + 5)
+				local marker_pos = x + offset
+				if marker_pos < sx then renderFontDrawText(fontes, '<', marker_pos, y, 0x90FFFFFF) end
+			end
 		end
+		y = y + mb.dist
 	end
 end
 
@@ -28483,10 +28786,9 @@ function isCursorAvailable()
 end
 
 function renderFontDrawClickableText(active, font, text, posX, posY, color, color_hovered, align, b_symbol)
-	local cursorX, cursorY = getCursorPos()
-	local lenght = renderGetFontDrawTextLength(font, text)
-	local height = renderGetFontDrawHeight(font)
-	local symb_len = renderGetFontDrawTextLength(font, '>')
+	local cursorX, cursorY
+	if active then cursorX, cursorY = getCursorPos() end
+	local lenght = (align == 2 or align == 3 or active) and renderGetFontDrawTextLength(font, text) or 0
 	local hovered = false
 	local result = false
 	b_symbol = b_symbol == nil and false or b_symbol
@@ -28498,16 +28800,16 @@ function renderFontDrawClickableText(active, font, text, posX, posY, color, colo
 		posX = posX - lenght
 	end
 
-	if active and cursorX > posX and cursorY > posY and cursorX < posX + lenght and cursorY < posY + height then
+	if active and cursorX > posX and cursorX < posX + lenght and cursorY > posY and cursorY < posY + renderGetFontDrawHeight(font) then
 		hovered = true
 		if isKeyJustPressed(0x01) then
 			result = true 
 		end
 	end
 
-	local anim = math.floor(math.sin(os.clock() * 10) * 3 + 5)
+	local anim = hovered and b_symbol and math.floor(math.sin(os.clock() * 10) * 3 + 5) or 0
  	if hovered and b_symbol and (align == 2 or align == 1) then
-		renderFontDrawText(font, '>', posX - symb_len - anim, posY, 0x90FFFFFF)
+		renderFontDrawText(font, '>', posX - renderGetFontDrawTextLength(font, '>') - anim, posY, 0x90FFFFFF)
 	end 
 	renderFontDrawText(font, text, posX, posY, hovered and color_hovered or color)
 	if hovered and b_symbol and (align == 2 or align == 3) then
@@ -28567,49 +28869,126 @@ function changePosition()
 	end
 end
 
-function update_lists()
-    local toggle_updater = false
-    while true do
-        wait(1000)
-        if sampIsLocalPlayerSpawned() and not sampIsDialogActive() and not sampIsChatInputActive() and wait_mb == 0 and not isGamePaused() and not isPauseMenuActive() then
-            local check_started = false
-            
-            local need_members = setting.mb.func
-            local need_wanted = setting.police_settings.wanted_list.func and (setting.org >= 11 and setting.org <= 15)
+function sh_audit.members_request_clear()
+	members_wait.members, members_wait.pending = false, nil
+	list_schedule.after = os.time() + 2
+end
 
-            if need_members and need_wanted then
-                if toggle_updater then
-                    sampSendChat('/members')
-                    members_wait.members = true
-                    check_started = true
-                    toggle_updater = false
-                else
-                    wanted_wait.checking = true
-                    wanted_wait.page = 1
-                    emp_wanted_players = {}
-                    sampSendChat('/wanted 1')
-                    wanted_wait.timeout = os.clock() + 5
-                    check_started = true
-                    toggle_updater = true
-                end
-            elseif need_members then
-                sampSendChat('/members')
-                members_wait.members = true
-                check_started = true
-            elseif need_wanted then
-                wanted_wait.checking = true
-                wanted_wait.page = 1
-                emp_wanted_players = {}
-                sampSendChat('/wanted 1')
-                wanted_wait.timeout = os.clock() + 5
-                check_started = true
-            end
-            
-            if check_started then
-                wait_mb = 15
-            end
-        end
-    end
+function sh_audit.members_request_valid()
+	local pending = members_wait.pending
+	if not pending then return false end
+	local ip, port = sampGetCurrentServerAddress()
+	if os.time() > pending.deadline or not setting.mb.func or not sampIsLocalPlayerSpawned()
+		or pending.ip ~= ip or pending.port ~= port or pending.org ~= setting.org then
+		sh_audit.members_request_clear()
+		return false
+	end
+	return true
+end
+
+function sh_audit.members_request_start(manual)
+	if not setting.mb.func or not sampIsLocalPlayerSpawned() or sampIsDialogActive()
+		or members_wait.members or wanted_wait.checking or stroi.read_members or os.time() < list_schedule.after then return false end
+	local ip, port = sampGetCurrentServerAddress()
+	if tostring(ip) .. ':' .. tostring(port) == '80.66.82.147:7777' then
+		if manual then sampSendChat('/members') end
+		return false
+	end
+	members_wait.pending = {ip = ip, port = port, org = setting.org, deadline = os.time() + 8, rows = {}, ids = {}, pages = {}}
+	members_wait.members = true
+	sampSendChat('/members')
+	return true
+end
+
+function sh_audit.members_page_rows(text)
+	local rows = {}
+	for line in text:gmatch('[^\r\n]+') do rows[#rows + 1] = line end
+	return rows
+end
+
+function sh_audit.members_next_page_row(rows, header_rows)
+	for i, line in ipairs(rows) do
+		if phone_mb_plain(line):find('Следующая страница', 1, true) then
+			local row = i - 1 - header_rows
+			if row >= 0 then return row end
+		end
+	end
+end
+
+function sh_audit.members_accept_page(id, title, text)
+	local pending = members_wait.pending
+	if not pending or type(text) ~= 'string' or type(title) ~= 'string' then return false end
+	local name, online = title:match('{FFFFFF}(.+)%(В сети: (%d+)%)')
+	online = tonumber(online or title:match('%(В сети: (%d+)%)'))
+	name = name or 'Больница VC'
+	if not online or pending.pages[text] or #pending.rows > 1004 or (pending.page_count or 0) >= 64
+		or (pending.name and pending.name ~= name) then
+		sh_audit.members_request_clear()
+		sampSendDialogResponse(id, 0, 0, '')
+		return true
+	end
+	pending.name, pending.online = name, online
+	pending.pages[text] = true
+	pending.page_count = (pending.page_count or 0) + 1
+	local rows = sh_audit.members_page_rows(text)
+	local next_row = sh_audit.members_next_page_row(rows, 1)
+	for _, line in ipairs(rows) do
+		if not line:find('Ник', 1, true) and not line:find('страница', 1, true) then
+			local source = line:gsub('%s*{%x+}%(%d+ дней%)', '')
+			local pattern = source:find('%(Вы%)') and
+				'{(%x+)}(.-)%((%d+)%)%{%x+%}%(Вы%)\t(.-)%((%d+)%)\t{%x+}(%d+) %[%d+] / (%d+)%s*(.-)\t%d+'
+				or '{(%x+)}(.-)%((%d+)%)\t(.-)%((%d+)%)\t{%x+}(%d+) %[%d+] / (%d+)%s*(.-)\t%d+'
+			local color, nick, player_id, rank_name, rank_id, warns, afk, muted = source:match(pattern)
+			if player_id and not pending.ids[player_id] then
+				pending.ids[player_id] = true
+				local identity = nick:match('([A-Za-z][A-Za-z0-9_]+)%s*$')
+				if not setting.mb_tags then nick = nick:match('([A-Za-z]+_[A-Za-z]+)$') or nick end
+				if muted ~= '' then nick = nick .. ' (' .. (muted:match('^/%s*(.*)') or muted) .. ') ' end
+				pending.rows[#pending.rows + 1] = {
+					nick = nick, identity = identity, id = player_id, rank = {count = tonumber(rank_id)},
+					afk = tonumber(afk) or 0, warns = tonumber(warns) or 0,
+					rank_name = rank_name, uniform = color == '90EE90'
+				}
+			end
+		end
+	end
+
+
+	if next_row and next_row >= 0 then
+		pending.deadline = os.time() + 8
+		sampSendDialogResponse(id, 1, next_row, '')
+	else
+		sampSendDialogResponse(id, 0, 0, '')
+		if #pending.rows >= pending.online then
+			local rows = pending.rows
+			for i = #rows, pending.online + 1, -1 do rows[i] = nil end
+			members = rows
+			org.name, org.online, org.afk = pending.name, pending.online, getAfkCount()
+			sh_audit.members_snapshot = {ip = pending.ip, port = pending.port, org = pending.org, time = os.time(), rows = rows}
+			sh_audit.members_hud_dirty()
+		end
+		sh_audit.members_request_clear()
+	end
+	return true
+end
+
+function update_lists()
+	local last = 'wanted'
+	while true do
+		wait(1000)
+		if members_wait.members then sh_audit.members_request_valid() end
+		if sampIsLocalPlayerSpawned() and not sampIsDialogActive() and not sampIsChatInputActive()
+			and not members_wait.members and not wanted_wait.checking and not stroi.read_members
+			and not isGamePaused() and not isPauseMenuActive() and wait_mb == 0 and os.time() >= list_schedule.after then
+			local need_members = setting.mb.func
+			local need_wanted = setting.police_settings.wanted_list.func and setting.org >= 11 and setting.org <= 15
+			if need_members and (not need_wanted or last == 'wanted') and sh_audit.members_request_start() then
+				last, wait_mb = 'members', 15
+			elseif need_wanted and swanted_refresh() then
+				last, wait_mb = 'wanted', 15
+			end
+		end
+	end
 end
 
 function check_all_wanted_pages() -- посл.проверки
@@ -28637,14 +29016,7 @@ function check_all_wanted_pages() -- посл.проверки
 end
 
 function EXPORTS.sendRequest()
-	if not sampIsDialogActive() and found_our then
-        sampSendChat('/members')
-		members_wait.members = true
-		
-		return true
-	end
-	
-	return false
+	return found_our and sh_audit.members_request_start() or false
 end
 
 function getAfkCount()
@@ -28772,6 +29144,51 @@ local function sh_is_loot_message(message)
  local draw = after_header('[Чёрный жребий]') or after_header('[Черный жребий]')
  if draw and draw:match('^Игрок%s+[%w_]+%s+испытал судьбу и получил%s+.+$') then return true end
  return false
+end
+
+local function department_tag(tag)
+	tag = autoheal_lower(tag):gsub('%%%-%%', '-'):gsub('[–—]', '-')
+	return tag:gsub('^%s*%[?%s*', ''):gsub('%s*%]?%s*$', ''):gsub('%s+', ' ')
+end
+
+local function department_call(mes, own_id, tags)
+	local sender, body = mes:match('^%s*%[[Dd]%].-%[(%d+)%]%s*:%s*(%S.*)$')
+	if not sender or tonumber(sender) == tonumber(own_id) then return false end
+	body = autoheal_lower(body)
+	local recipient, message = body:match('^к%s+([^,:]+)[,:]%s*(.*)$')
+	if not recipient then
+		local address
+		address, message = body:match('^([^,:]+)%s*[,:]%s*(.*)$')
+		if body:sub(1, 1) == '[' then
+			-- Separate by the colon first because the channel tag may contain a comma.
+			local header, text = body:match('^(.-)%s*:%s*(.*)$')
+			recipient = header and header:match('%[([^%[%]]+)%]%s*$')
+			if recipient then message = text end
+			if not recipient then
+				local call_header, call_text = body:match('^(.-)%s*,?%s+(на%s+связь.*)$')
+				recipient = call_header and call_header:match('%[([^%[%]]+)%]%s*$')
+				if recipient then message = call_text end
+			end
+			if not recipient then
+				recipient, message = body:match('^(%b[])%s*,%s*(.*)$')
+			end
+		else
+			recipient = address
+			if not recipient then
+				recipient, message = body:match('^(.-)%s+(на%s+связь.*)$')
+			end
+		end
+	end
+	if not recipient or not message:find('связь', 1, true) then return false end
+	recipient = department_tag(recipient)
+	for _, field in ipairs({'my_tag', 'my_tag_en', 'my_tag_en2', 'my_tag_en3'}) do
+		local tag = tags[field]
+		if tag and tag ~= '' then
+			tag = department_tag(u8:decode(tag))
+			if tag ~= '' and tag == recipient then return true end
+		end
+	end
+	return false
 end
 
 function chat_hook_server_message(color_mes, mes)
@@ -29251,60 +29668,23 @@ function chat_hook_server_message(color_mes, mes)
 	end
 	
 	if mescol:find('^%[D%](.+)%[(%d+)%]:') and tab == 'dep' and windows.main[0] then
-		local bool_t = imgui.new.char[110](mes)
-		table.insert(dep_history, ffi.string(bool_t))
-		if ffi.string(bool_t) ~= mes then
-			local icran = ffi.string(bool_t):gsub('%[', '%%['):gsub('%]', '%%]'):gsub('%.', '%%.'):gsub('%-', '%%-'):gsub('%+', '%%+'):gsub('%?', '%%?'):gsub('%$', '%%$'):gsub('%*', '%%*'):gsub('%(', '%%('):gsub('%)', '%%)')
-			local soc_new_char = mes:gsub(icran, '')
-			bool_t = imgui.new.char[110](soc_new_char)
-			table.insert(dep_history, ffi.string(bool_t))
+		for offset = 1, #mes, 109 do
+			table.insert(dep_history, mes:sub(offset, offset + 108))
 		end
 	end
 	
-	if setting.notice.dep and setting.dep.my_tag ~= '' then
-		local call_org = false
-		if mescol:find('%[D%](.+)'..u8:decode(setting.dep.my_tag)..'(.+)связь') and not mescol:find(my.nick .. '%[' .. my.id) then
-			call_org = true
+	if setting.notice.dep and department_call(mescol, my.id, setting.dep) then
+		if setting.cef_notif then
+			cefnotig('{FF5345}[SH]{e3a220} Вашу организацию вызывают в рации департамента!', 3000)
+		else
+			sampAddChatMessage('[SH]{e3a220} Вашу организацию вызывают в рации департамента!', 0xFF5345)
 		end
-		if mescol:find('%[D%](.+)'..u8:decode(setting.dep.my_tag_en)..'(.+)связь') and setting.dep.my_tag_en ~= '' and not mescol:find(my.nick .. '%[' .. my.id) then
-			call_org = true
-		end
-		if mescol:find('%[D%](.+)'..u8:decode(setting.dep.my_tag_en2)..'(.+)связь') and setting.dep.my_tag_en2 ~= '' and not mescol:find(my.nick .. '%[' .. my.id) then
-			call_org = true
-		end
-		if mescol:find('%[D%](.+)'..u8:decode(setting.dep.my_tag_en3)..'(.+)связь') and setting.dep.my_tag_en3 ~= '' and not mescol:find(my.nick .. '%[' .. my.id) then
-			call_org = true
-		end
-		
-		if call_org then
-			local comparison = mes:match('%[(%d+)%]')
-			comparison = tonumber(comparison)
-			lua_thread.create(function()
-				wait(15)
-				EXPORTS.sendRequest()
+		lua_thread.create(function()
+			for i = 1, 18 do
 				wait(200)
-				local found_our = false
-				for i, member in ipairs(members) do
-					if tonumber(member.id) == comparison then
-						found_our = true
-						break
-					end
-				end
-				if not found_our then
-					if not setting.cef_notif then
-						sampAddChatMessage('[SH]{e3a220} Вашу организацию вызывают в рации департамента!', 0xFF5345)
-						sampAddChatMessage('[SH]{e3a220} Вашу организацию вызывают в рации департамента!', 0xFF5345)
-					else
-						cefnotig("{FF5345}[SH]{e3a220} Вашу организацию вызывают в рации департамента!", 3000)
-					end
-					local stop_signal = 0
-					repeat wait(200) 
-						play_beep()
-						stop_signal = stop_signal + 1
-					until stop_signal > 17
-				end
-			end)
-		end
+				play_beep()
+			end
+		end)
 	end
 end
 
@@ -29666,6 +30046,7 @@ function hook.onShowDialog(id, style, title, but_1, but_2, text, payload)
 		if ok and hide == false then return false end
 		if not ok then
 			phone_mb_stop()
+			if stroi.read_members then stroi.read_members.error = 'Ошибка чтения состава. Повторите обновление.' end
 			stroi.want = false
 			stroi.say('Ошибка чтения состава. Повторите обновление.')
 			print('[SH][roster] ' .. tostring(hide))
@@ -29854,117 +30235,16 @@ function hook.onShowDialog(id, style, title, but_1, but_2, text, payload)
 		end
 	end
 	 
-    if id == 2015 and members_wait.members and setting.mb.func then
-        local status, err = pcall(function()
-            local ip, port = sampGetCurrentServerAddress()
-            local server = ip..':'..port
-            if server == '80.66.82.147:7777' then return false end
-            local count = 0
-            members_wait.next_page.bool = false
-            if title:find('{FFFFFF}(.+)%(В сети: (%d+)%)') then
-                org.name, org.online = title:match('{FFFFFF}(.+)%(В сети: (%d+)%)')
-            else
-                org.name = 'Больница VC'
-                org.online = tonumber(title:match('%(В сети: (%d+)%)')) or 0
-            end
-
-            for line in text:gmatch('[^\r\n]+') do
-                count = count + 1
-                if not line:find('Ник') and not line:find('страница') then
-                    local color, nick, id, rank_name, rank_id, color_nil, warns, idk, afk, muted, quests
-                    local clean_line = line:gsub('%s*{%x+}%(%d+ дней%)', '')
-
-                    if line:find('%(Вы%)') then
-                        color, nick, id, rank_name, rank_id, color_nil, warns, idk, afk, muted, quests = 
-                            line:match('{(%x+)}(.-)%((%d+)%){%x+}%(Вы%)\t(.-)%((%d+)%)\t{(%x+)}(%d+) %[(%d+)] / (%d+)%s*(.-)\t(%d+)')
-                    else
-                        color, nick, id, rank_name, rank_id, color_nil, warns, idk, afk, muted, quests = 
-                            clean_line:match('{(%x+)}(.-)%((%d+)%)\t(.-)%((%d+)%)\t{(%x+)}(%d+) %[(%d+)] / (%d+)%s*(.-)\t(%d+)')
-                    end 
-
-                    if nick then
-                        local uniform = (color == '90EE90')
-                        if not setting.mb_tags then
-                            nick = nick:match('([A-Za-z]+_[A-Za-z]+)$') or nick
-                        end
-                        if muted and muted ~= "" then
-                            muted = muted:match('^/%s*(.*)') or muted
-                            nick = nick .. " (" .. muted .. ") "
-                        end
-                        
-                        members[#members + 1] = {
-                            nick = tostring(nick),
-                            id = id,
-                            rank = {
-                                count = tonumber(rank_id),
-                            },
-                            afk = tonumber(afk) or 0,
-                            warns = tonumber(warns) or 0,
-                            rank_name = rank_name,
-                            uniform = uniform
-                        }
-                    end
-                end
-                
-                if line:match('Следующая страница') then
-                    members_wait.next_page.bool = true
-                    members_wait.next_page.i = count - 2
-                end
-            end
-
-            if members_wait.next_page.bool then
-                sampSendDialogResponse(id, 1, members_wait.next_page.i, _)
-                members_wait.next_page.bool = false
-                members_wait.next_page.i = 0
-            else
-                while #members > tonumber(org.online or 0) do
-                    table.remove(members, 1)
-                end
-                sampSendDialogResponse(id, 0, _, _)
-                org.afk = getAfkCount()
-                members_wait.members = false
-                if setting.police_settings.wanted_list.func and (setting.org >= 11 and setting.org <= 15) and not wanted_wait.checking then
-                    lua_thread.create(function()
-                        wait(1100)
-                        wanted_wait.checking = true
-                        wanted_wait.page = 1
-                        emp_wanted_players = {}
-                        sampSendChat('/wanted 1')
-                        wanted_wait.timeout = os.clock() + 5
-                    end)
-                end
-            end
-        end)
-        
-        if not status then
-            local err_msg = string.format('[SH] {FFFFFF}Ошибка в рядке: %s', tostring(err))
-            if not setting.cef_notif then
-                sampAddChatMessage(err_msg, 0xFF5345)
-            else
-                cefnotig(err_msg, 5000)
-            end
-            setting.mb.func = false
-        end
-        
-        return false
-	elseif members_wait.members and id ~= 2015 then
-		dont_show_me_members = true
-		members_wait.members = false
-		members_wait.next_page.bool = false
-		members_wait.next_page.i = 0
-		while #members > tonumber(org.online) do 
-			table.remove(members, 1) 
-		end 
-	elseif dont_show_me_members and id == 2015 then
-		dont_show_me_members = false
-		lua_thread.create(function()
-			wait(0)
-			sampSendDialogResponse(id, 0, nil, nil)
-		end)
-		
-		return false
+	if id == 2015 and members_wait.members then
+		if not sh_audit.members_request_valid() then return end
+		local ok, handled = pcall(sh_audit.members_accept_page, id, title, text)
+		if not ok then
+			sh_audit.members_request_clear()
+			print('[SH Members] ' .. tostring(handled))
+		end
+		if not ok or handled then return false end
 	end
-	
+
 	if id == 25637 and run_sob then
 		sampSendDialogResponse(25637, 1, 0, -1)
 		return false
@@ -30273,6 +30553,11 @@ function extractCommandArgument(text)
 end
 
 function hook.onSendCommand(cmd)
+	local read = stroi and stroi.read_members
+	if read and cmd:match('^/?members%s*$') then
+		read.outgoing = true
+		print('[SH][stroi] /members sent to server')
+	end
 	local lookup = sh_auto_license.pending
 	if lookup and not lookup.sending and cmd:match('^/?id%s+%d+%s*$') then lookup.cancelled = true; sh_auto_license.pending = nil end
 	if sh_license.pending then
@@ -30328,7 +30613,7 @@ function hook.onSendCommand(cmd)
 	end
 
 	if setting.auto_edit then
-		if cmd:find('/do (.+)') or cmd:find('/me (.+)') or cmd:find('/todo (.+)') then
+		if cmd:find('^/do (.+)') or cmd:find('^/me (.+)') or cmd:find('^/todo (.+)') then
 			local result_cmd = cmd:gsub('^([\\/])(.*)', function(first_slash, rest)
 				return first_slash .. rest:gsub('[\\/]', '')
 			end)
@@ -30423,9 +30708,9 @@ function check_and_correct(variable)
 	 elseif variable:match('^/todo (.+)%*(.+)') then
 		local text = variable:sub(7)
 		text = text:gsub('^.', to_upper)
-		local text2 = text:gsub('(.+)*', '')
-		text2 = text2:gsub('^.', to_lower)
-		text = text:gsub('%*(.+)', '')
+		local speech, action = text:match('^(.-)%*(.*)$')
+		local text2 = action:gsub('^.', to_lower)
+		text = speech
 		
 		return '/todo ' .. text .. '*' .. text2
 	end
@@ -30547,9 +30832,20 @@ function onWindowMessage(msg, wparam, lparam)
 		if #keys == 0 and wparam == vkeys.VK_RETURN then consumeWindowMessage(true, false) end
 		for _, key in ipairs(keys) do if dec_to_key(key) == wparam then consumeWindowMessage(true, false); break end end
 	end
-	if wparam == vkeys.VK_RETURN and (msg == 0x100 or msg == 0x101) and autoheal and autoheal.cur and autoheal.wait_until > os.clock() and not sampIsChatInputActive() and not sampIsDialogActive() then
+	if msg == 0x0008 then autoheal.consumed_key = nil end
+	if (key_down or key_up) and autoheal.consumed_key == wparam then
+		if key_up then autoheal.consumed_key = nil end
 		consumeWindowMessage(true, false)
-		if msg == 0x100 then autoheal_go() end
+		return
+	end
+	if key_down and bit.band(lparam, 0x40000000) == 0 and autoheal.cur and autoheal_ok()
+		and autoheal.wait_until > os.clock() and thread:status() == 'dead'
+		and not windows.main[0] and not edit_key and not edit_cmd
+		and not sampIsChatInputActive() and not sampIsDialogActive() and not isGamePaused()
+		and autoheal.matches_key(wparam, autoheal.confirm_key()[2]) then
+		autoheal.consumed_key = wparam
+		consumeWindowMessage(true, false)
+		autoheal_go()
 		return
 	end
 	if wparam == vkeys.VK_RETURN and (msg == 0x100 or msg == 0x101) and automask and automask.wait_until > os.clock() and not sampIsChatInputActive() and not sampIsDialogActive() then
@@ -30586,9 +30882,10 @@ function onWindowMessage(msg, wparam, lparam)
 				consumeWindowMessage(true, false)
 				tkui.close()
 			end
-			if windows.stroi[0] and not stroi.moving then
+			if stroi.is_open() and not stroi.moving and not sh_modal_open and stroi.ui.screen ~= 'list' then
 				consumeWindowMessage(true, false)
-				stroi.close()
+				stroi.back()
+				return
 			end
 			if windows.shpora[0] then
 				consumeWindowMessage(true, false)
@@ -30967,7 +31264,6 @@ stroi = {
 	moving = false, --> идёт перемещение мини-меню
 	ui = {screen = 'list', id = nil, t = 0, closing = false, bufs = {}, del = nil, del_t = 0, dirty = false, dirty_t = 0, scroll_end = false, hold = {}, filter = 'all', confirm = nil, confirm_t = 0, updated = 0, add_id = '', fetching = false}
 }
-windows.stroi = imgui.new.bool(false)
 
 --> ---------- настройки и данные ----------
 function stroi.cfg()
@@ -31207,18 +31503,28 @@ function stroi.valid_player(e)
 		and sampIsPlayerConnected(id) and sampGetPlayerNickname(id) == e.nick
 end
 
-function stroi.members_dialog(id, style, title, text)
-	if not stroi.want or id ~= 2015 then return end
+function stroi.members_dialog(id, style, title, text, respond)
 	local read = stroi.read_members
-	if not read then return end
-	local lines = phone_mb_lines(text)
-	local next_row, page = nil, phone_mb_plain(text)
+	if not stroi.want or not read then return end
+	local plain_title = phone_mb_plain(title)
+	local total = tonumber(plain_title:match('В сети:%s*(%d+)'))
+	local plain_text = phone_mb_plain(text)
+	if id ~= 2015 and (style ~= 4 and style ~= 5 or not total or not plain_text:find('Ник', 1, true)) then return end
+	local function reply(button, row)
+		if respond then respond(button, row) else sampSendDialogResponse(id, button, row, '') end
+	end
+	print(('[SH][stroi] Roster dialog received: id=%d style=%d'):format(id, style))
+	read.deadline = math.min(read.hard_deadline, os.time() + 12)
+	-- The game indexes the actual nonempty roster lines, omitting the table header.
+	local lines = sh_audit.members_page_rows(text)
+	local next_row = sh_audit.members_next_page_row(lines, (id == 2015 or style == 5) and 1 or 0)
+	local page = table.concat(lines, '\n')
 	if read.server ~= table.concat({sampGetCurrentServerAddress()}, ':') then read.error = 'Подключение изменилось.'; stroi.want = false; return false end
 	if read.pages[page] then read.error = 'Сервер повторил страницу состава.'; stroi.want = false; return false end
 	read.pages[page] = true
 	read.page_count = read.page_count + 1
 	if read.page_count > 30 then read.error = 'Слишком много страниц состава.'; stroi.want = false; return false end
-	for i, line in ipairs(lines) do
+	for _, line in ipairs(lines) do
 		local plain = phone_mb_plain(line)
 		local nick, pid = plain:match('([A-Za-z][A-Za-z0-9_]+)%s*%((%d+)%)')
 		if nick then
@@ -31230,18 +31536,18 @@ function stroi.members_dialog(id, style, title, text)
 				end
 			end
 		end
-		if plain:find('Следующая страница', 1, true) then next_row = i - 1 - (style == 5 and 1 or 0) end
 	end
 	if read.error then
 		stroi.want = false
-		sampSendDialogResponse(id, 0, 0, '')
-	elseif next_row and next_row >= 0 then
-		sampSendDialogResponse(id, 1, next_row, '')
+		reply(0, 0)
+	elseif next_row ~= nil then
+		read.requested_row = next_row
+		print(('[SH][stroi] Next roster page: page=%d row=%d entries=%d'):format(read.page_count, next_row, #read.list))
+		reply(1, next_row)
 	else
-		local total = tonumber(phone_mb_plain(title):match('В сети:%s*(%d+)'))
-		if #read.list == 0 and total ~= 0 then read.error = 'Не удалось распознать состав /members.' end
+		if (#read.list == 0 and total ~= 0) or (total and #read.list < total) then read.error = 'Не удалось распознать состав /members.' end
 		stroi.want = false
-		sampSendDialogResponse(id, 0, 0, '')
+		reply(0, 0)
 		if not read.error then
 			stroi.own_members, stroi.own_updated, stroi.own_org = read.list, os.clock(), tonumber(setting.org)
 			stroi.own_server = read.server
@@ -31262,29 +31568,92 @@ function phone_mb_async(task)
 end
 
 function stroi.fetch_own(token)
+	local wait_until = os.time() + 18
+	while token == stroi.refresh_token and (members_wait.members or wanted_wait.checking
+		or sampIsDialogActive() or sampIsChatInputActive() or os.time() < list_schedule.after) do
+		if os.time() >= wait_until then
+			stroi.say('Список состава занят. Повторите обновление.')
+			return false
+		end
+		wait(100)
+	end
+	if token ~= stroi.refresh_token or not sampIsLocalPlayerSpawned() then return false end
 	stroi.own_updated = 0
-	stroi.read_members = {server = table.concat({sampGetCurrentServerAddress()}, ':'), list = {}, seen = {}, pages = {}, page_count = 0}
-	stroi.want = true
+	local now = os.time()
+	local ip, port = sampGetCurrentServerAddress()
+	local server = table.concat({ip, port}, ':')
+	local cached = sh_audit.members_snapshot
+	if cached and cached.ip == ip and cached.port == port and cached.org == setting.org
+		and now - cached.time >= 0 and now - cached.time <= 25 then
+		local verified = {}
+		for _, row in ipairs(cached.rows) do
+			local id = tonumber(row.id)
+			local rank = tonumber(row.rank.count)
+			if id and rank and rank > 0 and sampIsPlayerConnected(id) then
+				local nick = sampGetPlayerNickname(id)
+				if type(nick) == 'string' and row.identity == nick then
+					verified[#verified + 1] = {nick = nick, id = id, rank = {count = rank}, afk = row.afk}
+				end
+			end
+		end
+		if #verified == #cached.rows then
+			stroi.own_members, stroi.own_updated, stroi.own_org, stroi.own_server = verified, os.clock(), tonumber(setting.org), server
+			return true
+		end
+	end
+	local read = {
+		server = server,
+		list = {}, seen = {}, pages = {}, page_count = 0,
+		deadline = now + 15, hard_deadline = now + 45
+	}
+	stroi.read_members, stroi.want = read, true
+	print('[SH][stroi] Requesting roster via /members')
 	sampSendChat('/members')
-	local deadline = os.clock() + 15
-	while stroi.want and os.clock() < deadline and token == stroi.refresh_token do wait(50) end
+	local retry_at = now + 6
+	while stroi.want and os.time() <= read.deadline and token == stroi.refresh_token do
+		wait(50)
+		if not stroi.want or token ~= stroi.refresh_token then break end
+		if sampIsDialogActive() then
+			local id, style = sampGetCurrentDialogId(), sampGetCurrentDialogType()
+			if id == 2015 or style == 4 or style == 5 then
+				local title, text = sampGetDialogCaption(), sampGetDialogText()
+				if not read.pages[table.concat(sh_audit.members_page_rows(text), '\n')] then
+					stroi.members_dialog(id, style, title, text, function(button, row)
+						if button == 1 then sampSetCurrentDialogListItem(row) end
+						sampCloseCurrentDialogWithButton(button)
+					end)
+				end
+			end
+		elseif read.page_count == 0 and retry_at and os.time() >= retry_at and not sampIsChatInputActive() then
+			retry_at = nil
+			print('[SH][stroi] Retrying /members via chat input')
+			sampProcessChatInput('/members')
+		end
+	end
+	local timed_out = stroi.want
+	if timed_out then print(('[SH][stroi] Roster timeout: pages=%d next_row=%s'):format(read.page_count, tostring(read.requested_row))) end
+	if stroi.read_members == read then
+		stroi.read_members, stroi.want = nil, false
+		list_schedule.after = os.time() + 2
+	end
 	if token ~= stroi.refresh_token then return false end
-	if stroi.want then stroi.want = false; stroi.say('Не получен ответ /members. Наказания недоступны.'); return false end
-	if stroi.read_members.error then stroi.say(stroi.read_members.error); return false end
+	if timed_out then stroi.say('Не получен ответ /members. Наказания недоступны.'); return false end
+	if read.error then stroi.say(read.error); return false end
 	return stroi.own_updated > 0
 end
+
 function stroi.run_valid(run)
 	return not run.cancel and sampIsLocalPlayerSpawned() and stroi.cfg().func
 		and (not run.server or run.server == table.concat({sampGetCurrentServerAddress()}, ':'))
 		and (not run.org_id or run.org_id == tonumber(setting.org))
 end
 function stroi.can_confirm()
-	return not sampIsChatInputActive() and not sampIsDialogActive() and not isGamePaused() and not edit_key and not edit_cmd and not windows.main[0]
+	return not sampIsChatInputActive() and not sampIsDialogActive() and not isGamePaused() and not edit_key and not edit_cmd and (not windows.main[0] or (stroi.is_open() and not imgui.GetIO().WantTextInput))
 end
 
 function stroi.refresh()
 	local ui = stroi.ui
-	if ui.fetching or sampIsChatInputActive() or phone_mb.active or members_wait.members then return end
+	if ui.fetching or sampIsChatInputActive() or phone_mb.active then return end
 	if not stroi.cfg().func or not sampIsLocalPlayerSpawned() then return end
 	local f = stroi.find(ui.id)
 	if not f or #f.orgs == 0 then return end
@@ -31295,7 +31664,7 @@ function stroi.refresh()
 	stroi.job_stop()
 	lua_thread.create(function()
 		local ok, err = pcall(function()
-			if stroi.has_org(f, oid) then stroi.fetch_own(token) end
+			local own_received = stroi.has_org(f, oid) and stroi.fetch_own(token)
 			if token ~= stroi.refresh_token or not stroi.cfg().func then return end
 			local need = {}
 			for _, id in ipairs(orgs) do if id ~= oid then need[#need + 1] = id end end
@@ -31306,12 +31675,12 @@ function stroi.refresh()
 				if token ~= stroi.refresh_token then return end
 				if phone_mb.active then phone_mb_stop('Превышено время сбора состава.') end
 			end
-			if stroi.has_org(f, oid) and os.clock() - stroi.own_updated > 60 then stroi.fetch_own(token) end
+			if own_received and os.clock() - stroi.own_updated > 60 then stroi.fetch_own(token) end
 			if oid ~= tonumber(setting.org) then stroi.own_updated = 0 end
 			ui.updated = os.time()
 		end)
 		if token == stroi.refresh_token then
-			stroi.want, ui.fetching = false, false
+			stroi.want, stroi.read_members, ui.fetching = false, nil, false
 			if not ok then
 				phone_mb_stop()
 				stroi.say('Не удалось обновить состав. Повторите попытку.')
@@ -31327,12 +31696,17 @@ function stroi.open_roster(f)
 	if not ui.fetching then stroi.refresh() end
 end
 
-function stroi.people(f) --> кнопка с человечком на карточке
-	if #f.orgs == 0 then
+function stroi.people(f)
+	local org_id = tonumber(setting.org)
+	if org_id == 15 or not stroi.org_names[org_id] then
 		stroi.ui.screen, stroi.ui.id = 'orgs', f.id
-	else
-		stroi.open_roster(f)
+		return
 	end
+	if #f.orgs ~= 1 or f.orgs[1] ~= org_id then
+		f.orgs = {org_id}
+		stroi.touch()
+	end
+	stroi.open_roster(f)
 end
 
 function stroi.punish_targets(f, list)
@@ -31504,7 +31878,7 @@ function stroi.unreg_all()
 			end
 		end
 	end
-	if windows.stroi[0] then stroi.close() end
+	if stroi.is_open() then stroi.leave_editor() end
 end
 
 function stroi.reg_keys() --> горячие клавиши строёв (при запуске скрипта)
@@ -31543,7 +31917,7 @@ function stroi.cmd(arg) --> /stroi
 		if stroi.run.active then stroi.stop() else stroi.say('Сейчас строй не запущен.') end
 		return
 	end
-	if windows.stroi[0] and not stroi.ui.closing then stroi.close() else stroi.open() end
+	if stroi.is_open() then stroi.close() else stroi.open() end
 end
 
 --> ---------- запуск строя ----------
@@ -31671,8 +32045,8 @@ function stroi.move_mode()
 		stroi.moving = true
 		local s = stroi.cfg()
 		local backup = {x = s.pos.x, y = s.pos.y}
-		local was_open = windows.stroi[0]
-		windows.stroi[0] = false
+		local was_open = windows.main[0]
+		windows.main[0] = false
 		sampSetCursorMode(4)
 		stroi.say('Нажмите {FF6060}ЛКМ{FFFFFF}, чтобы применить или {FF6060}ESC{FFFFFF} для отмены.')
 		wait(250)
@@ -31692,19 +32066,28 @@ function stroi.move_mode()
 		end
 		sampSetCursorMode(0)
 		stroi.moving = false
-		windows.stroi[0] = was_open
+		windows.main[0] = was_open
 	end)
 end
 
 --> ---------- открытие / редактирование ----------
+function stroi.is_open()
+	return windows.main[0] and tab == 'settings' and tab_settings == 25
+end
+
 function stroi.open()
-	local ui = stroi.ui
-	ui.screen, ui.id, ui.t, ui.closing, ui.del = 'list', nil, 0, false, nil
-	windows.stroi[0] = true
+	if not windows.main[0] then open_main() end
+	if not windows.main[0] then return end
+	stroi.leave_editor()
+	tab, name_tab, tab_settings = 'settings', u8'Главное', 25
+	bool_reset_tab_scroll, bool_go_stat_set = true, false
+	stroi.ui.sidebar_pending = true
 end
 
 function stroi.close()
-	if windows.stroi[0] then stroi.ui.closing = true end
+	if not stroi.is_open() then return end
+	stroi.leave_editor()
+	open_main()
 end
 
 function stroi.edit(id)
@@ -31716,6 +32099,8 @@ function stroi.back()
 	local ui = stroi.ui
 	if ui.screen == 'edit' then
 		stroi.leave_editor()
+	elseif ui.screen == 'settings' then
+		ui.screen = 'list'
 	elseif ui.screen == 'orgs' then
 		local f = stroi.find(ui.id)
 		ui.screen = (f and #f.orgs > 0) and 'roster' or 'list'
@@ -31843,23 +32228,26 @@ function stroi.btn(id, x, y, w, h, label, glyph, kind, disabled)
 	local clicked = imgui.InvisibleButton(u8'##stroi_' .. id, imgui.ImVec2(w, h))
 	local hov, act = imgui.IsItemHovered(), imgui.IsItemActive()
 	if disabled then clicked, hov, act = false, false, false end
-	local black = imgui.ImVec4(0, 0, 0, 1)
-	local bg, fg
-	if kind == 'accent' then
-		bg = stroi.mix(cl.def, black, act and 0.20 or (hov and 0.08 or 0))
-		fg = stroi.on_acc()
+	local bg, fg, border
+	if disabled then
+		bg = stroi.alpha(cl.bg, 0.4)
+		fg = stroi.alpha(cl.text, 0.35)
+		border = stroi.alpha(cl.line, 0.45)
 	elseif kind == 'danger' then
-		bg = imgui.ImVec4(0.90, 0.28, 0.30, act and 0.85 or 1.00)
-		fg = imgui.ImVec4(1, 1, 1, 1)
-	elseif kind == 'ghost' then
-		bg = (hov or act) and cl.bg or stroi.alpha(cl.bg, 0)
-		fg = hov and stroi.acc_text() or cl.text
+		bg = imgui.ImVec4(0.42, 0.14, 0.16, (act or hov) and 1 or 0.92)
+		fg = imgui.ImVec4(1, 0.9, 0.9, 1)
+		border = imgui.ImVec4(0.82, 0.28, 0.32, 1)
+	elseif kind == 'accent' then
+		bg = act and stroi.mix(cl.def, imgui.ImVec4(0, 0, 0, 1), 0.18) or cl.def
+		fg = stroi.on_acc()
+		if hov or act then border = stroi.mix(cl.def, fg, 0.55) end
 	else
-		bg = act and stroi.mix(cl.bg, cl.def, 0.25) or (hov and stroi.mix(cl.bg, cl.def, 0.12) or cl.bg)
-		fg = cl.text
+		bg = act and cl.def or ((kind == 'ghost' and not hov) and stroi.alpha(cl.bg, 0) or cl.bg)
+		fg = act and stroi.on_acc() or cl.text
+		border = (hov or act) and cl.def or (kind ~= 'ghost' and cl.line or nil)
 	end
-	if disabled then bg, fg = stroi.alpha(bg, 0.5), stroi.alpha(fg, 0.5) end
-	if bg.w > 0.01 then gui.Draw({x, y}, {w, h}, bg, 8, 15) end
+	if bg.w > 0.01 then gui.Draw({x, y}, {w, h}, bg, 5, 15) end
+	if border then gui.DrawEmp({x, y}, {w, h}, border, 5, 15, 1) end
 	local cy = y + h / 2
 	if label and glyph then
 		local gw = stroi.tw(glyph, fa_font[3])
@@ -31917,7 +32305,7 @@ end
 function stroi.card(idx, f, y, W) --> карточка строя; true - строй удалён
 	stroi.fix(f) --> строи, созданные до обновления, получают новые поля
 	local ui, run = stroi.ui, stroi.run
-	local x, cw, ch = 12, W - 8 - 24, 74
+	local x, cw, ch = 12, W - 16, 74
 	local muted = imgui.ImVec4(0.50, 0.50, 0.50, 0.90)
 	local is_run = run.active and run.id == f.id
 	gui.DrawBox({x, y}, {cw, ch}, cl.tab, is_run and stroi.alpha(cl.def, 0.75) or cl.line, 8, 15)
@@ -31925,7 +32313,6 @@ function stroi.card(idx, f, y, W) --> карточка строя; true - строй удалён
 	gui.DrawCircle({x + 38, y + ch / 2}, 19, stroi.alpha(cl.def, 0.16))
 	stroi.ico(x + 38, y + ch / 2, fa.USERS, 4, stroi.acc_text())
 	stroi.tu(x + 70, y + 14, stroi.fit(stroi.title(f, idx), bold_font[1], 210), bold_font[1])
-	stroi.tu(x + 70, y + 42, u8(stroi.summary(f)), bold_font[4], muted)
 	local by = y + (ch - 34) / 2
 	local bx3 = x + cw - 14 - 34
 	local bx2 = bx3 - 8 - 34
@@ -31933,8 +32320,7 @@ function stroi.card(idx, f, y, W) --> карточка строя; true - строй удалён
 	local bx1 = bxp - 8 - 112
 	--> удалить (двойное нажатие)
 	local confirming = ui.del == f.id and os.clock() - ui.del_t < 3
-	local c3, h3 = stroi.btn('del' .. f.id, bx3, by, 34, 34, nil, fa.TRASH, confirming and 'danger' or 'soft')
-	if h3 then imgui.SetTooltip(confirming and u8'Нажмите ещё раз для удаления' or u8'Удалить строй') end
+	local c3 = stroi.btn('del' .. f.id, bx3, by, 34, 34, nil, fa.TRASH, confirming and 'danger' or 'soft')
 	if c3 then
 		if confirming then
 			stroi.remove(f.id)
@@ -31943,13 +32329,11 @@ function stroi.card(idx, f, y, W) --> карточка строя; true - строй удалён
 		ui.del, ui.del_t = f.id, os.clock()
 	end
 	--> изменить
-	local c2, h2 = stroi.btn('edit' .. f.id, bx2, by, 34, 34, nil, fa.PEN, 'soft')
-	if h2 then imgui.SetTooltip(u8'Настроить строй') end
+	local c2 = stroi.btn('edit' .. f.id, bx2, by, 34, 34, nil, fa.PEN, 'soft')
 	if c2 then stroi.edit(f.id) end
 	--> состав строя (человечек)
-	local cp, hp = stroi.btn('ppl' .. f.id, bxp, by, 34, 34, nil, fa.USER, 'soft')
+	local cp = stroi.btn('ppl' .. f.id, bxp, by, 34, 34, nil, fa.USER, 'soft')
 	if #f.orgs > 0 then gui.DrawCircle({bxp + 29, by + 5}, 4, cl.def) end
-	if hp then imgui.SetTooltip(#f.orgs > 0 and (u8'Состав строя: ' .. u8(stroi.org_label(f))) or u8'Выбрать фракцию и открыть состав') end
 	if cp then stroi.people(f) end
 	--> запуск / стоп
 	if is_run then
@@ -31957,10 +32341,10 @@ function stroi.card(idx, f, y, W) --> карточка строя; true - строй удалён
 	else
 		if stroi.btn('run' .. f.id, bx1, by, 112, 34, 'Запуск', fa.PLAY, 'accent', run.active) then stroi.start(f.id) end
 	end
-	--> команда и клавиша
-	local xr = bx1 - 14
-	if f.key[1] ~= '' then xr = stroi.chip(xr, y + 14, f.key[1], fa.KEYBOARD) end
-	if f.cmd ~= '' then xr = stroi.chip(xr, y + 14, '/' .. f.cmd, fa.TERMINAL) end
+	local summary = u8(stroi.summary(f))
+	if f.cmd ~= '' then summary = summary .. '  /' .. f.cmd end
+	if f.key[1] ~= '' then summary = summary .. '  ' .. f.key[1] end
+	stroi.tu(x + 70, y + 42, stroi.fit(summary, bold_font[4], bx1 - x - 80), bold_font[4], muted)
 	return false
 end
 
@@ -31968,7 +32352,7 @@ function stroi.draw_list(W, H)
 	local s, ui = stroi.cfg(), stroi.ui
 	local muted = imgui.ImVec4(0.50, 0.50, 0.50, 0.90)
 	if #s.list == 0 then
-		local cx, cy = W / 2, H / 2 - 10
+		local cx, cy = W / 2, (H + 63) / 2
 		imgui.SetCursorPos(imgui.ImVec2(cx - 38, cy - 98))
 		local clicked = imgui.InvisibleButton(u8'##stroi_empty_add', imgui.ImVec2(76, 76))
 		local hov = imgui.IsItemHovered()
@@ -31979,15 +32363,18 @@ function stroi.draw_list(W, H)
 		stroi.ctext(cx, cy + 44, u8'Нажмите + чтобы создать новые настройки', nil, muted)
 		return
 	end
-	imgui.SetCursorPos(imgui.ImVec2(4, 46))
-	imgui.BeginChild(u8'##stroi_list', imgui.ImVec2(W - 8, H - 58), false, imgui.WindowFlags.NoMove + imgui.WindowFlags.NoScrollWithMouse)
+	imgui.SetCursorPos(imgui.ImVec2(4, 63))
+	imgui.BeginChild(u8'##stroi_list', imgui.ImVec2(W + 12, H - 75), false, imgui.WindowFlags.NoMove + imgui.WindowFlags.NoScrollWithMouse)
 	imgui.Scroller(u8'Список строёв', img_step[1][0], img_duration[1][0])
 	local y = 12
 	for idx, f in ipairs(s.list) do
 		if stroi.card(idx, f, y, W) then break end
 		y = y + 84
 	end
-	imgui.SetCursorPos(imgui.ImVec2(0, y))
+	if ui.screen == 'list' and stroi.btn('add_formation', 12 + (W - 16 - 122) * 0.5, y, 122, 30, 'Добавить', fa.PLUS, 'soft') then
+		stroi.create()
+	end
+	imgui.SetCursorPos(imgui.ImVec2(0, y + 38))
 	imgui.Dummy(imgui.ImVec2(0, 4))
 	imgui.EndChild()
 end
@@ -31999,6 +32386,8 @@ function stroi.draw_edit(W, H)
 	if not f then ui.screen = 'list' return end
 	local muted = imgui.ImVec4(0.50, 0.50, 0.50, 0.90)
 	local PH = H - 52 - 62
+	local timeline_width = W - 280
+	local action_width = timeline_width - 60
 	--> левая панель
 	gui.DrawBox({16, 52}, {240, PH}, cl.tab, cl.line, 8, 15)
 	stroi.tu(30, 64, u8'Название', bold_font[4], muted)
@@ -32026,10 +32415,7 @@ function stroi.draw_edit(W, H)
 	end
 	gui.DrawLine({30, 248}, {242, 248}, cl.line)
 	stroi.tu(30, 258, u8'Мини-меню на экране', bold_font[4], muted)
-	if stroi.btn('move', 30, 280, 212, 30, 'Переместить...', fa.UP_DOWN_LEFT_RIGHT, 'soft') then stroi.move_mode() end
-	local kn = stroi.fit(setting.enter_key[2], bold_font[4], 60)
-	local hint = {u8'Каждая строка - отдельное', u8'сообщение, пауза 2 сек.', u8'После таймера нажмите ' .. kn .. ',', u8'чтобы перейти дальше.'}
-	for i, h in ipairs(hint) do stroi.tu(30, 324 + (i - 1) * 16, h, bold_font[4], muted) end
+	if stroi.btn('move', 30, 274, 212, 28, 'Переместить...', fa.UP_DOWN_LEFT_RIGHT, 'soft') then stroi.move_mode() end
 	--> окна назначения команды / клавиши
 	if edit_cmd then
 		local r = cmd_edit(u8'Строй: команда', cur_cmd)
@@ -32048,7 +32434,7 @@ function stroi.draw_edit(W, H)
 	local AH, TH = 144, 82
 	local n = #f.actions
 	imgui.SetCursorPos(imgui.ImVec2(268, 52))
-	imgui.BeginChild(u8'##stroi_timeline', imgui.ImVec2(436, PH), false, imgui.WindowFlags.NoMove + imgui.WindowFlags.NoScrollWithMouse)
+	imgui.BeginChild(u8'##stroi_timeline', imgui.ImVec2(timeline_width, PH), false, imgui.WindowFlags.NoMove + imgui.WindowFlags.NoScrollWithMouse)
 	imgui.Scroller(u8'Действия строя', img_step[1][0], img_duration[1][0])
 	local y0 = 2
 	if n > 1 then
@@ -32057,22 +32443,22 @@ function stroi.draw_edit(W, H)
 	local del_action = nil
 	for i = 1, n do
 		local y = y0 + (i - 1) * (AH + TH + 16)
-		gui.DrawBox({44, y}, {372, AH}, cl.tab, cl.line, 8, 15)
+		gui.DrawBox({44, y}, {action_width, AH}, cl.tab, cl.line, 8, 15)
 		gui.DrawCircle({24, y + 22}, 12, cl.def)
 		stroi.ctext(24, y + 14, tostring(i), bold_font[4], stroi.on_acc())
 		stroi.tu(62, y + 12, u8('Действие ') .. i)
 		if n > 1 then
-			local cd, hd = stroi.btn('delact' .. i, 44 + 372 - 34, y + 6, 26, 26, nil, fa.XMARK, 'ghost')
+			local cd, hd = stroi.btn('delact' .. i, 44 + action_width - 34, y + 6, 26, 26, nil, fa.XMARK, 'ghost')
 			if hd then imgui.SetTooltip(u8'Удалить действие') end
 			if cd then del_action = i end
 		end
-		gui.Draw({56, y + 40}, {348, 78}, cl.bg, 6, 15)
+		gui.Draw({56, y + 40}, {action_width - 24, 78}, cl.bg, 6, 15)
 		local buf = stroi.buf(f, i)
 		imgui.PushStyleColor(imgui.Col.FrameBg, imgui.ImVec4(0, 0, 0, 0))
 		imgui.PushStyleVarVec2(imgui.StyleVar.FramePadding, imgui.ImVec2(8, 6))
 		imgui.PushFont(font[3])
 		imgui.SetCursorPos(imgui.ImVec2(56, y + 40))
-		local changed = imgui.InputTextMultiline(u8'##stroi_act' .. f.id .. '_' .. i, buf, ffi.sizeof(buf), imgui.ImVec2(348, 78))
+		local changed = imgui.InputTextMultiline(u8'##stroi_act' .. f.id .. '_' .. i, buf, ffi.sizeof(buf), imgui.ImVec2(action_width - 24, 78))
 		local active = imgui.IsItemActive()
 		imgui.PopFont()
 		imgui.PopStyleVar(1)
@@ -32086,15 +32472,14 @@ function stroi.draw_edit(W, H)
 			stroi.tu(66, y + 64, u8'/r У вас 5 минут!', bold_font[4], stroi.alpha(muted, 0.55))
 		end
 		local cnt = #stroi.lines(f.actions[i].text)
-		stroi.tu(62, y + 122, u8(string.format('Сообщений: %d   ·   пауза %d сек между ними', cnt, stroi.delay / 1000)), bold_font[4], muted)
+		stroi.tu(62, y + 122, stroi.fit(u8(string.format('Сообщений: %d   ·   пауза %d сек между ними', cnt, stroi.delay / 1000)), bold_font[4], action_width - 26), bold_font[4], muted)
 		--> плашка таймера после действия
 		if i < n then
 			local py = y + AH + 8
 			local t = f.timers[i] or 0
-			gui.DrawBox({44, py}, {372, TH}, stroi.mix(cl.tab, cl.def, 0.07), stroi.alpha(cl.def, 0.40), 8, 15)
-			stroi.ico(66, py + 24, fa.CLOCK, 4, stroi.acc_text())
-			stroi.tu(82, py + 15, u8'Таймер')
-			local sx0 = 170
+			gui.DrawBox({44, py}, {action_width, TH}, stroi.mix(cl.tab, cl.def, 0.07), stroi.alpha(cl.def, 0.40), 8, 15)
+			stroi.tu(52, py + 15, u8'Таймер')
+			local sx0 = 99
 			local m, sc = math.floor(t / 60), t % 60
 			local d = 0
 			if stroi.spin('m_dec' .. i, sx0, py + 12, 22, 34, fa.ANGLE_LEFT) then d = -60 end
@@ -32110,13 +32495,14 @@ function stroi.draw_edit(W, H)
 			end
 			local presets = {30, 60, 120, 300, 600}
 			for k, v in ipairs(presets) do
-				local px = 60 + (k - 1) * 64
+				local preset_width = math.floor((action_width - 32) / 5)
+				local px = 56 + (k - 1) * preset_width
 				local sel = (t == v)
 				imgui.SetCursorPos(imgui.ImVec2(px, py + 54))
-				local cp = imgui.InvisibleButton(u8'##stroi_pr' .. i .. '_' .. k, imgui.ImVec2(56, 20))
+				local cp = imgui.InvisibleButton(u8'##stroi_pr' .. i .. '_' .. k, imgui.ImVec2(preset_width - 4, 20))
 				local hp = imgui.IsItemHovered()
-				gui.Draw({px, py + 54}, {56, 20}, sel and cl.def or (hp and stroi.mix(cl.bg, cl.def, 0.14) or cl.bg), 6, 15)
-				stroi.ctext(px + 28, py + 56, stroi.fmt(v), bold_font[4], sel and stroi.on_acc() or nil)
+				gui.Draw({px, py + 54}, {preset_width - 4, 20}, sel and cl.def or (hp and stroi.mix(cl.bg, cl.def, 0.14) or cl.bg), 6, 15)
+				stroi.ctext(px + (preset_width - 4) * 0.5, py + 56, stroi.fmt(v), bold_font[4], sel and stroi.on_acc() or nil)
 				if cp then
 					f.timers[i] = v
 					stroi.touch()
@@ -32125,7 +32511,7 @@ function stroi.draw_edit(W, H)
 		end
 	end
 	local y_end = y0 + (n - 1) * (AH + TH + 16) + AH + 12
-	if stroi.btn('add_act', 44, y_end, 372, 40, 'Добавить действие', fa.PLUS, 'soft') then
+	if stroi.btn('add_act', 44, y_end, action_width, 40, 'Добавить действие', fa.PLUS, 'soft') then
 		table.insert(f.timers, 0)
 		table.insert(f.actions, {text = ''})
 		ui.bufs[f.id] = nil
@@ -32149,7 +32535,7 @@ function stroi.draw_edit(W, H)
 	--> нижняя панель
 	gui.DrawLine({4, H - 56}, {W - 4, H - 56}, cl.line)
 	if stroi.btn('test', 16, H - 46, 170, 34, 'Запустить строй', fa.PLAY, 'soft', stroi.run.active) then stroi.start(f.id) end
-	stroi.tu(200, H - 37, u8'Изменения сохраняются автоматически', bold_font[4], muted)
+	stroi.tu(195, H - 37, u8'Автосохранение', bold_font[4], muted)
 	if stroi.btn('done', W - 16 - 140, H - 46, 140, 34, 'Готово', fa.CHECK, 'accent') then stroi.leave_editor() end
 end
 
@@ -32160,10 +32546,15 @@ function stroi.draw_orgs(W, H)
 	local muted = imgui.ImVec4(0.50, 0.50, 0.50, 0.90)
 	stroi.ctext(W / 2, 52, u8'Выберите фракцию для этого строя', bold_font[1])
 	stroi.ctext(W / 2, 80, u8'Можно выбрать несколько. Обновление: ваша фракция через /members,', bold_font[4], muted)
-	stroi.ctext(W / 2, 96, u8'остальные — скрыто через телефон. Можно добавить вручную по ID.', bold_font[4], muted)
-	local cw, ch, gx, gy = 220, 46, 14, 10
+	stroi.ctext(W / 2, 96, u8'остальные через телефон. Можно добавить вручную по ID.', bold_font[4], muted)
+	imgui.SetCursorPos(imgui.ImVec2(12, 117))
+	imgui.BeginChild('##stroi_org_grid', imgui.ImVec2(W - 24, H - 177), false,
+		imgui.WindowFlags.NoScrollWithMouse)
+	imgui.Scroller('##stroi_org_grid', img_step[1][0], img_duration[1][0])
+	local gx, gy, ch = 9, 8, 44
+	local cw = math.floor((W - 24 - 20 - 2 * gx) / 3)
 	for i = 1, #stroi.org_names do
-		local x, y = 16 + ((i - 1) % 3) * (cw + gx), 124 + math.floor((i - 1) / 3) * (ch + gy)
+		local x, y = 3 + ((i - 1) % 3) * (cw + gx), 4 + math.floor((i - 1) / 3) * (ch + gy)
 		local sel = stroi.has_org(f, i)
 		imgui.SetCursorPos(imgui.ImVec2(x, y))
 		local clicked = imgui.InvisibleButton(u8'##stroi_org' .. i, imgui.ImVec2(cw, ch))
@@ -32176,6 +32567,9 @@ function stroi.draw_orgs(W, H)
 		if i == setting.org then stroi.tu(x + cw - 12 - stroi.tw(u8'ваша', bold_font[4]), y + 8, u8'ваша', bold_font[4], stroi.acc_text()) end
 		if clicked then stroi.toggle_org(f, i) end
 	end
+	imgui.SetCursorPos(imgui.ImVec2(0, 4 + math.ceil(#stroi.org_names / 3) * (ch + gy)))
+	imgui.Dummy(imgui.ImVec2(1, 1))
+	imgui.EndChild()
 	gui.DrawLine({4, H - 56}, {W - 4, H - 56}, cl.line)
 	stroi.tu(16, H - 37, u8('Выбрано фракций: ') .. #f.orgs, bold_font[4], muted)
 	if stroi.btn('orgs_done', W - 16 - 140, H - 46, 140, 34, 'Готово', fa.CHECK, 'accent') then
@@ -32201,21 +32595,21 @@ function stroi.mark_btn(id, x, y, glyph, active, kind) --> кнопка отметки (галоч
 	return clicked
 end
 
-function stroi.member_row(f, e, v, y)
-	local x, w = 0, 456
+function stroi.member_row(f, e, v, y, w)
+	local x = 2
 	local tint = cl.tab
 	if v == 'p' then tint = stroi.mix(cl.tab, cl.def, 0.14) elseif v == 'a' then tint = stroi.mix(cl.tab, imgui.ImVec4(0.90, 0.28, 0.30, 1), 0.14) end
 	gui.DrawBox({x, y}, {w, 38}, tint, cl.line, 8, 15)
 	if stroi.mark_btn('p' .. e.key, x + 6, y + 5, fa.CHECK, v == 'p', 'p') then stroi.mark(f, e.key, 'p') end
 	if stroi.mark_btn('a' .. e.key, x + 40, y + 5, fa.XMARK, v == 'a', 'a') then stroi.mark(f, e.key, 'a') end
-	stroi.tu(x + 80, y + 10, stroi.fit(e.nick, nil, 196))
+	stroi.tu(x + 80, y + 10, stroi.fit(e.nick, nil, w - 190))
 	local muted = imgui.ImVec4(0.50, 0.50, 0.50, 0.90)
 	if e.rank > 0 then
-		gui.Draw({x + 284, y + 9}, {24, 20}, cl.bg, 6, 15)
-		stroi.ctext(x + 296, y + 11, tostring(e.rank), bold_font[4])
+		gui.Draw({x + w - 104, y + 9}, {24, 20}, cl.bg, 6, 15)
+		stroi.ctext(x + w - 92, y + 11, tostring(e.rank), bold_font[4])
 	end
-	stroi.tu(x + 318, y + 12, u8('ID ') .. e.id, bold_font[4], muted)
-	if e.afk > 0 then stroi.tu(x + 376, y + 12, 'AFK ' .. e.afk, bold_font[4], imgui.ImVec4(0.95, 0.65, 0.20, 1)) end
+	stroi.tu(x + w - 74, y + 12, u8('ID ') .. e.id, bold_font[4], muted)
+	if e.afk > 0 then stroi.tu(x + w - 74, y + 23, 'AFK ' .. e.afk, bold_font[4], imgui.ImVec4(0.95, 0.65, 0.20, 1)) end
 end
 
 function stroi.draw_roster(W, H)
@@ -32253,32 +32647,38 @@ function stroi.draw_roster(W, H)
 	stroi.tu(W - 16 - stroi.tw(u8(info), bold_font[4]), 56, u8(info), bold_font[4], muted)
 	--> фильтр
 	local segs = {{'all', 'Все', 'Все', #list}, {'p', 'Присутствуют', 'Присутств.', cp}, {'a', 'Отсутствуют', 'Отсутств.', ca}, {'n', 'Не отмечены', 'Не отмеч.', cn}}
-	local total = 0
-	for _, sg in ipairs(segs) do total = total + stroi.tw(u8(sg[2]) .. ' (' .. sg[4] .. ')', bold_font[4]) + 28 end
-	local short = total > 468
+	local gap = 6
+	local w = math.floor((W - 32 - gap * (#segs - 1)) / #segs)
 	local sx0 = 16
 	for _, sg in ipairs(segs) do
-		local label = u8(short and sg[3] or sg[2]) .. ' (' .. sg[4] .. ')'
-		local w = stroi.tw(label, bold_font[4]) + 22
+		local suffix = ' (' .. sg[4] .. ')'
+		local label = u8(sg[2]) .. suffix
+		if stroi.tw(label, bold_font[4]) > w - 12 then label = u8(sg[3]) .. suffix end
+		label = stroi.fit(label, bold_font[4], w - 12)
 		imgui.SetCursorPos(imgui.ImVec2(sx0, 84))
 		local c = imgui.InvisibleButton(u8'##stroi_flt' .. sg[1], imgui.ImVec2(w, 28))
-		local hv = imgui.IsItemHovered()
-		local sel = ui.filter == sg[1]
-		gui.Draw({sx0, 84}, {w, 28}, sel and cl.def or (hv and stroi.mix(cl.bg, cl.def, 0.14) or cl.bg), 8, 15)
-		stroi.tu(sx0 + 11, 91, label, bold_font[4], sel and stroi.on_acc() or nil)
+		local hover, pressed = imgui.IsItemHovered(), imgui.IsItemActive()
+		local selected = ui.filter == sg[1]
+		local fill = (selected or pressed) and cl.def or cl.bg
+		local border = (hover or pressed) and (selected and stroi.mix(cl.def, stroi.on_acc(), 0.55) or cl.def)
+			or (not selected and cl.line or nil)
+		gui.Draw({sx0, 84}, {w, 28}, fill, 5, 15)
+		if border then gui.DrawEmp({sx0, 84}, {w, 28}, border, 5, 15, 1) end
+		stroi.ctext(sx0 + w / 2, 91, label, bold_font[4], (selected or pressed) and stroi.on_acc() or nil)
 		if c then ui.filter = sg[1] end
-		sx0 = sx0 + w + 6
+		sx0 = sx0 + w + gap
 	end
 	--> список сотрудников
+	local roster_width = W - 232
 	imgui.SetCursorPos(imgui.ImVec2(16, 122))
-	imgui.BeginChild(u8'##stroi_roster', imgui.ImVec2(470, H - 122 - 62), false, imgui.WindowFlags.NoMove + imgui.WindowFlags.NoScrollWithMouse)
+	imgui.BeginChild(u8'##stroi_roster', imgui.ImVec2(roster_width, H - 122 - 62), false, imgui.WindowFlags.NoMove + imgui.WindowFlags.NoScrollWithMouse)
 	imgui.Scroller(u8'Состав строя', img_step[1][0], img_duration[1][0])
 	local y, shown = 0, 0
 	for _, e in ipairs(list) do
 		local v = marks[e.key]
 		if ui.filter == 'all' or (ui.filter == 'p' and v == 'p') or (ui.filter == 'a' and v == 'a') or (ui.filter == 'n' and not v) then
 			shown = shown + 1
-			stroi.member_row(f, e, v, y)
+			stroi.member_row(f, e, v, y, roster_width - 18)
 			y = y + 42
 		end
 	end
@@ -32287,28 +32687,34 @@ function stroi.draw_roster(W, H)
 		if #list == 0 then
 			msg = ui.fetching and u8'Загружаю состав...' or u8'Список пуст. Нажмите обновить в углу'
 		end
-		stroi.ctext(228, 90, msg, nil, muted)
+		stroi.ctext(roster_width / 2, 60, msg, nil, muted)
 	end
 	imgui.SetCursorPos(imgui.ImVec2(0, y))
 	imgui.Dummy(imgui.ImVec2(0, 4))
 	imgui.EndChild()
 	--> панель действий
-	gui.DrawBox({498, 84}, {206, H - 84 - 62}, cl.tab, cl.line, 8, 15)
-	if stroi.btn('auto', 510, 96, 87, 32, 'Рядом', fa.CHECK_DOUBLE, 'soft') then stroi.auto_mark(f, list) end
+	local panel_x = W - 208
+	local panel_top = 122
+	local panel_height = H - panel_top - 62
+	gui.DrawBox({panel_x, panel_top}, {194, panel_height}, cl.tab, cl.line, 8, 15)
+	imgui.SetCursorPos(imgui.ImVec2(panel_x + 2, panel_top + 3))
+	imgui.BeginChild('##stroi_roster_actions', imgui.ImVec2(190, panel_height - 6), false, imgui.WindowFlags.NoScrollWithMouse)
+	imgui.Scroller('##stroi_roster_actions', img_step[1][0], img_duration[1][0])
+	if stroi.btn('auto', 5, 8, 80, 32, 'Рядом', fa.CHECK_DOUBLE, 'soft') then stroi.auto_mark(f, list) end
 	if imgui.IsItemHovered() then imgui.SetTooltip(u8'Отметить присутствующими тех, кто рядом (до 40 м)') end
-	if stroi.btn('reset', 605, 96, 87, 32, 'Сброс', fa.ROTATE_LEFT, 'soft') then stroi.marks[f.id] = {} end
+	if stroi.btn('reset', 90, 8, 80, 32, 'Сброс', fa.ROTATE_LEFT, 'soft') then stroi.marks[f.id] = {} end
 	if imgui.IsItemHovered() then imgui.SetTooltip(u8'Сбросить все отметки') end
-	stroi.tu(510, 140, u8'Добавить игрока по ID', bold_font[4], muted)
-	local nid = gui.InputText({512, 164}, 110, ui.add_id, u8'stroi_addid', 4, u8'ID')
+	stroi.tu(5, 54, u8'Добавить игрока по ID', bold_font[4], muted)
+	local nid = gui.InputText({7, 81}, 100, ui.add_id, u8'stroi_addid', 4, u8'ID')
 	ui.add_id = nid:gsub('%D', '')
-	if stroi.btn('addid', 640, 158, 52, 30, nil, fa.PLUS, 'soft') then
+	if stroi.btn('addid', 120, 75, 50, 30, nil, fa.PLUS, 'soft') then
 		stroi.add_ext(f, ui.add_id)
 		ui.add_id = ''
 	end
-	gui.DrawLine({510, 196}, {692, 196}, cl.line)
+	gui.DrawLine({5, 108}, {170, 108}, cl.line)
 	if leader then
-		stroi.tu(510, 204, u8'Причина / статья', bold_font[4], muted)
-		local rs = gui.InputText({512, 228}, 170, f.warn_reason, u8'stroi_reason' .. f.id, 60, u8'Неявка на строй')
+		stroi.tu(5, 116, u8'Причина / статья', bold_font[4], muted)
+		local rs = gui.InputText({7, 140}, 150, f.warn_reason, u8'stroi_reason' .. f.id, 60, u8'Неявка на строй')
 		if rs ~= f.warn_reason then
 			f.warn_reason = rs
 			stroi.touch()
@@ -32318,27 +32724,27 @@ function stroi.draw_roster(W, H)
 		local cw_on = ui.confirm == 'warn' and os.clock() - ui.confirm_t < 4
 		local cf_on = ui.confirm == 'fire' and os.clock() - ui.confirm_t < 4
 		local wl = cw_on and ('Точно? (' .. #pt .. ')') or ('Выговор всем (' .. #pt .. ')')
-		local c1, h1 = stroi.btn('warn', 510, 254, 182, 34, wl, fa.CIRCLE_EXCLAMATION, cw_on and 'danger' or 'soft', busy or #pt == 0)
+		local c1, h1 = stroi.btn('warn', 5, 166, 165, 34, wl, fa.CIRCLE_EXCLAMATION, cw_on and 'danger' or 'soft', busy or #pt == 0)
 		if h1 then imgui.SetTooltip(u8'Выдать выговор всем не явившимся (по очереди, /fwarn)') end
 		if c1 and stroi.confirm_click('warn') then stroi.job_start('warn', stroi.punish_msgs('fwarn', pt, f.warn_reason)) end
 		local fl = cf_on and ('Точно? (' .. #pt .. ')') or ('Уволить всех (' .. #pt .. ')')
-		local c2, h2 = stroi.btn('fire', 510, 294, 182, 34, fl, fa.USER_XMARK, cf_on and 'danger' or 'soft', busy or #pt == 0)
+		local c2, h2 = stroi.btn('fire', 5, 206, 165, 34, fl, fa.USER_XMARK, cf_on and 'danger' or 'soft', busy or #pt == 0)
 		if h2 then imgui.SetTooltip(u8'Уволить всех неявившихся (по очереди, /uninvite)') end
 		if c2 and stroi.confirm_click('fire') then stroi.job_start('fire', stroi.punish_msgs('uninvite', pt, f.warn_reason)) end
-		local c3, h3 = stroi.btn('ask', 510, 334, 182, 34, 'Где они? (' .. #at .. ')', fa.WALKIE_TALKIE, 'soft', busy or #at == 0)
+		local c3, h3 = stroi.btn('ask', 5, 246, 165, 34, 'Где они? (' .. #at .. ')', fa.WALKIE_TALKIE, 'soft', busy or #at == 0)
 		if h3 then imgui.SetTooltip(u8'Спросить в рации, где они (отсутствующие, а если их нет - неотмеченные)') end
 		if c3 then stroi.job_start('ask', stroi.ask_msgs(at, f.ask_mode)) end
 		if busy then
-			stroi.tu(510, 380, u8('Отправка ') .. stroi.job.done .. '/' .. stroi.job.total, bold_font[4], muted)
-			if stroi.btn('jobstop', 620, 374, 72, 26, 'Стоп', nil, 'soft') then stroi.job_stop() end
+			stroi.tu(5, 292, u8('Отправка ') .. stroi.job.done .. '/' .. stroi.job.total, bold_font[4], muted)
+			if stroi.btn('jobstop', 100, 286, 70, 26, 'Стоп', nil, 'soft') then stroi.job_stop() end
 		else
 			for k, md in ipairs({{'id', '@ID'}, {'nick', 'Ники'}}) do
-				local bx = 510 + (k - 1) * 94
-				imgui.SetCursorPos(imgui.ImVec2(bx, 374))
-				local cm = imgui.InvisibleButton(u8'##stroi_md' .. md[1], imgui.ImVec2(88, 26))
+				local bx = 5 + (k - 1) * 84
+				imgui.SetCursorPos(imgui.ImVec2(bx, 286))
+				local cm = imgui.InvisibleButton(u8'##stroi_md' .. md[1], imgui.ImVec2(81, 26))
 				local sel = f.ask_mode == md[1]
-				gui.Draw({bx, 374}, {88, 26}, sel and cl.def or cl.bg, 7, 15)
-				stroi.ctext(bx + 44, 379, md[2], bold_font[4], sel and stroi.on_acc() or nil)
+				gui.Draw({bx, 286}, {81, 26}, sel and cl.def or cl.bg, 7, 15)
+				stroi.ctext(bx + 40.5, 291, md[2], bold_font[4], sel and stroi.on_acc() or nil)
 				if cm and not sel then
 					f.ask_mode = md[1]
 					stroi.touch()
@@ -32347,8 +32753,11 @@ function stroi.draw_roster(W, H)
 		end
 	else
 		local hint = {u8'Выговоры и увольнение', u8'доступны с 9 ранга.', u8'Вы можете отмечать, кто', u8'пришёл, а кого нет.'}
-		for i, h in ipairs(hint) do stroi.tu(510, 208 + (i - 1) * 18, h, bold_font[4], muted) end
+		for i, h in ipairs(hint) do stroi.tu(5, 120 + (i - 1) * 18, h, bold_font[4], muted) end
 	end
+	imgui.SetCursorPos(imgui.ImVec2(0, leader and 318 or 194))
+	imgui.Dummy(imgui.ImVec2(1, 1))
+	imgui.EndChild()
 	--> нижняя панель
 	gui.DrawLine({4, H - 56}, {W - 4, H - 56}, cl.line)
 	if stroi.btn('test2', 16, H - 46, 170, 34, 'Запустить строй', fa.PLAY, 'soft', stroi.run.active) then stroi.start(f.id) end
@@ -32356,114 +32765,57 @@ function stroi.draw_roster(W, H)
 end
 
 --> ---------- главное окно /stroi ----------
-win.stroi = imgui.OnFrame(
-	function() return windows.stroi[0] end,
-	function(self)
-		local W, H = 720, (stroi.ui.screen == 'roster' or stroi.ui.screen == 'orgs') and 520 or 468
-		local ui = stroi.ui
-		local dt = imgui.GetIO().DeltaTime
-		if ui.closing then
-			ui.t = ui.t - dt * 6
-			if ui.t <= 0 then
-				ui.t, ui.closing = 0, false
-				windows.stroi[0] = false
-				stroi.leave_editor()
-				return
-			end
-		else
-			ui.t = math.min(1, ui.t + dt * 6)
-		end
-		stroi.flush(false)
-		imgui.PushStyleVarFloat(imgui.StyleVar.Alpha, math.max(0.001, ui.t))
-		imgui.SetNextWindowPos(imgui.ImVec2(sx / 2, sy / 2), imgui.Cond.FirstUseEver, imgui.ImVec2(0.5, 0.5))
-		imgui.SetNextWindowSize(imgui.ImVec2(W, H))
-		imgui.Begin('StroiMenu', windows.stroi, imgui.WindowFlags.NoCollapse + imgui.WindowFlags.NoTitleBar + imgui.WindowFlags.NoScrollbar + imgui.WindowFlags.NoScrollWithMouse + imgui.WindowFlags.NoResize + imgui.WindowFlags.NoSavedSettings)
-		bug_fix_input()
-		gui.Draw({4, 4}, {W - 8, H - 8}, cl.main, 12, 15)
-		if winter then winter.begin(W, H) end
-		--> шапка
-		gui.DrawLine({4, 38}, {W - 4, 38}, cl.line)
-		imgui.SetCursorPos(imgui.ImVec2(11, 11))
-		if imgui.InvisibleButton(u8'##stroi_close', imgui.ImVec2(20, 20)) then stroi.close() end
-		if imgui.IsItemHovered() then
-			gui.DrawCircle({21, 21}, 7, imgui.ImVec4(0.98, 0.30, 0.38, 1.00))
-		else
-			gui.DrawCircle({21, 21}, 7, imgui.ImVec4(0.98, 0.40, 0.38, 1.00))
-		end
-		if ui.screen ~= 'list' then
-			imgui.SetCursorPos(imgui.ImVec2(40, 5))
-			if imgui.InvisibleButton(u8'##stroi_exit', imgui.ImVec2(48, 32)) then stroi.back() end
-			if imgui.IsItemActive() or imgui.IsItemHovered() then
-				if an[35] < 0.45 then an[35] = an[35] + (anim * 1) end
-			elseif an[35] > 0 then
-				an[35] = an[35] - (anim * 1)
-			end
-			if setting.cl == 'White' then
-				imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.50 - an[35], 0.50 - an[35], 0.50 - an[35], 1.00))
-			else
-				imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.50 + an[35], 0.50 + an[35], 0.50 + an[35], 1.00))
-			end
-			gui.FaText(55, 6, fa.ARROW_RIGHT_TO_BRACKET, fa_font[4])
-			gui.Text(45, 22, 'Выйти')
-			imgui.PopStyleColor(1)
-		end
-		local titles = {edit = 'Настройка строя', orgs = 'Выбор фракций', roster = 'Состав строя', list = 'Умный строй'}
-		local title = u8(titles[ui.screen] or titles.list)
-		local tw = stroi.tw(title, bold_font[1])
-		stroi.tu(W / 2 - tw / 2, 11, title, bold_font[1])
-		if ui.screen == 'list' then
-			imgui.SetCursorPos(imgui.ImVec2(W - 148, 5))
-			if imgui.InvisibleButton(u8'##stroi_add', imgui.ImVec2(65, 32)) then stroi.create() end
-			if imgui.IsItemActive() or imgui.IsItemHovered() then
-				if an[33] < 0.45 then an[33] = an[33] + (anim * 1) end
-			elseif an[33] > 0 then
-				an[33] = an[33] - (anim * 1)
-			end
-			if setting.cl == 'White' then
-				imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.50 - an[33], 0.50 - an[33], 0.50 - an[33], 1.00))
-			else
-				imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.50 + an[33], 0.50 + an[33], 0.50 + an[33], 1.00))
-			end
-			command_toolbar_label(W - 148, fa.PLUS, 'Добавить')
-			imgui.PopStyleColor(1)
-
-			imgui.SetCursorPos(imgui.ImVec2(W - 78, 5))
-			if imgui.InvisibleButton(u8'##stroi_settings', imgui.ImVec2(65, 32)) then
-				stroi.close()
-				windows.main[0] = true
-				tab = 'settings'
-				name_tab = u8'Главное'
-				tab_settings = 23
-			end
-			if imgui.IsItemActive() or imgui.IsItemHovered() then
-				if an[34] < 0.45 then an[34] = an[34] + (anim * 1) end
-			elseif an[34] > 0 then
-				an[34] = an[34] - (anim * 1)
-			end
-			if setting.cl == 'White' then
-				imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.50 - an[34], 0.50 - an[34], 0.50 - an[34], 1.00))
-			else
-				imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.50 + an[34], 0.50 + an[34], 0.50 + an[34], 1.00))
-			end
-			command_toolbar_label(W - 78, fa.GEAR, 'Настройки')
-			imgui.PopStyleColor(1)
-		end
-		if winter then winter.small_front('stroi_win', W, H, tw, 21) end
-		if ui.screen == 'roster' then
-			if stroi.btn('refresh', W - 116, 7, 100, 26, 'Обновить', fa.ARROWS_ROTATE, 'soft', ui.fetching) then stroi.refresh() end
-		end
-		if ui.screen == 'edit' then stroi.draw_edit(W, H) elseif ui.screen == 'orgs' then stroi.draw_orgs(W, H) elseif ui.screen == 'roster' then stroi.draw_roster(W, H) else stroi.draw_list(W, H) end
-		if winter then winter.finish() end
-		imgui.End()
-		imgui.PopStyleVar(1)
+function stroi.draw_embedded(W, H)
+	local ui, config = stroi.ui, stroi.cfg()
+	stroi.flush(false)
+	if ui.screen ~= 'list' then gui.DrawLine({4, 38}, {W - 4, 38}, cl.line) end
+	local titles = {edit = 'Настройка строя', orgs = 'Выбор фракций', roster = 'Состав строя',
+		list = 'Умный строй', settings = 'Настройки строя'}
+	if ui.screen ~= 'list' and stroi.btn('back', 12, 6, 91, 26, 'Назад', fa.ANGLE_LEFT, 'soft') then
+		stroi.back()
 	end
-)
+	if ui.screen == 'list' then
+		new_draw(16, 37)
+		gui.Text(26, 26, 'Система умного строя', font[3])
+		if imgui.IsItemClicked(1) then imgui.OpenPopup('##StroiHeaderActions') end
+		if imgui.BeginPopup('##StroiHeaderActions') then
+			if config.func and imgui.Selectable(u8'Создать строй') then stroi.create() end
+			if imgui.Selectable(u8'Настройки строя') then ui.screen = 'settings' end
+			imgui.EndPopup()
+		end
+		imgui.SetCursorPos(imgui.ImVec2(561, 21))
+		if gui.Switch(u8'##stroi_func', config.func) then
+			config.func = not config.func
+			if config.func then
+				stroi.reg_all()
+				stroi.reg_keys()
+			else
+				stroi.unreg_all()
+			end
+			save()
+		end
+	else
+		stroi.ctext(W / 2, 10, u8(titles[ui.screen] or titles.list), bold_font[1])
+		if ui.screen == 'roster' and stroi.btn('refresh', W - 112, 6, 100, 26, 'Обновить', fa.ARROWS_ROTATE, 'soft', ui.fetching) then
+			stroi.refresh()
+		end
+	end
+	-- Record the screen once so a click cannot draw a second screen over the first.
+	local screen = ui.screen
+	if screen == 'settings' then
+		stroi.settings_item(16, 52)
+	elseif not config.func then
+		return
+	elseif screen == 'edit' then stroi.draw_edit(W, H)
+	elseif screen == 'orgs' then stroi.draw_orgs(W, H)
+	elseif screen == 'roster' then stroi.draw_roster(W, H)
+	else stroi.draw_list(W, H) end
+end
 
---> ---------- мини-меню с таймером ----------
 function stroi.timer_visible()
 	local s = setting.stroi
 	if stroi.run.active or stroi.moving then return true end
-	return type(s) == 'table' and s.func == true and windows.stroi[0]
+	return type(s) == 'table' and s.func == true and stroi.is_open()
 end
 
 win.stroi_timer = imgui.OnFrame(
@@ -32520,54 +32872,37 @@ win.stroi_timer = imgui.OnFrame(
 )
 
 --> ---------- пункт в «Доп. функциях» ----------
-function stroi.settings_item(x, y) --> x, y - левый верхний угол карточки (координаты окна или дочернего окна)
+function stroi.settings_item(x, y)
 	local s = stroi.cfg()
-	local progress = gui.RevealProgress('stroi_settings', s.func)
-	local height = 37 + 108 * progress
+	local height = 109
 	local muted = imgui.ImVec4(0.50, 0.50, 0.50, 0.90)
 	gui.DrawBox({x, y}, {586, height}, cl.tab, cl.line, 7, 15)
-	gui.Text(x + 10, y + 9, 'Система Умного строя', font[3])
-	imgui.SetCursorPos(imgui.ImVec2(x + 545, y + 5))
-	if gui.Switch(u8'##stroi_func', s.func) then
-		s.func = not s.func
-		if s.func then
-			stroi.reg_all()
-			stroi.reg_keys()
-		else
-			stroi.unreg_all()
-		end
-		save()
+	gui.Text(x + 10, y + 11, 'Команда активации', font[3])
+	stroi.tu(x + 222, y + 11, s.cmd ~= '' and ('/' .. s.cmd) or u8'Не назначена', font[3], s.cmd == '' and muted or nil)
+	if gui.Button(u8'Изменить...##stroi_menu_cmd', {x + 476, y + 6}, {100, 25}) then
+		lockPlayerControl(true)
+		edit_cmd, cur_cmd, new_cmd = true, s.cmd, s.cmd
+		imgui.OpenPopup(u8'Умный строй: команда активации')
 	end
-	if gui.BeginReveal(progress, y + 36, 108, x + 586) then
-		gui.DrawLine({x, y + 36}, {x + 586, y + 36}, cl.line)
-		gui.Text(x + 10, y + 47, 'Команда активации', font[3])
-		stroi.tu(x + 222, y + 47, s.cmd ~= '' and ('/' .. s.cmd) or u8'Не назначена', font[3], s.cmd == '' and muted or nil)
-		if gui.Button(u8'Изменить...##stroi_menu_cmd', {x + 476, y + 42}, {100, 25}) then
-			lockPlayerControl(true)
-			edit_cmd, cur_cmd, new_cmd = true, s.cmd, s.cmd
-			imgui.OpenPopup(u8'Умный строй: команда активации')
-		end
-		gui.DrawLine({x, y + 72}, {x + 586, y + 72}, cl.line)
-		gui.Text(x + 10, y + 83, 'Клавиша активации', font[3])
-		stroi.tu(x + 222, y + 83, s.key[1] ~= '' and s.key[1] or u8'Не назначена', font[3], s.key[1] == '' and muted or nil)
-		if gui.Button(u8'Изменить...##stroi_menu_key', {x + 476, y + 78}, {100, 25}) then
-			current_key = {'', {}}
-			key_bool_cur = s.key[2]
-			lockPlayerControl(true)
-			edit_key = true
-			imgui.OpenPopup(u8'Умный строй: клавиша активации')
-		end
-		gui.DrawLine({x, y + 108}, {x + 586, y + 108}, cl.line)
-		gui.Text(x + 10, y + 119, 'Клавиша подтверждения', font[3])
-		stroi.tu(x + 222, y + 119, stroi.fit(setting.enter_key[2], font[3], 240), font[3])
-		if gui.Button(u8'Изменить...##stroi_enter_key', {x + 476, y + 114}, {100, 25}) then
-			imgui.OpenPopup(u8'Изменить клавишу продолжения команды')
-			lockPlayerControl(true)
-			edit_key = true
-			enter_key = setting.enter_key[1]
-			current_key = {u8'Enter', {13}}
-		end
-		gui.EndReveal()
+	gui.DrawLine({x, y + 36}, {x + 586, y + 36}, cl.line)
+	gui.Text(x + 10, y + 47, 'Клавиша активации', font[3])
+	stroi.tu(x + 222, y + 47, s.key[1] ~= '' and s.key[1] or u8'Не назначена', font[3], s.key[1] == '' and muted or nil)
+	if gui.Button(u8'Изменить...##stroi_menu_key', {x + 476, y + 42}, {100, 25}) then
+		current_key = {'', {}}
+		key_bool_cur = s.key[2]
+		lockPlayerControl(true)
+		edit_key = true
+		imgui.OpenPopup(u8'Умный строй: клавиша активации')
+	end
+	gui.DrawLine({x, y + 72}, {x + 586, y + 72}, cl.line)
+	gui.Text(x + 10, y + 83, 'Клавиша подтверждения', font[3])
+	stroi.tu(x + 222, y + 83, stroi.fit(setting.enter_key[2], font[3], 240), font[3])
+	if gui.Button(u8'Изменить...##stroi_enter_key', {x + 476, y + 78}, {100, 25}) then
+		imgui.OpenPopup(u8'Изменить клавишу продолжения команды')
+		lockPlayerControl(true)
+		edit_key = true
+		enter_key = setting.enter_key[1]
+		current_key = {u8'Enter', {13}}
 	end
 	if edit_cmd then
 		local changed = cmd_edit(u8'Умный строй: команда активации', cur_cmd)
@@ -33192,58 +33527,59 @@ function getStrByState2(keyState)
 	return '{F55353}Caps{ffffff}'
 end
 
+local clock_hud = {}
+
 function time_hud_func_and_distance_point()
-	local text_dist_user_point = ''
-	local text_dist_server_point = ''
-	local my_int = getActiveInterior()
-	local bool_result_server, pos_X_s, pos_Y_s, pos_Z_s = getTargetServerCoordinates()
-	local distance_end_serv = -2
 	local bias = 0
-	
 	if setting.time_hud then
-		local success = ffi.C.GetKeyboardLayoutNameA(KeyboardLayoutName)
-		local errorCode = ffi.C.GetLocaleInfoA(tonumber(ffi.string(KeyboardLayoutName), 16), 0x00000002, LocalInfo, BuffSize)
-		local localName = ffi.string(LocalInfo)
-		local capsState = ffi.C.GetKeyState(20)
-		local function lang()
-			local str = string.match(localName, '([^%(]*)')
-			if str:find('Русский') then
-				return 'Ru'
-			elseif str:find('Английский') then
-				return 'En'
-			end
-		end
-		local text = string.format('%s | {ffeeaa}%s{ffffff} %s', os.date('%d ')..month[tonumber(os.date('%m'))]..os.date(' - %H:%M:%S'), lang(), getStrByState2(capsState))
-		bias = renderGetFontDrawTextLength(fontPD, text) + 10
-		renderFontDrawText(fontPD, text, 20, sy-25, 0xFFFFFFFF)
-	end
-	
-	if setting.display_map_distance.server and my_int == 0 then
-		if bool_result_server then
-			local x_player, y_player, z_player = getCharCoordinates(PLAYER_PED)
-			distance_end_serv = getDistanceBetweenCoords3d(pos_X_s, pos_Y_s, pos_Z_s, x_player, y_player, z_player)
-			text_dist_server_point = tostring(removeDecimalPart(distance_end_serv)..' м. до серв. метки')
-			renderFontDrawText(font_metka, text_dist_server_point, 20 + bias, sy - 20, 0xFFFFFFFF)
-		end
-	end
-	
-	if setting.display_map_distance.user and my_int == 0 then
-		local bool_result, pos_X, pos_Y, pos_Z = getTargetBlipCoordinates()
-		if bool_result then
-			local x_player, y_player, z_player = getCharCoordinates(PLAYER_PED)
-			local distance_end = getDistanceBetweenCoords3d(pos_X, pos_Y, pos_Z, x_player, y_player, z_player)
-			text_dist_user_point = tostring(removeDecimalPart(distance_end)..' м. до вашей метки')
-			local y_bias = 0
-			if setting.display_map_distance.server and my_int == 0 and bool_result_server then
-				y_bias = -18
-			end
-			if bool_result_server then
-				if math.abs(distance_end_serv - distance_end) > 3 then
-					renderFontDrawText(font_metka, text_dist_user_point, 20 + bias, sy - 20 + y_bias, 0xFFFFFFFF)
+		local now = os.clock()
+		if not clock_hud.next_input or now >= clock_hud.next_input then
+			clock_hud.next_input = now + 0.10
+			local layout = ffi.C.GetKeyboardLayoutNameA(KeyboardLayoutName) ~= 0 and ffi.string(KeyboardLayoutName)
+			if layout and layout ~= clock_hud.layout then
+				local locale = tonumber(layout, 16)
+				clock_hud.layout, clock_hud.language = layout, nil
+				if locale and ffi.C.GetLocaleInfoA(locale, 0x00000002, LocalInfo, BuffSize) > 0 then
+					local name = ffi.string(LocalInfo)
+					clock_hud.language = name:find('Русский', 1, true) and 'Ru' or name:find('Английский', 1, true) and 'En' or nil
 				end
-			else
-				renderFontDrawText(font_metka, text_dist_user_point, 20 + bias, sy - 20 + y_bias, 0xFFFFFFFF)
 			end
+			clock_hud.caps = ffi.C.GetKeyState(20)
+		end
+		local second = os.time()
+		if clock_hud.second ~= second then
+			clock_hud.second = second
+			local date = os.date('*t', second)
+			clock_hud.date = ('%02d %s - %02d:%02d:%02d'):format(date.day, month[date.month], date.hour, date.min, date.sec)
+		end
+		if clock_hud.rendered_second ~= second or clock_hud.rendered_caps ~= clock_hud.caps
+			or clock_hud.rendered_language ~= clock_hud.language or clock_hud.font ~= fontPD then
+			clock_hud.rendered_second, clock_hud.rendered_caps = second, clock_hud.caps
+			clock_hud.rendered_language, clock_hud.font = clock_hud.language, fontPD
+			clock_hud.text = ('%s | {ffeeaa}%s{ffffff} %s'):format(clock_hud.date, clock_hud.language or '', getStrByState2(clock_hud.caps))
+			clock_hud.width = renderGetFontDrawTextLength(fontPD, clock_hud.text)
+		end
+		bias = clock_hud.width + 10
+		renderFontDrawText(fontPD, clock_hud.text, 20, sy - 25, 0xFFFFFFFF)
+	end
+
+	local markers = setting.display_map_distance
+	if not (markers.server or markers.user) or getActiveInterior() ~= 0 then return end
+	local server_ok, sx, sy_point, sz
+	local user_ok, ux, uy, uz
+	if markers.server then server_ok, sx, sy_point, sz = getTargetServerCoordinates() end
+	if markers.user then user_ok, ux, uy, uz = getTargetBlipCoordinates() end
+	if not (server_ok or user_ok) then return end
+	local px, py, pz = getCharCoordinates(PLAYER_PED)
+	local server_distance
+	if server_ok then
+		server_distance = getDistanceBetweenCoords3d(sx, sy_point, sz, px, py, pz)
+		renderFontDrawText(font_metka, removeDecimalPart(server_distance) .. ' м. до серв. метки', 20 + bias, sy - 20, 0xFFFFFFFF)
+	end
+	if user_ok then
+		local distance = getDistanceBetweenCoords3d(ux, uy, uz, px, py, pz)
+		if not server_distance or math.abs(server_distance - distance) > 3 then
+			renderFontDrawText(font_metka, removeDecimalPart(distance) .. ' м. до вашей метки', 20 + bias, sy - (server_distance and 38 or 20), 0xFFFFFFFF)
 		end
 	end
 end
@@ -34355,18 +34691,8 @@ local cmd_defoult_json_for_hospital = {
   "id_element": 3,
   "rank": 1,
   "act": [
-    [
-      "SEND",
-      "/do Медицинская сумка весит на левом плече."
-    ],
-    [
-      "SEND",
-      "/me открыв сумку, достал{sex[][а]} необходимое лекарство и передал{sex[][а]} человеку напротив"
-    ],
-    [
-      "SEND",
-      "/heal {id} {pricelec}"
-    ]
+    ["SEND", "/me открыв сумку, достал{sex[][а]} необходимое лекарство и передал{sex[][а]} человеку напротив"],
+    ["SEND", "/heal {id} {pricelec}"]
   ],
   "desc": "Вылечить игрока",
   "send_end_mes": true,
@@ -34896,61 +35222,12 @@ local cmd_defoult_json_for_hospital = {
   "var": {},
   "rank": 4,
   "act": [
-    [
-      "SEND",
-      "Очень замечательно, что Вы решили излечиться от укропозависимости."
-    ],
-    [
-      "SEND",
-      "Стоимость одного сеанса составит {pricenarko}$"
-    ],
-    [
-      "SEND",
-      "Метод лечения современный, называется \"Нейроочищение\". Он полностью сотрёт информацию об укропе с Вашего мозга."
-    ],
-    [
-      "SEND",
-      "Вы согласны? Если да, то ложитесь на кушетку и мы приступим."
-    ],
-    [
-      "WAIT_ENTER"
-    ],
-    [
-      "SEND",
-      "/do На столе лежат стерильные перчатки и медицинская маска."
-    ],
-    [
-      "SEND",
-      "/me взяв со стола средства индивидуальной защиты, надел{sex[][а]} их на себя"
-    ],
-    [
-      "SEND",
-      "/todo А теперь максимально расслабьтесь*подвигая спец. аппарат ближе к пациенту"
-    ],
-    [
-      "SEND",
-      "/me взял{sex[][а]} шлем от аппарата, после чего надел{sex[][а]} его на голову пациента"
-    ],
-    [
-      "SEND",
-      "/me включил{sex[][а]} устройство, затем, подождав пять секунд, выключил{sex[][а]} его"
-    ],
-    [
-      "SEND",
-      "/do Аппарат успешно завершил работу."
-    ],
-    [
-      "SEND",
-      "/me снял{sex[][а]} шлем с пациента и повесил{sex[][а]} его обратно на аппарат"
-    ],
-    [
-      "SEND",
-      "/healbad {id}"
-    ],
-    [
-      "SEND",
-      "/todo Вот и всё! Тяга к запрещённым веществам должна исчезнуть*снимая с себя маску с перчатками"
-    ]
+    ["SEND", "Сеанс стоит {pricenarko}$. Вы согласны?"],
+    ["WAIT_ENTER"],
+    ["SEND", "/me достал{sex[][а]} из медицинской сумки перчатки и надел{sex[][а]} их"],
+    ["SEND", "/me достал{sex[][а]} из медицинского кейса шприц и аккуратно {sex[ввёл][ввела]} пациенту препарат"],
+    ["SEND", "/me убрал{sex[][а]} использованный шприц в контейнер"],
+    ["SEND", "/healbad {id}"]
   ],
   "desc": "Вылечить от укропозависимости",
   "arg": [
@@ -35086,42 +35363,9 @@ local cmd_defoult_json_for_hospital = {
   "var": {},
   "rank": 1,
   "act": [
-    [
-      "SEND",
-      "/cure {id}"
-    ],
-    [
-      "SEND",
-      "/me легким движением руки открыл{sex[][а]} мед. сумку, после чего достал{sex[][а]} платок"
-    ],
-    [
-      "SEND",
-      "/me аккуратно приложил{sex[][а]} платок ко рту пострадавшего, после чего сделал{sex[][а]} глубокий вдох"
-    ],
-    [
-      "SEND",
-      "/do В лёгких много воздуха."
-    ],
-    [
-      "SEND",
-      "/me встал{sex[][а]} на колени, после чего прислонил{sex[ся][ась]} к пациенту"
-    ],
-    [
-      "SEND",
-      "/me {sex[подвел][подвела]} губы ко рту пострадавшего, после чего начал{sex[][а]} делать искусственное дыхание"
-    ],
-    [
-      "SEND",
-      "/me отвел{sex[][а]} губы от рта пострадавшего, после чего сделал{sex[][а]} глубокий вдох"
-    ],
-    [
-      "SEND",
-      "/me подвел{sex[][а]} губы ко рту пострадавшего, после чего начал{sex[][а]} делать искусственное дыхание"
-    ],
-    [
-      "SEND",
-      "/todo Сейчас аккуратно поднимайтесь*помогая встать"
-    ]
+    ["SEND", "/cure {id}"],
+    ["SEND", "/me достал{sex[][а]} аптечку и осмотрел{sex[][а]} пострадавшего"],
+    ["SEND", "/me оказал{sex[][а]} пострадавшему первую медицинскую помощь и помог{sex[][ла]} ему подняться"]
   ],
   "desc": "Поднять человека при смерти",
   "arg": [
@@ -35147,42 +35391,9 @@ local cmd_defoult_json_for_hospital = {
   "var": {},
   "rank": 3,
   "act": [
-    [
-      "SEND",
-      "Очень замечательно, что Вы решили оформить медицинскую страховку."
-    ],
-    [
-      "SEND",
-      "С ней Вы сможете лечиться за счёт государства."
-    ],
-    [
-      "SEND",
-      "/me достаёт из под стола пустой бланк, после чего начинает его заполнять"
-    ],
-    [
-      "SEND",
-      "/me заполнив бланк, передаёт его человеку напротив и говорит:"
-    ],
-    [
-      "SEND",
-      "Это бумажная копия, сейчас впишу Вас в базу данных."
-    ],
-    [
-      "SEND",
-      "/me вбивает человека напротив в компьютер, находящийся на столе"
-    ],
-    [
-      "SEND",
-      "/do Обратившийся внесён в базу данных страхования."
-    ],
-    [
-      "SEND",
-      "/todo Поздравляю! Вы официально застрахованы!*заканчивая оформление"
-    ],
-    [
-      "SEND",
-      "/givemedinsurance {id}"
-    ]
+    ["SEND", "/me заполнил{sex[][а]} бланк медицинской страховки и передал{sex[][а]} его на подпись"],
+    ["SEND", "/me {sex[внёс][внесла]} сведения в журнал страхования и выдал{sex[][а]} медицинский полис"],
+    ["SEND", "/givemedinsurance {id}"]
   ],
   "desc": "Оформить медицинскую страховку",
   "arg": [
@@ -35332,18 +35543,8 @@ local cmd_defoult_json_for_hospital = {
   "id_element": 3,
   "rank": 1,
   "act": [
-    [
-      "SEND",
-      "/do Медицинская сумка весит на левом плече."
-    ],
-    [
-      "SEND",
-      "/me открыв сумку, достал{sex[][а]} необходимое лекарство и передал{sex[][а]} охраннику пациента"
-    ],
-    [
-      "SEND",
-      "/healactor {id} {priceguard}"
-    ]
+    ["SEND", "/me открыв сумку, достал{sex[][а]} необходимое лекарство и передал{sex[][а]} охраннику пациента"],
+    ["SEND", "/healactor {id} {priceguard}"]
   ],
   "desc": "Вылечить охранника игрока",
   "send_end_mes": true,
@@ -35891,18 +36092,8 @@ local cmd_defoult_json_for_hospital = {
   "id_element": 3,
   "rank": 1,
   "act": [
-    [
-      "SEND",
-      "/do Медицинская сумка весит на левом плече."
-    ],
-    [
-      "SEND",
-      "/me открыв сумку, достал{sex[][а]} необходимое лекарство и запил его водой"
-    ],
-    [
-      "SEND",
-      "/heal {myid} 100000"
-    ]
+    ["SEND", "/me открыв сумку, достал{sex[][а]} необходимое лекарство и запил его водой"],
+    ["SEND", "/heal {myid} 100000"]
   ],
   "desc": "Вылечить самого себя",
   "send_end_mes": true,
@@ -43245,10 +43436,7 @@ function checkVehicleData(refresh)
 	end
 
 	local function load()
-		local file = io.open(local_path, 'rb')
-		if not file then return false end
-		local data = file:read(32 * 1024 * 1024 + 1)
-		file:close()
+		local data = sh_resource.read_bounded(local_path, 32 * 1024 * 1024)
 		local names, version = parse(data)
 		if not names then return false end
 		vehicleNames, localVehicleVersion = names, version
@@ -43438,18 +43626,11 @@ function send_smart_su_commands(commands)
 end
 
 function get_pursuit_target_distance(target_id)
-	local chars = getAllChars()
+	local found, target = sampGetCharHandleBySampPlayerId(target_id)
+	if not found or target == PLAYER_PED or not doesCharExist(target) or not doesCharExist(PLAYER_PED) then return nil end
 	local mx, my, mz = getCharCoordinates(PLAYER_PED)
-	for i, v in ipairs(chars) do
-		if doesCharExist(v) and v ~= PLAYER_PED then
-			local r, id = sampGetPlayerIdByCharHandle(v)
-			if r and id == target_id then
-				local vx, vy, vz = getCharCoordinates(v)
-				return getDistanceBetweenCoords3d(mx, my, mz, vx, vy, vz)
-			end
-		end
-	end
-	return nil
+	local tx, ty, tz = getCharCoordinates(target)
+	return getDistanceBetweenCoords3d(mx, my, mz, tx, ty, tz)
 end
 
 function su_accept_reg()
