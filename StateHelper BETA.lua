@@ -276,6 +276,7 @@ end
 local sx, sy = getScreenResolution()
 local scr = thisScript()
 local sh_display_version = 'State Helper ' .. scr.version .. ' БЕТА'
+local sh_update_display_version = 'State Helper ' .. scr.version .. ' pre-release'
 
 font = renderCreateFont('Trebuchet MS', 14, 5)
 fontPD = renderCreateFont('Trebuchet MS', 12, 5)
@@ -10442,21 +10443,12 @@ function hall.settings()
 				col_mb.work = convert_color(sh_audit.members_color("work"))
 				save()
 			end
-			gui.Text(26, 739 + slide_y, 'Заголовок', font[3])
+			gui.Text(26, 739 + slide_y, 'Заголовок использует цвет сотрудников в форме', font[3])
 			gui.DrawLine({16, 765 + slide_y}, {602, 765 + slide_y}, cl.line)
 			gui.Text(26, 775 + slide_y, 'Сотрудники в форме', font[3])
 			gui.DrawLine({16, 801 + slide_y}, {602, 801 + slide_y}, cl.line)
 			gui.Text(26, 811 + slide_y, 'Сотрудники без формы', font[3])
 			imgui.PushStyleVarVec2(imgui.StyleVar.FramePadding, imgui.ImVec2(6.5, 6.5))
-			imgui.SetCursorPos(imgui.ImVec2(564, 734 + slide_y))
-			if imgui.ColorEdit4('##TitleColor', col_mb.title, imgui.ColorEditFlags.NoInputs + imgui.ColorEditFlags.NoLabel + imgui.ColorEditFlags.NoAlpha) then
-				local c = imgui.ImVec4(col_mb.title[0], col_mb.title[1], col_mb.title[2], col_mb.title[3])
-				local argb = imgui.ColorConvertFloat4ToARGB(c)
-				setting.mb.color.title = imgui.ColorConvertFloat4ToARGB(c)
-				setting.mb.custom_palette = setting.mb.custom_palette or {}
-				setting.mb.custom_palette.title = true
-				save()
-			end
 			imgui.SetCursorPos(imgui.ImVec2(564, 770 + slide_y))
 			if imgui.ColorEdit4('##WorkColor', col_mb.work, imgui.ColorEditFlags.NoInputs + imgui.ColorEditFlags.NoLabel + imgui.ColorEditFlags.NoAlpha) then
 				local c = imgui.ImVec4(col_mb.work[0], col_mb.work[1], col_mb.work[2], col_mb.work[3])
@@ -10529,13 +10521,13 @@ function hall.settings()
 	elseif tab_settings == 6 then
 		if setting.org == 10 then
 			new_draw(16, 53)
+			imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.50, 0.50, 0.50, 1.00))
 			gui.Text(26, 25, 'Умный тюремный срок', font[3])
 			imgui.SetCursorPos(imgui.ImVec2(561, 21))
-			if gui.Switch(u8'##smart_term', setting.prison_settings.smart_term) then
-				setting.prison_settings.smart_term = not setting.prison_settings.smart_term
-				save()
-			end
+			gui.Switch(u8'##smart_term', false, true)
 			gui.TextInfo({26, 44}, {'Позволяет удобно повышать/понижать срок заключённому'})
+			gui.Text(26, 81, 'Данная функция в разработке', font[3])
+			imgui.PopStyleColor()
 		elseif setting.org <= 4 then
 			new_draw(16, 53)
 			
@@ -11807,13 +11799,26 @@ function hall.settings()
 		new_draw(468, 53)
 		gui.Text(26, 477, 'Изменить значение текущего времени', font[3])
 		gui.TextInfo({26, 496}, {'Скрипт начнёт воспринимать текущее время с учётом Вашего изменения.'})
+
+		local function time_offset_label(offset)
+			local hours = math.abs(offset)
+			local unit = hours == 1 and ' час' or hours >= 2 and hours <= 4 and ' часа' or ' часов'
+			return (offset > 0 and '+' or '') .. tostring(offset) .. unit
+		end
+		imgui.PushFont(bold_font[1])
+		local label = time_offset_label(setting.time_offset)
+		local label_width = imgui.CalcTextSize(u8(label)).x
+		imgui.PopFont()
+		local plus_x = 584
+		local label_right = plus_x - 19
+		local minus_x = label_right - label_width - 19
 		
 		local color_imVec4_button1, color_imVec4_button_text1 = cl.bg, cl.text
 		if setting.time_offset >= 12 then
 			color_imVec4_button1 = imgui.ImVec4(0.40, 0.40, 0.40, 0.50)
 			color_imVec4_button_text1 = imgui.ImVec4(0.50, 0.50, 0.50, 1.00)
 		else
-			imgui.SetCursorPos(imgui.ImVec2(566, 482))
+			imgui.SetCursorPos(imgui.ImVec2(plus_x - 12.5, 482))
 			if imgui.InvisibleButton(u8'##Прибавить значение к времени', imgui.ImVec2(26, 26)) then
 				setting.time_offset = setting.time_offset + 1
 				save()
@@ -11824,15 +11829,15 @@ function hall.settings()
 				color_imVec4_button_text1 = imgui.ImVec4(0.95, 0.95, 0.95, 1.00)
 			end
 		end
-		gui.DrawCircle({578.5, 494.5}, 12.5, color_imVec4_button1)
-		gui.FaText(572, 486, fa.PLUS, fa_font[3], color_imVec4_button_text1)
+		gui.DrawCircle({plus_x, 494.5}, 12.5, color_imVec4_button1)
+		gui.FaText(plus_x - 6.5, 486, fa.PLUS, fa_font[3], color_imVec4_button_text1)
 		
 		local color_imVec4_button2, color_imVec4_button_text2 = cl.bg, cl.text
 		if setting.time_offset <= -12 then
 			color_imVec4_button2 = imgui.ImVec4(0.40, 0.40, 0.40, 0.50)
 			color_imVec4_button_text2 = imgui.ImVec4(0.50, 0.50, 0.50, 1.00)
 		else
-			imgui.SetCursorPos(imgui.ImVec2(486, 482))
+			imgui.SetCursorPos(imgui.ImVec2(minus_x - 12.5, 482))
 			if imgui.InvisibleButton(u8'##Убавить значение к времени', imgui.ImVec2(26, 26)) then
 				setting.time_offset = setting.time_offset - 1
 				save()
@@ -11843,32 +11848,11 @@ function hall.settings()
 				color_imVec4_button_text2 = imgui.ImVec4(0.95, 0.95, 0.95, 1.00)
 			end
 		end
-		gui.DrawCircle({462.5, 494.5}, 12.5, color_imVec4_button2)
-		gui.FaText(456, 486, fa.MINUS, fa_font[3], color_imVec4_button_text2)
+		gui.DrawCircle({minus_x, 494.5}, 12.5, color_imVec4_button2)
+		gui.FaText(minus_x - 6.5, 486, fa.MINUS, fa_font[3], color_imVec4_button_text2)
 		
-		local format_time_text = ' час'
-		if setting.time_offset >= -4 and setting.time_offset <= 4 and setting.time_offset ~= -1 and setting.time_offset ~= 1 then
-			format_time_text = ' часа'
-		elseif setting.time_offset ~= -1 and setting.time_offset ~= 1 then
-			format_time_text = ' часов'
-		end
-		
-		if setting.time_offset == 0 then
-			gui.Text(492, 484, '0 часов', bold_font[1])
-		elseif setting.time_offset > 0 then
-			imgui.PushFont(bold_font[1])
-			local text_format = '+' .. tostring(setting.time_offset) .. format_time_text
-			local calc_size_text = imgui.CalcTextSize(u8(text_format))
-			imgui.PopFont()
-			gui.Text(521 - (calc_size_text.x / 2), 484, text_format, bold_font[1])
-		else
-			imgui.PushFont(bold_font[1])
-			local text_format = tostring(setting.time_offset) .. format_time_text
-			local calc_size_text = imgui.CalcTextSize(u8(text_format))
-			imgui.PopFont()
-			gui.Text(521 - (calc_size_text.x / 2), 484, text_format, bold_font[1])
-		end
-		
+		gui.Text(label_right - label_width, 484, label, bold_font[1])
+
 		if imgui.BeginPopupModal(u8'Изменить клавишу деактивации команды', null, imgui.WindowFlags.AlwaysAutoResize + imgui.WindowFlags.NoMove + imgui.WindowFlags.NoTitleBar) then
 			if imgui.IsKeyPressed(27, false) then imgui.CloseCurrentPopup() end
 			imgui.SetCursorPos(imgui.ImVec2(10, 10))
@@ -12587,9 +12571,9 @@ function hall.settings()
 			
 			else
 				imgui.PushFont(bold_font[1])
-				local calc_text_size = imgui.CalcTextSize(u8(sh_display_version))
+				local calc_text_size = imgui.CalcTextSize(u8(sh_update_display_version))
 				imgui.PopFont()
-				gui.Text(309 - (calc_text_size.x / 2), 192, sh_display_version, bold_font[1])
+				gui.Text(309 - (calc_text_size.x / 2), 192, sh_update_display_version, bold_font[1])
 				local status_text = sh_update.check == 'current' and 'Версия актуальна'
 					or sh_update.check == 'failed' and 'Не удалось проверить обновления.'
 					or 'Проверка обновлений ещё не выполнена.'
@@ -19215,12 +19199,9 @@ function sh_browser_bootstrap.verify_entry(data, entry)
 end
 
 function sh_browser_bootstrap.file_ready(path, entry)
-    local file = io.open(path, 'rb')
-    if not file then return false end
     local max_size = 0
     for index = 2, #entry, 2 do max_size = math.max(max_size, entry[index]) end
-    local data = file:read(max_size + 1)
-    file:close()
+    local data = sh_resource.read_bounded(path, max_size)
     local ok, valid = pcall(sh_browser_bootstrap.verify_entry, data, entry)
     return ok and valid
 end
@@ -19503,7 +19484,7 @@ function sh_browser_bootstrap.draw()
     end
 end
 
-local function sh_browser_ensure()
+local function sh_browser_initialize()
     if not sh_browser_manager and not sh_browser_load_error then
         local root = dir .. '/State Helper/Browser'
         if not doesFileExist(root .. '/StateHelperBrowser.exe') then
@@ -19511,19 +19492,22 @@ local function sh_browser_ensure()
             return
         end
         for _, entry in ipairs(sh_browser_bootstrap.installed) do
+            wait(0)
             if not sh_browser_bootstrap.file_ready(root .. '/' .. entry[1], entry) then
                 sh_browser_load_error = 'Файлы браузера требуют обновления.'
                 sh_browser_bootstrap.message = sh_browser_load_error
                 return
             end
         end
+        wait(0)
         local private_ok, problem = sh_audit.prepare_private_browser()
         if not private_ok then
             sh_browser_bootstrap.message = 'Закройте браузер и откройте вкладку снова для переноса личных данных.'
             if problem then print('[SH Browser] Private storage: ' .. problem) end
             return
         end
-        local factory, err = loadfile(root .. '/browser.lua')
+        wait(0)
+        local factory = loadfile(root .. '/browser.lua')
         if factory then
             local loaded, constructor = pcall(factory)
             if loaded and type(constructor) == 'function' then
@@ -19594,6 +19578,25 @@ local function sh_browser_ensure()
         end
         if not sh_browser_manager then sh_browser_load_error = 'Не найдены файлы браузера. Восстановите папку State Helper/Browser.' end
     end
+end
+
+local function sh_browser_ensure()
+    local setup = sh_browser_bootstrap
+    if sh_browser_manager or sh_browser_load_error or setup.initializing or setup.downloading then return end
+    if setup.retry_at and getGameTimer() < setup.retry_at then return end
+    setup.initializing = true
+    lua_thread.create(function()
+        wait(0)
+        local ok, err = pcall(sh_browser_initialize)
+        setup.initializing = false
+        if not ok then
+            print('[SH Browser] Initialization: ' .. tostring(err))
+            setup.message = 'Не удалось подготовить браузер. Повторите загрузку файлов.'
+            sh_browser_load_error = setup.message
+        elseif not sh_browser_manager and not sh_browser_load_error then
+            setup.retry_at = getGameTimer() + 1000
+        end
+    end)
 end
 
 function sh_settings_search.browser_available(embedded)
@@ -19781,7 +19784,9 @@ end
 function hall.help()
     sh_browser_ensure()
     local setup, manager = sh_browser_bootstrap, sh_browser_manager
-    if not manager or setup.downloading or manager.state.installing or manager.state.dependency_repair or not setup.libraries_ready() then
+    if setup.initializing then
+        setup.centered_text('Браузер загружается..', math.max(72, imgui.GetWindowHeight() / 2 - 12), bold_font[1])
+    elseif not manager or setup.downloading or manager.state.installing or manager.state.dependency_repair or not setup.libraries_ready() then
         setup.draw()
     elseif setting.browser_cookies ~= 'yes' and setting.browser_cookies ~= 'no' then
         setup.draw_cookie_intro()
@@ -28682,8 +28687,8 @@ end
 function render_members()
 	local mb = setting.mb
 	local limit = sh_audit.members_limit(mb.max_visible)
-	local color_title = sh_audit.members_color('title')
-	local color_work = mb.form and sh_audit.members_color('work') or mb.color.default
+	local color_title = sh_audit.members_color('work')
+	local color_work = mb.form and color_title or mb.color.default
 	if members_hud.rank_source ~= setting.rank_members then
 		members_hud.rank_source = setting.rank_members
 		local mask = 0
@@ -28702,16 +28707,30 @@ function render_members()
 		or cache.show_rank ~= mb.rank or cache.show_id ~= mb.id or cache.show_afk ~= mb.afk or cache.show_warn ~= mb.warn
 		or cache.title_tint ~= color_title or cache.work_tint ~= color_work or cache.default_tint ~= mb.color.default
 		or cache.visibility ~= mb.vis or cache.font ~= fontes or cache.size ~= mb.size or cache.flag ~= mb.flag then
-		local title = ('%s | Онлайн: %s%s'):format(org.name, org.online, mb.afk and (' (%s в АФК)'):format(org.afk) or '')
+		local title_parts, title_width = {}, 0
+		local white = changeColorAlpha(0xFFFFFFFF, mb.vis * 2)
+		local tint = changeColorAlpha(color_title, mb.vis * 2)
+		local function add_title(text, color)
+			title_parts[#title_parts + 1] = {text, title_width, color}
+			title_width = title_width + renderGetFontDrawTextLength(fontes, text)
+		end
+		add_title(org.name .. ' ', tint)
+		add_title('| ', white)
+		add_title('Онлайн: ', tint)
+		add_title(tostring(org.online), white)
+		if mb.afk then
+			add_title(' (', tint)
+			add_title(tostring(org.afk), white)
+			add_title(' в АФК)', tint)
+		end
 		cache = {
 			revision = members_hud.revision, source = members, name = org.name, online = org.online, afk_count = afk_count,
 			countdown = countdown, rank_mask = rank_mask, limit = limit,
 			show_rank = mb.rank, show_id = mb.id, show_afk = mb.afk, show_warn = mb.warn,
 			title_tint = color_title, work_tint = color_work, default_tint = mb.color.default,
 			visibility = mb.vis, font = fontes, size = mb.size, flag = mb.flag,
-			title = title, title_width = renderGetFontDrawTextLength(fontes, title),
+			title_parts = title_parts, title_width = title_width,
 			height = renderGetFontDrawHeight(fontes), rows = {},
-			title_color = changeColorAlpha(color_title, mb.vis * 2),
 			normal_color = changeColorAlpha(mb.color.default, mb.vis * 2)
 		}
 		local work_color = changeColorAlpha(color_work, mb.vis * 2)
@@ -28752,7 +28771,9 @@ function render_members()
 		renderDrawBox(title_x, y - 4, cache.title_width, 1, 0xFFFFFFFF)
 	end
 	if title_y < sy and title_y + cache.height > 0 and title_x < sx and title_x + cache.title_width > 0 then
-		renderFontDrawText(fontes, cache.title, title_x, title_y, cache.title_color)
+		for _, part in ipairs(cache.title_parts) do
+			renderFontDrawText(fontes, part[1], title_x + part[2], title_y, part[3])
+		end
 		if cx and cx > title_x and cx < title_x + cache.title_width and cy > title_y and cy < title_y + cache.height and isKeyJustPressed(0x01) then
 			sh_audit.members_request_start(true)
 		end
