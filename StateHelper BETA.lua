@@ -3,7 +3,7 @@ local math = math
 script_name('State Helper')
 script_authors('Kane')
 script_description('Script for employees of state organizations on the Arizona Role Playing Game')
-script_version('3.5.5')
+script_version('3.5.6')
 script_properties('work-in-pause')
 
 local ffi = require 'ffi'
@@ -275,7 +275,7 @@ do
 end
 local sx, sy = getScreenResolution()
 local scr = thisScript()
-local sh_display_version = 'State Helper ' .. scr.version .. ' аерю'
+local sh_display_version = 'State Helper ' .. scr.version .. ' pre-release'
 local sh_update_display_version = 'State Helper ' .. scr.version .. ' pre-release'
 
 font = renderCreateFont('Trebuchet MS', 14, 5)
